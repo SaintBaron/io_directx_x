@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 8, 0),
+    "version": (1, 5, 0),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -55,7 +55,7 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         name="Forward Axis",
         items=[("-Z","−Z",""),("Z","Z",""),("Y","Y",""),
                ("-Y","−Y",""),("X","X",""),("-X","−X","")],
-        default="-Z",
+        default="Z",
     )
     axis_up: EnumProperty(
         name="Up Axis",
@@ -69,24 +69,29 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
     import_uvs:       BoolProperty(name="Import UVs",       default=True)
     import_materials: BoolProperty(name="Import Materials", default=True)
     import_textures:  BoolProperty(name="Import Textures",  default=True)
+
     import_armature:  BoolProperty(name="Import Armature",  default=True)
     import_weights:   BoolProperty(name="Import Weights",   default=True)
     import_animation: BoolProperty(name="Import Animation", default=True)
 
-    # Normals
-    infer_sharps: BoolProperty(
-        name="Infer Sharp Edges",
+    rest_pose_source: EnumProperty(
+        name="Rest Pose Source",
         description=(
-            "Mark edges as sharp where adjacent face normals diverge beyond the "
-            "threshold angle. Produces correct hard edges from the source normals "
-            "without requiring manual crease marking"
+            "Where to read bone rest poses from.\n\n"
+            "Bind Pose: uses the SkinWeights offset matrices — the geometry is "
+            "correct and joints sit at their authored positions, but some files "
+            "have an arbitrary rotation baked into the root bone that makes the "
+            "armature face the wrong way in edit mode.\n\n"
+            "Frame Hierarchy: uses the FrameTransformMatrix chain, matching "
+            "fragMOTION's behaviour — the armature and mesh face the same "
+            "direction in edit mode, but for files where the FTM encodes an "
+            "animated pose the legs may appear crunched at rest"
         ),
-        default=True,
-    )
-    sharp_angle_deg: FloatProperty(
-        name="Sharp Angle",
-        description="Edges with normals diverging beyond this angle are marked sharp",
-        default=75.0, min=0.0, max=180.0, subtype="ANGLE",
+        items=[
+            ('BIND',            "Bind Pose",       "Use SkinWeights offset matrices (correct joint positions)"),
+            ('FRAME_TRANSFORM', "Frame Hierarchy", "Use FrameTransformMatrix chain (armature/mesh aligned in edit mode)"),
+        ],
+        default='BIND',
     )
 
     # Animation
@@ -95,26 +100,16 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         description="Override FPS (0 = read from file's AnimTicksPerSecond)",
         default=0.0, min=0.0, max=240.0,
     )
-    lock_root_translation: BoolProperty(
-        name="Lock Root Translation",
+    set_frame_range: BoolProperty(
+        name="Set Scene Frame Range",
         description=(
-            "Pin the root bone's world position to its rest pose for every keyframe. "
-            "The character animates in place (feet rooted) rather than walking through "
-            "the scene. Matches the behaviour of tools like Fragmotion that strip "
-            "root-motion translation from the animation. Disable if you need root motion "
-            "for a character controller"
+            "Scan the animation data and set scene frame_start / frame_end "
+            "to match the authored range.  The file's tick numbers are "
+            "preserved verbatim, so an animation authored from tick 0 to "
+            "120 will play from frame 0 to 120 regardless of what the "
+            "scene range was set to before"
         ),
         default=True,
-    )
-
-    lock_leaf_translation: BoolProperty(
-        name="Lock Leaf Bone Translation",
-        description=(
-            "Pin the translation of leaf bones (bones with no children, e.g. foot tips) "
-            "to their rest pose. The game engine normally overrides these with IK at "
-            "runtime, so locking them matches the planted-feet look seen in fragmotion"
-        ),
-        default=False,
     )
 
     # Logging
@@ -144,19 +139,15 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         box.prop(self, "import_uvs")
         box.prop(self, "import_materials")
         box.prop(self, "import_textures")
-        box.prop(self, "infer_sharps")
-        row = box.row()
-        row.prop(self, "sharp_angle_deg")
-        row.enabled = self.infer_sharps
 
         box = layout.box()
         box.label(text="Armature & Animation", icon="ARMATURE_DATA")
         box.prop(self, "import_armature")
         box.prop(self, "import_weights")
         box.prop(self, "import_animation")
+        box.prop(self, "rest_pose_source")
         box.prop(self, "anim_fps")
-        box.prop(self, "lock_root_translation")
-        box.prop(self, "lock_leaf_translation")
+        box.prop(self, "set_frame_range")
 
         box = layout.box()
         box.label(text="Diagnostics", icon="INFO")
@@ -220,6 +211,28 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     export_weights:   BoolProperty(name="Export Weights",   default=True)
     export_animation: BoolProperty(name="Export Animation", default=True)
 
+    use_original_material_data: BoolProperty(
+        name="Use Original Material Data",
+        description=(
+            "When ticked, exports the material values as originally imported "
+            "from the .x file, ignoring any changes made in Blender. "
+            "When unticked (default), exports the current Blender material "
+            "state so your edits are included in the output"
+        ),
+        default=False,
+    )
+
+    # Format
+    binary_format: BoolProperty(
+        name="Binary Format",
+        description=(
+            "Write a DirectX binary (.x bin) file instead of text (.x txt). "
+            "Binary files are smaller and parse faster but are not human-readable. "
+            "Leave off (default) to produce standard text format."
+        ),
+        default=False,
+    )
+
     # Animation
     anim_fps:         FloatProperty(name="FPS", default=30.0, min=1.0, max=240.0)
     anim_frame_start: IntProperty(name="Frame Start", default=1)
@@ -253,6 +266,33 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.prop(self, "export_uvs")
         box.prop(self, "export_materials")
         box.prop(self, "export_textures")
+        if self.export_materials:
+            box.prop(self, "use_original_material_data")
+
+        # ── Editable texture paths ────────────────────────────────────────
+        # Show every material that has an _x_texture_filename custom property
+        if self.export_materials and self.export_textures:
+            mats_with_tex = []
+            for obj in context.scene.objects:
+                if obj.type != "MESH":
+                    continue
+                for slot in obj.material_slots:
+                    mat = slot.material
+                    if mat and mat.get("_x_texture_filename") is not None:
+                        if mat not in mats_with_tex:
+                            mats_with_tex.append(mat)
+            if mats_with_tex:
+                tbox = layout.box()
+                tbox.label(text="Texture Paths", icon="IMAGE_DATA")
+                tbox.label(text="Edit before export if needed:", icon="INFO")
+                for mat in mats_with_tex:
+                    row = tbox.row()
+                    row.label(text=mat.name, icon="MATERIAL")
+                    row.prop(mat, '["_x_texture_filename"]', text="")
+
+        box = layout.box()
+        box.label(text="Format", icon="FILE_BLANK")
+        box.prop(self, "binary_format")
 
         box = layout.box()
         box.label(text="Armature & Animation", icon="ARMATURE_DATA")
@@ -270,13 +310,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.prop(self, "verbose_log")
         if self.verbose_log:
             box.label(text="Output goes to the launch terminal", icon="CONSOLE")
-
-    def invoke(self, context, event):
-        scene = context.scene
-        self.anim_frame_start = scene.frame_start
-        self.anim_frame_end   = scene.frame_end
-        self.anim_fps         = scene.render.fps
-        return super().invoke(context, event)
 
     def execute(self, context):
         XLog.set_verbose(self.verbose_log)
@@ -302,7 +335,7 @@ def register():
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
     # Confirm the addon loaded — visible in terminal even before any import
-    XLog("init")._write("[DX.x] addon registered (v1.8.0)")
+    XLog("init")._write("[DX.x] addon registered (v1.5.0)")
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)

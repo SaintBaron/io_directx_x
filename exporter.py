@@ -24,13 +24,163 @@ Compatible with Blender <=3.x, 4.x, and 5.x:
 """
 
 import os
+import re
 import bpy
+import struct
 import bmesh
 from mathutils import Matrix, Vector, Quaternion
 
 from .xlog import XLog
 
 log = XLog("exporter")
+
+
+# ─────────────────────────────────────────────────────────────
+#  Binary serialiser
+# ─────────────────────────────────────────────────────────────
+# DirectX binary token IDs used on output.
+_BT_NAME      = 0x0001
+_BT_STRING    = 0x0002
+_BT_INT_LIST  = 0x0006
+_BT_FLT_LIST  = 0x0007
+_BT_OBRACE    = 0x000a
+_BT_CBRACE    = 0x000b
+_BT_COMMA     = 0x0013
+_BT_SEMICOLON = 0x0014
+
+class _BinarySerializer:
+    """Convert the text-oriented write stream to DirectX binary tokens.
+
+    The exporter writes text via `w(string)`.  When binary output is requested,
+    `w` is replaced by this object's `feed()` method, which parses each text
+    chunk into tokens and emits the binary equivalents into a bytearray.
+
+    Design rationale
+    ----------------
+    Re-using the existing text-generation logic avoids duplicating the ~400-line
+    body of export_x.  The trade-off is that we parse our OWN text output back
+    into tokens, which is slightly roundabout but very robust: the text output
+    is deterministic and ASCII-clean, so the tokeniser is trivially simple.
+
+    Binary token encoding (32-bit floats, little-endian):
+      NAME token    : u16(0x0001) u32(len) bytes
+      STRING token  : u16(0x0002) u32(len) bytes u16(0x0000)  [terminator]
+      INT_LIST      : u16(0x0006) u32(count) count×u32
+      FLOAT_LIST    : u16(0x0007) u32(count) count×f32
+      { / } / , / ; : u16(token_id)
+
+    The serialiser groups consecutive floats and integers into list records,
+    which is what real DX binary files do and what the binary parser expects.
+    """
+
+    # Simple regex for tokenising our own text output.
+    _RE = re.compile(
+        r'"([^"]*)"'                                          # quoted string
+        r'|([{};,])'                                          # punctuation
+        r'|([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)'      # number
+        r'|([A-Za-z_][A-Za-z0-9_.]*)',                        # identifier/keyword
+    )
+
+    def __init__(self):
+        self._buf   = bytearray()
+        # Deferred float/int list accumulation.
+        self._pending_floats : list[float] = []
+        self._pending_ints   : list[int]   = []
+        self._in_float_ctx   = False  # True while inside a data block needing floats
+
+    # ── public interface ─────────────────────────────────────
+    def feed(self, text: str):
+        """Accept a text chunk and convert it to binary tokens."""
+        for m in self._RE.finditer(text):
+            qstr, punc, num, word = m.groups()
+            if qstr is not None:
+                self._flush_pending()
+                self._emit_string(qstr)
+            elif punc is not None:
+                if punc == '{':
+                    self._flush_pending()
+                    self._emit_u16(_BT_OBRACE)
+                elif punc == '}':
+                    self._flush_pending()
+                    self._emit_u16(_BT_CBRACE)
+                elif punc == ';':
+                    # Semicolons are separators in text; in binary they're
+                    pass  # absorbed into list records
+                elif punc == ',':
+                    pass  # comma separators are also absorbed
+            elif num is not None:
+                # Route to int list only if the token looks like a plain
+                is_plain_int = ('.' not in num and 'e' not in num.lower()
+                                and not num.startswith('-'))
+                if is_plain_int:
+                    v = int(num)
+                    self._pending_ints.append(v)
+                    if self._pending_floats:
+                        self._flush_floats()
+                else:
+                    v = float(num)
+                    self._pending_floats.append(v)
+                    if self._pending_ints:
+                        self._flush_ints()
+            elif word is not None:
+                self._flush_pending()
+                self._emit_name(word)
+
+    def getvalue(self) -> bytes:
+        self._flush_pending()
+        return bytes(self._buf)
+
+    # ── emission helpers ─────────────────────────────────────
+    def _emit_u16(self, v: int):
+        self._buf += struct.pack('<H', v)
+
+    def _emit_u32(self, v: int):
+        self._buf += struct.pack('<I', v)
+
+    def _emit_f32(self, v: float):
+        self._buf += struct.pack('<f', v)
+
+    def _emit_name(self, s: str):
+        enc = s.encode('latin-1')
+        self._emit_u16(_BT_NAME)
+        self._emit_u32(len(enc))
+        self._buf += enc
+
+    def _emit_string(self, s: str):
+        enc = s.encode('latin-1')
+        self._emit_u16(_BT_STRING)
+        self._emit_u32(len(enc))
+        self._buf += enc
+        self._buf += b'\x00\x00'   # 2-byte string terminator
+
+    def _flush_ints(self):
+        if not self._pending_ints:
+            return
+        self._emit_u16(_BT_INT_LIST)
+        self._emit_u32(len(self._pending_ints))
+        for v in self._pending_ints:
+            self._emit_u32(v)
+        self._pending_ints = []
+
+    def _flush_floats(self):
+        if not self._pending_floats:
+            return
+        self._emit_u16(_BT_FLT_LIST)
+        self._emit_u32(len(self._pending_floats))
+        for v in self._pending_floats:
+            self._emit_f32(v)
+        self._pending_floats = []
+
+    def _flush_pending(self):
+        # Flush whichever list has content; mixed int+float in same flush
+        # shouldn't happen due to per-token routing, but handle gracefully.
+        if self._pending_ints and self._pending_floats:
+            self._flush_ints()
+            self._flush_floats()
+        elif self._pending_ints:
+            self._flush_ints()
+        elif self._pending_floats:
+            self._flush_floats()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -121,14 +271,15 @@ def export_x(context, filepath,
              anim_frame_start=1,
              anim_frame_end=250,
              triangulate=False,
+             binary_format=False,
              **_):
 
     log.info("filepath: %s", filepath)
-    log.info("options: scale=%.3f forward=%s up=%s normals=%s uvs=%s mats=%s tex=%s arm=%s weights=%s anim=%s fps=%.1f frames=%d-%d tri=%s",
+    log.info("options: scale=%.3f forward=%s up=%s normals=%s uvs=%s mats=%s tex=%s arm=%s weights=%s anim=%s fps=%.1f frames=%d-%d tri=%s binary=%s",
              global_scale, axis_forward, axis_up,
              export_normals, export_uvs, export_materials, export_textures,
              export_armature, export_weights, export_animation,
-             anim_fps, anim_frame_start, anim_frame_end, triangulate)
+             anim_fps, anim_frame_start, anim_frame_end, triangulate, binary_format)
 
     scene     = context.scene
     depsgraph = context.evaluated_depsgraph_get()
@@ -139,12 +290,27 @@ def export_x(context, filepath,
     bl_to_dx_3 = _axis_matrix(axis_forward, axis_up).to_3x3()
     inv_scale  = 1.0 / global_scale if global_scale != 0.0 else 1.0
 
-    out = []
-    w   = out.append
+    # Output accumulator.  For text: list of strings joined at write time.
+    # For binary: a _BinarySerializer whose feed() method replaces w().
+    if binary_format:
+        _ser = _BinarySerializer()
+        out  = _ser   # kept for passing to _write_mesh_frame
+        w    = _ser.feed
+    else:
+        _ser = None
+        out  = []
+        w    = out.append
 
     # ─── header ────────────────────────────────────────────
-    w("xof 0303txt 0032\n\n")
-    w(f"AnimTicksPerSecond {{\n\t{int(anim_fps)};\n}}\n")
+    if binary_format:
+        # Binary header is written directly as raw bytes — it is NOT token data.
+        _bin_header = b"xof 0303bin 0032"
+        # The binary payload starts immediately after the header.
+        # AnimTicksPerSecond must be emitted as tokens.
+        w(f"AnimTicksPerSecond {{ {int(anim_fps)}; }}\n")
+    else:
+        w("xof 0303txt 0032\n\n")
+        w(f"AnimTicksPerSecond {{\n\t{int(anim_fps)};\n}}\n")
 
     mesh_objs     = [o for o in objects if o.type == "MESH"]
     armature_objs = [o for o in objects if o.type == "ARMATURE"]
@@ -163,9 +329,6 @@ def export_x(context, filepath,
                 log.debug("material '%s'", mat.name)
                 bsdf = _get_principled(mat)
                 # Prefer values the importer preserved from the original .x file
-                # (stored as custom properties on the material). Fall back to
-                # deriving them from the Principled BSDF for materials that
-                # were created in Blender.
                 face_color = mat.get("_x_face_color")
                 power      = mat.get("_x_power")
                 specular   = mat.get("_x_specular")
@@ -236,14 +399,6 @@ def export_x(context, filepath,
         def write_bone(bone, indent):
             ind = "\t" * indent
             # Bone frame transform matrix = parent-local rest matrix in DX space.
-            # Blender's bone.matrix_local is in ARMATURE (object) space with the
-            # importer's conv_mat applied. Un-apply conv for the ROOT level only,
-            # then express every level in parent-local.
-            # Prefer the original FrameTransformMatrix if the importer stashed it.
-            # The original .x file's FTM values often differ from the bind-pose
-            # derived matrix (they're a separate piece of data — Burger.x uses
-            # simplified head-translation-only FTMs). Round-tripping those exact
-            # 16 floats is the only way to make the output byte-identical.
             stashed = arm_data.get(f"_x_ftm:{bone.name}")
             if stashed is not None and len(stashed) >= 16:
                 ftm_string = ",".join(f"{float(v):.6f}" for v in stashed[:16])
@@ -254,8 +409,6 @@ def export_x(context, filepath,
                     # so the matrix is already numerically the DX parent-local.
                 else:
                     # Root bone: un-apply conv_mat and armature world transform.
-                    # bone.matrix_local == conv_mat @ bind_pose_dx (as per importer).
-                    # We also need to remove global_scale from translation only.
                     local_mat = _bl_bone_to_dx_world(bone.matrix_local, bl_to_dx_3, inv_scale)
                 ftm_string = _mat4_to_dx(local_mat)
 
@@ -273,8 +426,6 @@ def export_x(context, filepath,
 
     # ─── meshes (as sibling Frames, NOT children of bones) ─
     # All meshes live at top level in the importer's expected format. If a
-    # mesh is parented to the armature it stays in armature world space; we
-    # still emit it at top level.
     armature_set = set(armature_objs)
     for obj in mesh_objs:
         _write_mesh_frame(obj, out, 0,
@@ -292,9 +443,6 @@ def export_x(context, filepath,
                  len(arm_obj.pose.bones), frame_count)
 
         # Pre-compute bone ancestry in Blender armature space. We need to convert
-        # Blender pose delta → absolute DX parent-local quaternion for each frame.
-        # Strategy: at each frame, read pose_bone.matrix (armature-space), build
-        # parent-local matrix, un-apply conv_mat at root level, then decompose.
 
         # Cache rest matrices (armature-space Blender) per bone for derivation
         rest_arm_bl = {b.name: b.matrix_local.copy() for b in arm_obj.data.bones}
@@ -304,11 +452,6 @@ def export_x(context, filepath,
         baked = {b.name: {"rot": {}, "scale": {}, "pos": {}} for b in arm_obj.pose.bones}
 
         conv_3 = Matrix.Identity(3)  # identity placeholder — actual conv below
-        # conv_mat equivalent that the IMPORTER used to go DX→BL. Exporter needs BL→DX = conv.T.
-        # In the importer: conv_mat = _axis_matrix('-Z', 'Y') = [[1,0,0],[0,0,-1],[0,1,0]]
-        # So conv_inv (BL→DX) = conv.T = [[1,0,0],[0,0,1],[0,-1,0]]
-        # But the user-selected axis_forward/axis_up may change this. The exporter's
-        # bl_to_dx_3 already is BL→DX, so conv_inv_3 = bl_to_dx_3, and conv_3 = inv.
         conv_inv_3 = bl_to_dx_3
         conv_3 = conv_inv_3.transposed()  # orthogonal → inverse == transpose
 
@@ -326,8 +469,6 @@ def export_x(context, filepath,
                     parent_world_bl = pb.parent.matrix.copy()
                     local_bl = parent_world_bl.inverted() @ world_bl
                     # conv_mat cancels between parent and child since both
-                    # got the same conv applied. So local_bl is numerically
-                    # the same as DX parent-local.
                     dx_local = local_bl
                 else:
                     # Root: un-apply conv_mat to get true DX world matrix.
@@ -342,9 +483,6 @@ def export_x(context, filepath,
                 # So on write we conjugate xyz to cancel (w, -x, -y, -z) output.
                 qw, qx, qy, qz = q.w, -q.x, -q.y, -q.z
                 # The importer specifically negates w for root type-0 via the
-                # (-1,0,0,0) identity pattern seen in the file. We match by
-                # NOT re-negating w; the standard quat sign is kept and the
-                # reader's logic flips xyz.
 
                 baked[name]["rot"]  [fr] = (qw, qx, qy, qz)
                 baked[name]["scale"][fr] = (dx_s.x, dx_s.y, dx_s.z)
@@ -371,13 +509,13 @@ def export_x(context, filepath,
             # type-1: scale (3 values, but nvals field still written as 4 to
             # match the file format convention produced by Maya's exporter).
             w(f"\t\tAnimationKey {{\n\t\t\t1;\n\t\t\t{len(scale_keys)};\n")
-            entries = [f"\t\t\t{fr};4;{sx:.6f},{sy:.6f},{sz:.6f};;"
+            entries = [f"\t\t\t{fr};3;{sx:.6f},{sy:.6f},{sz:.6f};;"
                        for fr, (sx, sy, sz) in sorted(scale_keys.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
 
             # type-2: position
             w(f"\t\tAnimationKey {{\n\t\t\t2;\n\t\t\t{len(pos_keys)};\n")
-            entries = [f"\t\t\t{fr};4;{px:.6f},{py:.6f},{pz:.6f};;"
+            entries = [f"\t\t\t{fr};3;{px:.6f},{py:.6f},{pz:.6f};;"
                        for fr, (px, py, pz) in sorted(pos_keys.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
 
@@ -385,8 +523,14 @@ def export_x(context, filepath,
 
         w("}\n")
 
-    with open(filepath, "w", encoding="utf-8") as fh:
-        fh.write("".join(out))
+    if binary_format:
+        payload = _ser.getvalue()
+        with open(filepath, "wb") as fh:
+            fh.write(_bin_header)
+            fh.write(payload)
+    else:
+        with open(filepath, "w", encoding="utf-8") as fh:
+            fh.write("".join(out))
 
     log.info("export done: %s", filepath)
     return {"FINISHED"}
@@ -438,18 +582,15 @@ def _write_mesh_frame(obj, out, indent,
                       export_materials, export_weights,
                       arm_obj, bl_to_dx_3, inv_scale,
                       triangulate, written_mats):
-    w   = out.append
+    # 'out' is either a list (text mode) or a _BinarySerializer (binary mode).
+    w   = out.feed if isinstance(out, _BinarySerializer) else out.append
     ind = "\t" * indent
     log.info("  mesh '%s'", obj.name)
 
     # Vertex positions must come from the bind pose, not the current animated
-    # frame.  obj.data always holds the raw undeformed vertex positions
-    # regardless of the current frame or depsgraph state.
     me_src = obj.data
 
     # Work on a bmesh copy so we can optionally triangulate without touching
-    # the original data. If triangulate=False we preserve n-gons so the
-    # output matches the original file's quad structure.
     bm = bmesh.new()
     bm.from_mesh(me_src)
     if triangulate:
@@ -460,19 +601,23 @@ def _write_mesh_frame(obj, out, indent,
 
     me_work.update()
 
+    # Non-manifold check via bmesh (MeshEdge lacks is_manifold; BMEdge has it).
+    _bm_check = bmesh.new()
+    _bm_check.from_mesh(me_work)
+    _bm_check.edges.ensure_lookup_table()
+    non_manifold = [e.index for e in _bm_check.edges if not e.is_manifold]
+    _bm_check.free()
+    if non_manifold:
+        log.warn("  mesh '%s': %d non-manifold edge(s) — may cause broken normals "
+                 "or bad skinning in DX consumers (edge indices: %s%s)",
+                 obj.name, len(non_manifold),
+                 non_manifold[:10],
+                 " ..." if len(non_manifold) > 10 else "")
+
     conv_inv_3 = bl_to_dx_3   # BL→DX rotation
 
     # ── UN-WELD: emit one vertex per face corner ─────────────
     # DX .x doesn't store "welds" — the file just has vertices and face indices.
-    # Per-corner attributes (split normals, UV seams) are encoded by duplicating
-    # a vertex at each corner that needs different data. Maya's exporter produces
-    # ~4x more vertices than the welded mesh for this reason (Burger.x has 10880
-    # verts for 2800 quads = 11200 corners, with some shared where attributes match).
-    #
-    # For clean round-trip we un-weld on export: emit one vertex per face corner.
-    # Skin weights get re-indexed from (source Blender vertex) to (new corner-vert
-    # indices that came from that Blender vertex).
-    # The importer will re-weld on read, producing the same welded topology.
 
     # Build un-welded vertex list + face index list
     bl_verts = me_work.vertices
@@ -503,9 +648,6 @@ def _write_mesh_frame(obj, out, indent,
 
     # ─── Frame + FrameTransformMatrix ─────────────────────
     # Prefer original names / FTM from the import, when stashed. This makes
-    # the output match the source file even when the Blender-derived values
-    # would differ (e.g. Burger.x uses a simplified identity-ish FTM that
-    # isn't recoverable from the mesh data alone).
     frame_name = obj.get("_x_frame_name") or obj.name
     mesh_name  = obj.get("_x_mesh_name")  or (f"{obj.name}Geo"
                                                if not obj.name.endswith("Geo")
@@ -578,12 +720,6 @@ def _write_mesh_frame(obj, out, indent,
     if export_uvs and me_work.uv_layers:
         uv_layer = me_work.uv_layers.active
         # The importer does (u, 1.0 - v) on read. To round-trip, we write
-        # (u, 1.0 - v_blender) which produces the V-flipped values like the
-        # original file (which has negative V coordinates).
-        #
-        # DX stores ONE UV per vertex. With un-welding, each face corner has
-        # its own vertex so we can preserve per-loop UVs directly: write one
-        # UV per un-welded vertex using that corner's UV from the source loop.
         new_uvs = [(0.0, 0.0)] * n_verts
         for poly in me_work.polygons:
             for li in poly.loop_indices:
@@ -612,17 +748,12 @@ def _write_mesh_frame(obj, out, indent,
     if export_weights and arm_obj and obj.vertex_groups:
         bone_names = {b.name for b in arm_obj.data.bones}
         # Use ORIGINAL object's vertex groups (evaluated mesh's are the same).
-        # Work from the original object's mesh data since that carries the
-        # skin-weight assignments.
         orig_me = obj.data
         vgroups = [vg for vg in obj.vertex_groups if vg.name in bone_names]
         log.info("    SkinWeights: %d bone groups", len(vgroups))
 
         if vgroups:
             # Collect influences per group. We use the WORKING mesh's vertex
-            # positions (not the original pre-modifier) — for modifier-applied
-            # exports this is correct because vertex indices match.
-            # If modifiers changed vertex count, fall back gracefully.
             ref_me = orig_me if not use_mesh_modifiers or len(orig_me.vertices) == n_verts else me_work
 
             # Build reverse map: source BL vertex → list of new un-welded indices
@@ -657,8 +788,6 @@ def _write_mesh_frame(obj, out, indent,
                     log.debug("      '%s': %d influences", vg.name, len(influences))
 
                     # Offset matrix = inv(bind pose in DX world space).
-                    # bone.matrix_local is in Blender armature space. We need to
-                    # un-apply conv_mat to get back to DX world space, then invert.
                     if bone:
                         bind_dx = _bl_bone_to_dx_world(bone.matrix_local, bl_to_dx_3, inv_scale)
                         try:

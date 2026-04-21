@@ -52,6 +52,102 @@ def _mat4_from_list(vals):
     ]).transposed()
 
 
+class _SyntheticKeyNode:
+    """Minimal object mimicking an XNode AnimationKey for synthetic tracks.
+
+    Only .nums() is used by the AnimationKey consumer code, so we don't need
+    to implement the full XNode interface.
+    """
+    __slots__ = ("_nums",)
+
+    def __init__(self, nums_list):
+        self._nums = nums_list
+
+    def nums(self):
+        return self._nums
+
+
+def _compose_type4_from_trs(rot_node, scale_node, trans_node):
+    """
+    Compose three separate AnimationKey tracks (type 0 rotation, type 1 scale,
+    type 2 translation) into a single synthetic type-4 (full 4x4 matrix) track.
+
+    This mirrors what fragMOTION does internally when reading DirectX .x files:
+    it combines the separate TRS channels into a single matrix per frame, which
+    locks them into a consistent parent-local coordinate frame.  Pose reconstruction
+    from a full matrix is unambiguous, whereas reconstructing from separate TRS
+    channels requires assumptions about coordinate frames that can disagree,
+    causing visible artefacts like feet sliding.
+
+    The composition is the standard DX row-major:
+        M[0:3, 0:3] = diag(scale) * R(quat)      # scale applied to rotation rows
+        M[3,   0:3] = translation                # translation in the bottom row
+        M[0:3, 3]   = 0
+        M[3,   3]   = 1
+
+    Returns a _SyntheticKeyNode whose .nums() returns flat data in the same
+    format as a real type-4 AnimationKey node: [4, count, tick, 16, m00..m33, ...].
+    Returns None if any of the input tracks is malformed.
+    """
+    def _parse(node, expected):
+        nums = node.nums()
+        if len(nums) < 2:
+            return None
+        count = int(nums[1])
+        out = []
+        i = 2
+        while i < len(nums) and len(out) < count:
+            if i + 1 >= len(nums):
+                break
+            tick = nums[i]; i += 1
+            i += 1  # skip in-file nvals
+            if i + expected > len(nums):
+                break
+            out.append((tick, nums[i:i + expected]))
+            i += expected
+        return out
+
+    rot_frames   = _parse(rot_node,   4)
+    scale_frames = _parse(scale_node, 3)
+    trans_frames = _parse(trans_node, 3)
+    if not rot_frames or not scale_frames or not trans_frames:
+        return None
+
+    n = min(len(rot_frames), len(scale_frames), len(trans_frames))
+    if n == 0:
+        return None
+
+    out_nums = [4.0, float(n)]
+    for i in range(n):
+        tick, rot_vals   = rot_frames[i]
+        _,    scale_vals = scale_frames[i]
+        _,    trans_vals = trans_frames[i]
+
+        w, x, y, z = rot_vals[:4]
+        sx, sy, sz = scale_vals[:3]
+        tx, ty, tz = trans_vals[:3]
+
+        # Quaternion -> 3x3 rotation (DirectX row-major convention).
+        r00 = 1.0 - 2.0*(y*y + z*z);  r01 =       2.0*(x*y - z*w);  r02 =       2.0*(x*z + y*w)
+        r10 =       2.0*(x*y + z*w);  r11 = 1.0 - 2.0*(x*x + z*z);  r12 =       2.0*(y*z - x*w)
+        r20 =       2.0*(x*z - y*w);  r21 =       2.0*(y*z + x*w);  r22 = 1.0 - 2.0*(x*x + y*y)
+
+        # Apply scale: row i gets scaled by s[i] (S * R where S is diag(sx,sy,sz)).
+        r00 *= sx; r01 *= sx; r02 *= sx
+        r10 *= sy; r11 *= sy; r12 *= sy
+        r20 *= sz; r21 *= sz; r22 *= sz
+
+        out_nums.extend([
+            tick, 16.0,
+            r00, r01, r02, 0.0,
+            r10, r11, r12, 0.0,
+            r20, r21, r22, 0.0,
+            tx,  ty,  tz,  1.0,
+        ])
+
+    return _SyntheticKeyNode(out_nums)
+
+
 def _axis_matrix(axis_forward, axis_up):
     """Build the 4x4 DX-to-Blender axis conversion matrix.
 
@@ -122,6 +218,50 @@ def _collect_ftm_globals(frame_node, parent_mat=None):
     return result
 
 
+def _compute_animation_frame_range(root):
+    """
+    Scan every AnimationKey block in the file and return the global
+    (min_frame, max_frame) tuple in DX ticks, or None if the file has
+    no animation data.
+
+    The file's frame ticks are authored by the source tool (Maya, fragMOTION,
+    etc.) and are not guaranteed to start at frame 1 — so relying on a
+    hard-coded 1-N range would clip short animations or leave long ones with
+    blank trailing frames.  Scanning the data once up-front lets the importer
+    set scene.frame_start / frame_end to the exact authored range.
+    """
+    min_f = None
+    max_f = None
+    for anim_set in [n for n in root.children if n.kind == "AnimationSet"]:
+        for anim_node in anim_set.children_of("Animation"):
+            for key_node in anim_node.children_of("AnimationKey"):
+                nums = key_node.nums()
+                if len(nums) < 2:
+                    continue
+                key_type  = int(nums[0])
+                key_count = int(nums[1])
+                expected  = _KEY_TYPE_VALUES.get(key_type)
+                if expected is None:
+                    continue
+                # Walk the AnimationKey data layout: for each of key_count
+                i = 2
+                for _ in range(key_count):
+                    if i + 1 >= len(nums):
+                        break
+                    tick = nums[i]
+                    i += 2                        # frame + nvals field
+                    if i + expected > len(nums):
+                        break
+                    i += expected                 # skip the payload values
+                    if min_f is None or tick < min_f:
+                        min_f = tick
+                    if max_f is None or tick > max_f:
+                        max_f = tick
+    if min_f is None:
+        return None
+    return int(round(min_f)), int(round(max_f))
+
+
 # ─────────────────────────────────────────────────────────────
 #  Main entry point
 # ─────────────────────────────────────────────────────────────
@@ -138,6 +278,8 @@ def import_x(context, filepath,
              import_weights=True,
              import_animation=True,
              anim_fps=0.0,
+             set_frame_range=True,
+             rest_pose_source='BIND',
              infer_sharps=True,
              sharp_angle_deg=75.0,
              lock_root_translation=False,
@@ -145,11 +287,11 @@ def import_x(context, filepath,
              **_):
 
     log.info("filepath: %s", filepath)
-    log.info("options: scale=%.3f forward=%s up=%s normals=%s uvs=%s mats=%s tex=%s arm=%s weights=%s anim=%s fps=%.1f sharps=%s sharp_angle=%.1f°",
+    log.info("options: scale=%.3f forward=%s up=%s normals=%s uvs=%s mats=%s tex=%s arm=%s weights=%s anim=%s fps=%.1f range=%s rest=%s sharps=%s sharp_angle=%.1f°",
              global_scale, axis_forward, axis_up,
              import_normals, import_uvs, import_materials, import_textures,
              import_armature, import_weights, import_animation, anim_fps,
-             infer_sharps, sharp_angle_deg)
+             set_frame_range, rest_pose_source, infer_sharps, sharp_angle_deg)
 
     root     = parse_x_file(filepath)
     base_dir = os.path.dirname(filepath)
@@ -167,6 +309,7 @@ def import_x(context, filepath,
         import_weights=import_weights,
         import_animation=import_animation,
         anim_fps=anim_fps,
+        rest_pose_source=rest_pose_source,
         infer_sharps=infer_sharps,
         sharp_angle_deg=sharp_angle_deg,
         lock_root_translation=lock_root_translation,
@@ -201,7 +344,19 @@ def import_x(context, filepath,
         ftm_globals = {}
         for fn in frame_nodes:
             ftm_globals.update(_collect_ftm_globals(fn))
+
         conv_mat = _axis_matrix(axis_forward, axis_up)
+        axis_fix = Matrix.Rotation(math.pi, 4, 'Z')
+
+        # Left-multiply: rotate in Blender space AFTER the axis conversion.
+        conv_mat = axis_fix @ conv_mat
+
+        _cm3 = conv_mat.to_3x3()
+        log.debug("conv_mat axis mapping: DX+X->%s  DX+Y->%s  DX+Z->%s",
+                  tuple(round(v,3) for v in _cm3 @ Vector((1,0,0))),
+                  tuple(round(v,3) for v in _cm3 @ Vector((0,1,0))),
+                  tuple(round(v,3) for v in _cm3 @ Vector((0,0,1))))
+
         state.build_armature(frame_nodes, context, bind_poses, ftm_globals, conv_mat)
 
     # 3b. Detect permanently-hidden bones (scale≈0 on every frame).
@@ -239,12 +394,21 @@ def import_x(context, filepath,
         for node in anim_sets:
             state.import_animation_set(node, context)
 
-    # Jump to frame 1 so the user sees the animated pose instead of the bind pose.
-    # The .x bind pose has a 180° Y-flip baked in that makes the character face
-    # -Y at rest; the animation's first frame corrects this to +Y. Setting the
-    # scene frame to 1 ensures the default view shows the "correct" orientation.
-    if import_animation:
-        context.scene.frame_set(1)
+    # 6. Apply the detected frame range to the scene and jump to the first
+    if import_animation and set_frame_range:
+        frame_range = _compute_animation_frame_range(root)
+        if frame_range:
+            fstart, fend = frame_range
+            # Guard against degenerate single-frame animations: keep end >= start.
+            if fend < fstart:
+                fend = fstart
+            context.scene.frame_start = fstart
+            context.scene.frame_end   = fend
+            log.info("scene frame range set to %d-%d (from animation data)",
+                     fstart, fend)
+            context.scene.frame_set(fstart)
+        else:
+            log.info("no animation keyframes found — scene frame range unchanged")
 
     log.info("import done — objects created: %d", len(state.created_objects))
     return {"FINISHED"}
@@ -317,8 +481,6 @@ def _apply_custom_normals(me, loop_normals):
     """
     if hasattr(me, "normals_split_custom_set"):
         # Set use_auto_smooth first WITHOUT calling update() in between —
-        # an intermediate update re-evaluates shading and can reset the flag
-        # before the custom normals are committed, leaving the mesh flat-shaded.
         if hasattr(me, "use_auto_smooth"):
             me.use_auto_smooth = True
         me.normals_split_custom_set(loop_normals)
@@ -345,6 +507,7 @@ class _ImportState:
         self._conv_mat           = Matrix.Identity(4)
         self._always_hidden_bones: set = set()
         self._skel_root_names:   set    = set()   # top-level skeleton bones (delta, not abs)
+        self._bone_rebind:       dict   = {}      # bone_name -> rebind 4x4 matrix for mesh verts
 
     # ── materials ────────────────────────────────────────────
     def parse_material(self, node, base_dir):
@@ -352,46 +515,72 @@ class _ImportState:
         log.debug("material '%s'", name)
         existing = bpy.data.materials.get(name)
         if existing:
-            # Always rebuild from scratch on re-import so stale colours/textures
-            # from a previous import of a differently-configured file don't linger.
-            log.debug("  material '%s' already exists, rebuilding node tree", name)
-            mat = existing
-            mat.node_tree.nodes.clear()
-            mat.node_tree.links.clear()
-        else:
-            mat = bpy.data.materials.new(name)
+            log.debug("  material '%s' already exists, skipping", name)
+            self.materials[name] = existing
+            return existing
+        mat = bpy.data.materials.new(name)
         mat.use_nodes = True
 
-        bsdf     = mat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
-        out_node = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
-        mat.node_tree.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+        # Setting use_nodes=True on a brand-new material causes Blender to
+        bsdf = next(
+            (n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"),
+            None,
+        )
+        out_node = next(
+            (n for n in mat.node_tree.nodes if n.type == "OUTPUT_MATERIAL"),
+            None,
+        )
+        if bsdf is None:
+            bsdf = mat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+        if out_node is None:
+            out_node = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+        # Ensure the BSDF is wired to the active output (it will be a no-op
+        # if the link already exists from the auto-populated tree).
+        if not any(
+            lnk.from_node == bsdf and lnk.to_node == out_node
+            for lnk in mat.node_tree.links
+        ):
+            mat.node_tree.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
 
         nums = node.nums()
         if len(nums) >= 4:
-            bsdf.inputs["Base Color"].default_value = (nums[0], nums[1], nums[2], nums[3])
+            r, g, b, a = nums[0], nums[1], nums[2], nums[3]
+            bsdf.inputs["Base Color"].default_value = (r, g, b, a)
+            # Store original diffuse for round-trip export.
+            mat["_x_face_color"] = (r, g, b, a)
         if len(nums) >= 5:
-            roughness = max(0.0, min(1.0, 1.0 - math.log(max(nums[4], 1e-6)) / math.log(128.0)))
+            shininess = nums[4]
+            roughness = max(0.0, min(1.0, 1.0 - math.log(max(shininess, 1e-6)) / math.log(128.0)))
             bsdf.inputs["Roughness"].default_value = roughness
+            mat["_x_power"] = shininess
         if len(nums) >= 8:
-            spec_val   = (nums[5] + nums[6] + nums[7]) / 3.0
+            sr, sg, sb = nums[5], nums[6], nums[7]
+            spec_val   = (sr + sg + sb) / 3.0
             spec_input = (bsdf.inputs.get("Specular IOR Level")
                           or bsdf.inputs.get("Specular"))
             if spec_input:
                 spec_input.default_value = spec_val
             else:
                 log.warn("  no Specular input on BSDF")
+            mat["_x_specular"] = (sr, sg, sb)
+        if len(nums) >= 11:
+            mat["_x_emissive"] = (nums[8], nums[9], nums[10])
 
         if self.import_textures:
-            tex_node = node.child("TextureFileName")
+            tex_node = node.child("TextureFileName") or node.child("TextureFilename")
             if tex_node:
                 strs = tex_node.strings()
                 if strs:
-                    tex_path  = strs[0].replace("\\", os.sep).replace("/", os.sep)
+                    # The .x format uses \\ for a literal backslash inside a
+                    original_tex_name = strs[0].replace('\\\\', '\\')
+                    mat["_x_texture_filename"] = original_tex_name
+                    tex_path  = original_tex_name.replace("\\", os.sep).replace("/", os.sep)
                     full_path = os.path.join(base_dir, tex_path)
                     stem      = os.path.splitext(full_path)[0]
                     loaded    = False
                     for candidate in [full_path,
-                                      stem + ".png", stem + ".jpg", stem + ".tga"]:
+                                      stem + ".png", stem + ".jpg", stem + ".tga",
+                                      stem + ".dds"]:
                         if os.path.exists(candidate):
                             log.info("  texture: %s", candidate)
                             img          = bpy.data.images.load(candidate, check_existing=True)
@@ -404,7 +593,8 @@ class _ImportState:
                             loaded = True
                             break
                     if not loaded:
-                        log.warn("  texture not found: %s (also tried .png/.jpg/.tga)", full_path)
+                        log.warn("  texture not found: %s (also tried .png/.jpg/.tga/.dds)",
+                                 full_path)
 
         self.materials[name] = mat
         return mat
@@ -417,6 +607,11 @@ class _ImportState:
         Both armature and mesh stay at Matrix.Identity.
         """
         self._conv_mat = conv_mat
+        # ── Rest pose source ─────────────────────────────────────────────
+        # 'BIND' (default): rest comes from inv(SkinWeights offset matrix).
+        use_ftm_rest = (self.rest_pose_source == 'FRAME_TRANSFORM')
+        self._bone_rebind = {}  # populated only when use_ftm_rest is True
+
         # Identify skeleton root frames (have sub-Frame children = are bones)
         skel_roots = [f for f in frame_nodes
                       if any(c.kind == "Frame" for c in f.children)]
@@ -435,39 +630,55 @@ class _ImportState:
         context.collection.objects.link(arm_obj)
         self.armature_obj = arm_obj
         self.created_objects.append(arm_obj)
-        # Armature stays at world origin — skinned mesh will too.
         arm_obj.matrix_world = Matrix.Identity(4)
 
         context.view_layer.objects.active = arm_obj
         bpy.ops.object.mode_set(mode="EDIT")
 
-        bone_count      = [0]
-        fallback_count  = [0]
+        bone_count     = [0]
+        fallback_count = [0]
 
         def add_bone(frame_node, parent_edit_bone):
             name = frame_node.name or "Bone"
 
-            if name in bind_poses:
-                rest_mat = conv_mat @ bind_poses[name]
-            elif name in ftm_globals:
-                rest_mat = conv_mat @ ftm_globals[name]
-                fallback_count[0] += 1
-                log.debug("  bone '%s': no SkinWeights, using FTM fallback", name)
+            if use_ftm_rest:
+                # FTM path: prefer FrameTransformMatrix-derived global matrix.
+                new_rest_bl = conv_mat @ ftm_globals[name] if name in ftm_globals else None
+                old_bind_bl = conv_mat @ bind_poses[name]  if name in bind_poses  else None
+                if new_rest_bl is None:
+                    new_rest_bl = old_bind_bl   # no FTM — fall back to bind
+                if new_rest_bl is None:
+                    rest_mat = Matrix.Identity(4)
+                    log.warn("  bone '%s': no rest data, using identity", name)
+                else:
+                    rest_mat = new_rest_bl
+                # Record rebind if FTM and bind differ (needed for mesh vertices).
+                if old_bind_bl is not None and new_rest_bl is not old_bind_bl:
+                    try:
+                        self._bone_rebind[name] = new_rest_bl @ old_bind_bl.inverted()
+                    except ValueError:
+                        pass
+                if name not in bind_poses:
+                    fallback_count[0] += 1
+                    log.debug("  bone '%s': no SkinWeights", name)
             else:
-                rest_mat = Matrix.Identity(4)
-                log.warn("  bone '%s': no bind pose data at all, using identity", name)
+                # Bind path: prefer SkinWeights bind pose (inv of offset matrix).
+                if name in bind_poses:
+                    rest_mat = conv_mat @ bind_poses[name]
+                elif name in ftm_globals:
+                    rest_mat = conv_mat @ ftm_globals[name]
+                    fallback_count[0] += 1
+                    log.debug("  bone '%s': no SkinWeights, using FTM fallback", name)
+                else:
+                    rest_mat = Matrix.Identity(4)
+                    log.warn("  bone '%s': no bind pose data at all, using identity", name)
 
             eb = arm_data.edit_bones.new(name)
-            # Apply global_scale to the translation column only so bone
-            # positions are scaled without corrupting the rotation axes.
             if self.global_scale != 1.0:
                 scaled = rest_mat.copy()
                 scaled.translation *= self.global_scale
                 rest_mat = scaled
-            # Set the full rest-pose matrix directly — this is the only way to
-            # correctly set head, tail AND roll simultaneously.
             eb.matrix = rest_mat
-            # Enforce minimum visible bone length
             if (eb.tail - eb.head).length < 1e-4:
                 eb.tail = eb.head + rest_mat.to_3x3() @ Vector((0, 0.1, 0))
             eb.use_connect = False
@@ -477,7 +688,7 @@ class _ImportState:
             bone_count[0] += 1
             log.debug("  bone '%s' head=(%.3f, %.3f, %.3f)  source=%s",
                       name, eb.head.x, eb.head.y, eb.head.z,
-                      "bind_pose" if name in bind_poses else "FTM_fallback")
+                      "bind" if name in bind_poses else "FTM_fallback")
 
             for child in frame_node.children:
                 if child.kind == "Frame":
@@ -487,8 +698,9 @@ class _ImportState:
             add_bone(fn, None)
 
         bpy.ops.object.mode_set(mode="OBJECT")
-        log.info("armature built: %d bones (%d used FTM fallback)",
-                 bone_count[0], fallback_count[0])
+        log.info("armature built: %d bones (%d fallback, %d rebind, source=%s)",
+                 bone_count[0], fallback_count[0], len(self._bone_rebind),
+                 self.rest_pose_source)
 
     # ── frame / mesh traversal ───────────────────────────────
     def import_frame_meshes(self, frame_node, context, parent_matrix=None):
@@ -554,10 +766,6 @@ class _ImportState:
         me.update()
 
         # normals — parsed here from the file, but applied to the mesh only AFTER
-        # the weld step below.  bmesh.ops.remove_doubles discards custom loop data
-        # (split normals) so setting them before welding would silently lose them.
-        # Normals are also rotated by the 3x3 part of conv_mat so they end up in
-        # Blender world space, consistent with the already-converted vertices.
         _pending_loop_normals = None
         normals_node = mesh_node.child("MeshNormals")
         if self.import_normals and normals_node:
@@ -673,11 +881,6 @@ class _ImportState:
             log.info("  SkinWeights blocks: %d", len(sw_nodes))
 
             # Collect all skin weight data BEFORE welding.
-            # We need the pre-weld vertex positions to build a remapping after weld,
-            # because BMesh does not carry vertex group data — assigning weights
-            # before the weld and then welding causes duplicate vertices to lose
-            # their weight assignments, leaving unweighted vertices that stretch
-            # toward the origin during deformation.
             pre_weld_skin = []  # list of (bone_name, [(vi, weight), ...])
             for sw in sw_nodes:
                 bone_name = next((v for t, v in sw.values if t == "STR"), None)
@@ -700,23 +903,47 @@ class _ImportState:
             arm_mod           = obj.modifiers.new("Armature", "ARMATURE")
             arm_mod.object    = self.armature_obj
             arm_mod.use_vertex_groups = True
+            # Use dual-quaternion skinning instead of default linear-blend.
+            arm_mod.use_deform_preserve_volume = True
             log.info("  parented to armature at world origin")
 
+            # ─── Skin-weighted vertex rebind (FRAME_TRANSFORM mode only) ──
+            # When using FTM-derived rest poses the mesh vertices must be
+            if self._bone_rebind:
+                vert_accum      = [None] * len(me.vertices)
+                vert_weight_sum = [0.0]  * len(me.vertices)
+                for bone_name, influences in pre_weld_skin:
+                    rebind = self._bone_rebind.get(bone_name)
+                    if rebind is None:
+                        continue
+                    for vi, w in influences:
+                        if vi >= len(vert_accum):
+                            continue
+                        contrib = rebind * w
+                        if vert_accum[vi] is None:
+                            vert_accum[vi] = contrib
+                        else:
+                            for r in range(4):
+                                for c in range(4):
+                                    vert_accum[vi][r][c] += contrib[r][c]
+                        vert_weight_sum[vi] += w
+                rebind_applied = 0
+                for vi, accum in enumerate(vert_accum):
+                    if accum is None or vert_weight_sum[vi] <= 0.0:
+                        continue
+                    v_old = me.vertices[vi].co.copy()
+                    v_h   = Vector((v_old.x, v_old.y, v_old.z, 1.0))
+                    v_new = accum @ v_h
+                    ws    = vert_weight_sum[vi]
+                    me.vertices[vi].co = Vector((v_new.x / ws,
+                                                 v_new.y / ws,
+                                                 v_new.z / ws))
+                    rebind_applied += 1
+                me.update()
+                log.info("  skin-weighted rebind: %d/%d verts",
+                         rebind_applied, len(me.vertices))
+
             # Weld FIRST, before assigning any weights.
-            #
-            # ATTRIBUTE-AWARE WELD: two pre-weld verts are considered identical
-            # ONLY IF their full attribute signature matches:
-            #   - position (rounded to 1e-5)
-            #   - bone weight signature (sorted list of (bone, rounded_weight) pairs)
-            #
-            # This prevents the catastrophic case where Open/Closed eyelid verts
-            # at the same position — but with different bone weights — get merged
-            # into a single vertex, collapsing independent animation geometry.
-            # Body verts at coincident positions DO have matching weight signatures
-            # (they're face-corner duplicates of the same logical vertex) and weld
-            # together correctly. Lid Open/Closed verts share positions but have
-            # different bone influences, so their VertexKeys differ and they stay
-            # apart.
             import bmesh as _bmesh
             pre_weld_positions = [tuple(v.co) for v in me.vertices]
             _pre_count = len(pre_weld_positions)
@@ -790,25 +1017,6 @@ class _ImportState:
                 log.warn("  %d pre-weld vertices could not be remapped", remap_miss)
 
             # Assign weights using remapped post-weld indices.
-            #
-            # Two distinct collision cases after welding:
-            #
-            # Case A — legitimate multi-bone weighting: the SAME pre-weld vertex
-            #   index appears in multiple bones' influence lists (e.g. a foot vertex
-            #   shared 50/50 between Leg04 and TopSHJnt). All assignments must be
-            #   written — use REPLACE for each since they reference the same pre-weld
-            #   vertex and Blender normalises weights at deformation time.
-            #
-            # Case B — position collision: DIFFERENT pre-weld vertex indices that
-            #   happen to sit at the same 3-D position (e.g. UpperLidOpen vi=1608
-            #   and UpperLidClosed vi=1771). After welding they share one post-weld
-            #   vertex. Only the first bone's assignment should win; subsequent ones
-            #   would overwrite and corrupt the skinning.
-            #
-            # Distinguish by tracking which (pre_vi, bone) pairs have been written
-            # to each post-weld vertex. If the same pre_vi is written again (Case A
-            #   duplicate face-corner), allow it. If a NEW pre_vi maps to an already-
-            #   claimed post_vi (Case B collision), skip it.
 
             # post_vi -> set of pre_vi indices already written there
             post_vert_pre_vis: dict = {}
@@ -826,8 +1034,6 @@ class _ImportState:
                         vg.add([post_vi], w, "REPLACE")
                     elif pre_vi in seen_pre:
                         # Same pre-weld vertex written again (duplicate face corner
-                        # within the same bone, or same vertex in two bones — Case A).
-                        # Allow: overwrite is safe because it's the same geometric vertex.
                         vg.add([post_vi], w, "REPLACE")
                     else:
                         # A different pre-weld vertex is colliding here (Case B).
@@ -835,10 +1041,6 @@ class _ImportState:
                         pass
 
             # After welding: set smooth shading and let Blender recompute normals
-            # from geometry.  This matches the working GLB reference which uses
-            # smooth per-vertex normals throughout.  The raw .x split normals are
-            # per-loop for the pre-weld topology; applying them post-weld causes
-            # conflicting normals at merged vertices and blocky shading.
             for poly in obj.data.polygons:
                 poly.use_smooth = True
             obj.data.update()
@@ -849,14 +1051,6 @@ class _ImportState:
 
         else:
             # Unskinned mesh: apply the frame world matrix (already in Blender
-            # space because vertices were converted by conv_mat at build time).
-            # Vertices were already rotated by conv_mat during build.
-            # Bake the remaining FTM translation/scale into the vertices so the
-            # object can sit at world-origin like the skinned mesh, but first
-            # convert the FTM world matrix into Blender space.
-            # For a purely unskinned mesh with no armature the simplest correct
-            # approach is to apply only the translation portion of the converted
-            # world_mat and leave rotation at identity (vertices carry the rest).
             obj.matrix_world = Matrix.Identity(4)
             log.debug("  unskinned mesh, world origin")
             # Unskinned mesh: smooth shading, Blender recomputes normals from geometry.
@@ -886,9 +1080,6 @@ class _ImportState:
         threshold_cos = _math.cos(_math.radians(self.sharp_angle_deg))
 
         # Force Blender to recompute face normals from the welded vertex positions
-        # before we read poly.normal. Without this the normals may still reflect
-        # the pre-weld or pre-smooth-shading state and produce wrong comparisons.
-        # calc_normals() was removed in Blender 4.x; me.update() does the same job.
         if hasattr(me, "calc_normals"):
             me.calc_normals()
         else:
@@ -931,9 +1122,6 @@ class _ImportState:
         arm_obj = self.armature_obj
         scene   = context.scene
         # Set scene FPS from the first AnimationSet only.  Multiple sets in a
-        # single file all share the same tick rate so later sets would be a
-        # no-op anyway, but this makes the intent explicit and avoids repeatedly
-        # mutating a scene property that the user may have overridden manually.
         target_fps = int(round(self.ticks_per_second))
         if scene.render.fps != target_fps:
             scene.render.fps = target_fps
@@ -956,9 +1144,6 @@ class _ImportState:
 
         action = bpy.data.actions.new(anim_set_node.name or "Action")
         # Blender 5.x uses a layered action system with slots.
-        # We must assign the action AND create/assign a slot before writing
-        # any F-curve data, otherwise channelbags end up disconnected from
-        # the object and the animation plays back incorrectly.
         if hasattr(action, "slots"):
             # Blender 5.x: create a slot for the armature object
             slot = action.slots.new(id_type="OBJECT", name=arm_obj.name)
@@ -971,6 +1156,8 @@ class _ImportState:
         # Enter pose mode so rotation_mode can be set on pose bones,
         # which is needed before writing rotation_quaternion F-curves.
         bpy.ops.object.mode_set(mode="POSE")
+
+
 
         anim_nodes = anim_set_node.children_of("Animation")
         log.info("  animation tracks: %d", len(anim_nodes))
@@ -989,6 +1176,19 @@ class _ImportState:
             pose_bone = arm_obj.pose.bones[bone_name]
             key_nodes = anim_node.children_of("AnimationKey")
             log.debug("  bone '%s': %d key tracks", bone_name, len(key_nodes))
+
+            _tracks_by_type = {}
+            for _kn in key_nodes:
+                _kn_nums = _kn.nums()
+                if len(_kn_nums) >= 2:
+                    _tracks_by_type[int(_kn_nums[0])] = _kn
+            if (0 in _tracks_by_type and 1 in _tracks_by_type
+                    and 2 in _tracks_by_type and 4 not in _tracks_by_type):
+                _synth = _compose_type4_from_trs(
+                    _tracks_by_type[0], _tracks_by_type[1], _tracks_by_type[2])
+                if _synth is not None:
+                    key_nodes = [_synth]
+                    log.debug("  '%s': composed 0/1/2 tracks into type-4", bone_name)
 
             for key_node in key_nodes:
                 key_nums = key_node.nums()
@@ -1015,30 +1215,9 @@ class _ImportState:
 
                 # ── type-0 rotation setup ────────────────────────────────
                 # DX .x type-0 stores ABSOLUTE quaternion orientation in parent-local
-                # space, in (w,x,y,z) order — standard DX SDK format.
-                # Blender pose_bone.rotation_quaternion is a DELTA from rest, so we
-                # must convert:  pose_q = inv(local_rest_q) @ abs_q
-                #
-                # Special cases for parentless bones:
-                #  • Skeleton root bones (e.g. Burger_ROOTSHJnt): Maya exports these as
-                #    a true delta already, so we use abs_q directly (no inv(rest) needed).
-                #  • Auxiliary top-level bones (pupils, lids, tusks): they ARE absolute,
-                #    so we use inv(bone.matrix_local) as the rest — same formula as
-                #    child bones but the "parent" is the armature world frame.
-                #
-                # Continuous-spin bones (like spinning pupils) store a quaternion that
-                # crosses the 180° boundary during the animation. Blender's SLERP would
-                # take the short path and reverse the spin at that boundary. We call
-                # make_compatible() against the previous keyframe quaternion to keep
-                # the rotation sign consistent and preserve the continuous spin.
                 local_rest_q = None
                 is_skel_root  = (bone_name in self._skel_root_names)
-                # conv_q is the quaternion form of conv_mat's rotation.
-                # It is needed only for skeleton-root bones to bridge the gap between
-                # DX world space (where the root's type-0 absolute quaternion lives)
-                # and Blender bone-local space (what pb.rotation_quaternion expects).
-                # For child bones the conv cancels in the parent-local rest matrix,
-                # so no explicit conv_q factor is needed.
+                # _conv_q is the quaternion form of conv_mat's rotation.
                 _conv_q = self._conv_mat.to_3x3().to_quaternion()
 
                 if key_type == 0:
@@ -1050,22 +1229,14 @@ class _ImportState:
                                          @ pb.bone.matrix_local)
                         local_rest_q  = local_rest_bl.to_quaternion()
                     elif is_skel_root:
-                        # Skeleton-root bone: the DX type-0 quaternion is an absolute
-                        # rotation in DX world space.  To convert to the Blender
-                        # pose-space delta we need to factor out BOTH the rest rotation
-                        # AND the conv_mat rotation:
-                        #   pose_q = inv(rest_q @ conv_q) @ abs_q
-                        local_rest_q = pb.bone.matrix_local.to_quaternion() @ _conv_q
+                        # Skeleton-root bone: abs_q stores an ABSOLUTE rotation in
+                        local_rest_q = Quaternion()
                     else:
                         # Aux top-level bone (no children of its own driving skeleton).
-                        # The conv cancels the same way it does for child bones when
-                        # the bone's rest is expressed in armature space directly.
                         local_rest_q = pb.bone.matrix_local.to_quaternion()
 
                 # ── write keyframes directly to F-curve points ───────
                 # Bypasses scene.frame_set() + keyframe_insert() which together
-                # force a full depsgraph evaluation on every keyframe.
-                # Direct F-curve point writing is orders of magnitude faster.
 
                 # Pre-compute type-2 rest quantities once (not inside frame loop).
                 if key_type == 2:
@@ -1086,6 +1257,7 @@ class _ImportState:
                 chan_data: dict = {}   # channel_index -> [(frame, value), ...]
 
                 prev_pose_q = None
+                _dbg_done   = False   # fire once per bone/track
 
                 for frame_tick, vals in all_key_vals:
                     frame = float(frame_tick)
@@ -1096,6 +1268,16 @@ class _ImportState:
                             if prev_pose_q is not None:
                                 pose_q.make_compatible(prev_pose_q)
                             prev_pose_q = Quaternion(pose_q)
+
+                            # ── DEBUG: first keyframe only for skel_root ──
+                            if is_skel_root and not _dbg_done:
+                                _dbg_done = True
+                                _w3 = (pose_bone.bone.matrix_local @ pose_q.to_matrix().to_4x4()).to_3x3()
+                                log.debug("skel_root '%s' frame %.0f: pose_q=(%.4f,%.4f,%.4f,%.4f) fwd=%s",
+                                          bone_name, frame,
+                                          pose_q.w, pose_q.x, pose_q.y, pose_q.z,
+                                          tuple(round(v,3) for v in _w3 @ Vector((0,0,1))))
+
                             for ci, v in enumerate(pose_q):
                                 chan_data.setdefault(ci, []).append((frame, v))
 
@@ -1113,28 +1295,34 @@ class _ImportState:
                                 anim_t = _t2_conv3 @ (
                                     Vector((vals[0], vals[1], vals[2])) * self.global_scale)
                                 loc = _t2_rest_rot_inv @ (anim_t - _t2_rest_head)
+
+
+
                             for ci, v in enumerate(loc):
                                 chan_data.setdefault(ci, []).append((frame, v))
 
                         elif key_type == 4:
+                            # dx_local is the bone's parent-local transform in DX space
                             dx_local = _mat4_from_list(vals)
                             if pose_bone.parent:
-                                arm_mat = (pose_bone.parent.bone.matrix_local
-                                           @ self._conv_mat.to_3x3().to_4x4()
-                                           @ dx_local)
+                                matrix_basis = (pose_bone.bone.matrix_local.inverted()
+                                                @ pose_bone.parent.bone.matrix_local
+                                                @ dx_local)
                             else:
-                                arm_mat = self._conv_mat @ dx_local
-                            arm_q   = arm_mat.to_quaternion()
-                            arm_loc = arm_mat.to_translation()
-                            arm_sca = arm_mat.to_scale()
+                                matrix_basis = (pose_bone.bone.matrix_local.inverted()
+                                                @ self._conv_mat
+                                                @ dx_local)
+                            mb_loc = matrix_basis.to_translation()
+                            mb_rot = matrix_basis.to_quaternion()
+                            mb_sca = matrix_basis.to_scale()
                             if prev_pose_q is not None:
-                                arm_q.make_compatible(prev_pose_q)
-                            prev_pose_q = Quaternion(arm_q)
-                            for ci, v in enumerate(arm_loc):
+                                mb_rot.make_compatible(prev_pose_q)
+                            prev_pose_q = Quaternion(mb_rot)
+                            for ci, v in enumerate(mb_loc):
                                 chan_data.setdefault(10 + ci, []).append((frame, v))
-                            for ci, v in enumerate(arm_q):
+                            for ci, v in enumerate(mb_rot):
                                 chan_data.setdefault(20 + ci, []).append((frame, v))
-                            for ci, v in enumerate(arm_sca):
+                            for ci, v in enumerate(mb_sca):
                                 chan_data.setdefault(30 + ci, []).append((frame, v))
 
                     except Exception as exc:
