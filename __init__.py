@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 5, 0),
+    "version": (1, 0, 0),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
