@@ -11,8 +11,8 @@ armatures, skin weights, and keyframe animation on import and export.
 
 | Source | Status |
 |---|---|
-| fragMOTION exports (text format) | ✅ Full support |
-| Bugsnax character models | ✅ Tested |
+| fragMOTION exports (text format) | ✅ |
+| Bugsnax character models | ✅ |
 | DirectX binary format (`bin `) | ✅ |
 | MS-ZIP compressed (`tzip` / `bzip`) | ✅ |
 | 32-bit and 64-bit float variants | ✅ |
