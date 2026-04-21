@@ -100,10 +100,11 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         description=(
             "Pin the root bone's world position to its rest pose for every keyframe. "
             "The character animates in place (feet rooted) rather than walking through "
-            "the scene. Matches the behaviour of tools like fragmotion that strip "
-            "root-motion translation from the animation"
+            "the scene. Matches the behaviour of tools like Fragmotion that strip "
+            "root-motion translation from the animation. Disable if you need root motion "
+            "for a character controller"
         ),
-        default=False,
+        default=True,
     )
 
     lock_leaf_translation: BoolProperty(
@@ -269,6 +270,13 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.prop(self, "verbose_log")
         if self.verbose_log:
             box.label(text="Output goes to the launch terminal", icon="CONSOLE")
+
+    def invoke(self, context, event):
+        scene = context.scene
+        self.anim_frame_start = scene.frame_start
+        self.anim_frame_end   = scene.frame_end
+        self.anim_fps         = scene.render.fps
+        return super().invoke(context, event)
 
     def execute(self, context):
         XLog.set_verbose(self.verbose_log)

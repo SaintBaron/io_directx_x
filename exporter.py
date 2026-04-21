@@ -442,9 +442,10 @@ def _write_mesh_frame(obj, out, indent,
     ind = "\t" * indent
     log.info("  mesh '%s'", obj.name)
 
-    # Evaluated mesh (modifiers applied if requested)
-    evaluated = obj.evaluated_get(depsgraph) if use_mesh_modifiers else obj
-    me_src    = evaluated.to_mesh()
+    # Vertex positions must come from the bind pose, not the current animated
+    # frame.  obj.data always holds the raw undeformed vertex positions
+    # regardless of the current frame or depsgraph state.
+    me_src = obj.data
 
     # Work on a bmesh copy so we can optionally triangulate without touching
     # the original data. If triangulate=False we preserve n-gons so the
@@ -456,7 +457,6 @@ def _write_mesh_frame(obj, out, indent,
     me_work = bpy.data.meshes.new("_x_export_tmp")
     bm.to_mesh(me_work)
     bm.free()
-    evaluated.to_mesh_clear()
 
     me_work.update()
 
