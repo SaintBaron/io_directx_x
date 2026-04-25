@@ -73,11 +73,6 @@ own viewport behaviour. The armature and mesh face the same direction in edit mo
 where the FTM encodes an animated pose rather than the bind pose, limbs may appear crunched
 at rest; mesh vertices are automatically rebound to compensate.
 
-### Diagnostics
-| Option | Default | Description |
-|---|---|---|
-| Verbose Logging | Off | Prints per-bone and per-mesh DEBUG output to the terminal Blender was launched from; INFO / WARN / ERROR always appear |
-
 ---
 
 ## Export Options
@@ -161,5 +156,4 @@ io_directx_x/
 ├── parser.py     — Tokenizer and recursive-descent parser → XNode tree
 ├── importer.py   — XNode tree → Blender objects, armature, and animation
 ├── exporter.py   — Blender scene → .x text or binary file
-└── xlog.py       — Print-based logger that writes to the original terminal fd
 ```
