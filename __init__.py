@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 0, 0),
+    "version": (1, 5, 0),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -23,16 +23,9 @@ from bpy.props import (
 )
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 
-from .xlog    import XLog
 from .importer import import_x
 from .exporter import export_x
 
-_log = XLog("init")
-
-
-# ─────────────────────────────────────────────────────────────
-#  Import operator
-# ─────────────────────────────────────────────────────────────
 class ImportDirectX(bpy.types.Operator, ImportHelper):
     """Import a DirectX .x file"""
     bl_idname  = "import_scene.directx_x"
@@ -42,7 +35,6 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
     filename_ext = ".x"
     filter_glob: StringProperty(default="*.x", options={"HIDDEN"})
 
-    # Transform
     use_apply_transform: BoolProperty(
         name="Apply Transform",
         description="Apply the root Frame transform matrix to mesh data",
@@ -64,7 +56,6 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         default="Y",
     )
 
-    # Data
     import_normals:   BoolProperty(name="Import Normals",   default=True)
     import_uvs:       BoolProperty(name="Import UVs",       default=True)
     import_materials: BoolProperty(name="Import Materials", default=True)
@@ -94,7 +85,6 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         default='BIND',
     )
 
-    # Animation
     anim_fps: FloatProperty(
         name="Animation FPS",
         description="Override FPS (0 = read from file's AnimTicksPerSecond)",
@@ -110,16 +100,6 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
             "scene range was set to before"
         ),
         default=True,
-    )
-
-    # Logging
-    verbose_log: BoolProperty(
-        name="Verbose Logging",
-        description=(
-            "Print detailed per-bone/per-mesh DEBUG output to the terminal "
-            "you launched Blender from.  INFO/WARN/ERROR always appear."
-        ),
-        default=False,
     )
 
     def draw(self, context):
@@ -149,23 +129,11 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         box.prop(self, "anim_fps")
         box.prop(self, "set_frame_range")
 
-        box = layout.box()
-        box.label(text="Diagnostics", icon="INFO")
-        box.prop(self, "verbose_log")
-        if self.verbose_log:
-            box.label(text="Output goes to the launch terminal", icon="CONSOLE")
-
     def execute(self, context):
-        XLog.set_verbose(self.verbose_log)
-        _log.section("IMPORT")
-        keywords = self.as_keywords(ignore=("filter_glob", "verbose_log"))
+        keywords = self.as_keywords(ignore=("filter_glob",))
         result = import_x(context, **keywords)
         return result
 
-
-# ─────────────────────────────────────────────────────────────
-#  Export operator
-# ─────────────────────────────────────────────────────────────
 class ExportDirectX(bpy.types.Operator, ExportHelper):
     """Export selected objects as a DirectX .x file"""
     bl_idname  = "export_scene.directx_x"
@@ -175,7 +143,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     filename_ext = ".x"
     filter_glob: StringProperty(default="*.x", options={"HIDDEN"})
 
-    # Selection
     use_selection: BoolProperty(
         name="Selected Only",
         description="Export only selected objects",
@@ -187,7 +154,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         default=True,
     )
 
-    # Transform
     global_scale: FloatProperty(name="Scale", default=1.0, min=0.001, max=1000.0)
     axis_forward: EnumProperty(
         name="Forward Axis",
@@ -202,7 +168,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         default="Y",
     )
 
-    # Data
     export_normals:   BoolProperty(name="Export Normals",   default=True)
     export_uvs:       BoolProperty(name="Export UVs",       default=True)
     export_materials: BoolProperty(name="Export Materials", default=True)
@@ -222,7 +187,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
-    # Format
     binary_format: BoolProperty(
         name="Binary Format",
         description=(
@@ -233,17 +197,9 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
-    # Animation
     anim_fps:         FloatProperty(name="FPS", default=30.0, min=1.0, max=240.0)
     anim_frame_start: IntProperty(name="Frame Start", default=1)
     anim_frame_end:   IntProperty(name="Frame End",   default=250)
-
-    # Logging
-    verbose_log: BoolProperty(
-        name="Verbose Logging",
-        description="Print detailed DEBUG output to the launch terminal",
-        default=False,
-    )
 
     def draw(self, context):
         layout = self.layout
@@ -269,8 +225,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         if self.export_materials:
             box.prop(self, "use_original_material_data")
 
-        # ── Editable texture paths ────────────────────────────────────────
-        # Show every material that has an _x_texture_filename custom property
         if self.export_materials and self.export_textures:
             mats_with_tex = []
             for obj in context.scene.objects:
@@ -305,22 +259,13 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         row.prop(self, "anim_frame_start")
         row.prop(self, "anim_frame_end")
 
-        box = layout.box()
-        box.label(text="Diagnostics", icon="INFO")
-        box.prop(self, "verbose_log")
-        if self.verbose_log:
-            box.label(text="Output goes to the launch terminal", icon="CONSOLE")
-
     def execute(self, context):
-        XLog.set_verbose(self.verbose_log)
-        _log.section("EXPORT")
-        keywords = self.as_keywords(ignore=("filter_glob", "check_existing", "verbose_log"))
-        return export_x(context, **keywords)
+        keywords = self.as_keywords(ignore=("filter_glob", "check_existing"))
+        result, warnings = export_x(context, **keywords)
+        for msg in warnings:
+            self.report({'WARNING'}, msg)
+        return result
 
-
-# ─────────────────────────────────────────────────────────────
-#  Registration
-# ─────────────────────────────────────────────────────────────
 def menu_import(self, context):
     self.layout.operator(ImportDirectX.bl_idname, text="DirectX X (.x)")
 
@@ -334,8 +279,6 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
-    # Confirm the addon loaded — visible in terminal even before any import
-    XLog("init")._write("[DX.x] addon registered (v1.5.0)")
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)

@@ -9,7 +9,6 @@ import re
 import struct
 import zlib
 
-
 TOK_WORD   = "WORD"
 TOK_STR    = "STR"
 TOK_NUM    = "NUM"
@@ -27,7 +26,6 @@ _RE_TOKEN = re.compile(
     r'([A-Za-z_][A-Za-z0-9_.]*)',
 )
 
-
 def _tokenize(text):
     tokens = []
     for m in _RE_TOKEN.finditer(text):
@@ -44,7 +42,6 @@ def _tokenize(text):
             tokens.append((TOK_WORD, word))
     tokens.append((TOK_EOF, None))
     return tokens
-
 
 class XNode:
     __slots__ = ("kind", "name", "children", "values")
@@ -77,10 +74,6 @@ class XNode:
         return (f"<XNode {self.kind!r} name={self.name!r} "
                 f"vals={len(self.values)} children={len(self.children)}>")
 
-
-# ─────────────────────────────────────────────────────────────
-#  Text parser
-# ─────────────────────────────────────────────────────────────
 class _TextParser:
     def __init__(self, tokens):
         self._tok = tokens
@@ -158,10 +151,6 @@ class _TextParser:
                 continue
             self.consume()
 
-
-# ─────────────────────────────────────────────────────────────
-#  Binary token constants
-# ─────────────────────────────────────────────────────────────
 _BIN_TOK_NAME      = 0x01
 _BIN_TOK_STRING    = 0x02
 _BIN_TOK_INTEGER   = 0x03
@@ -181,10 +170,6 @@ _BIN_KEYWORD = {
     0x34: "array",
 }
 
-
-# ─────────────────────────────────────────────────────────────
-#  Binary parser
-# ─────────────────────────────────────────────────────────────
 class _BinaryParser:
     """Parse a DirectX binary token stream into XNode trees."""
 
@@ -392,12 +377,12 @@ class _BinaryParser:
     def _p_material(self) -> XNode:
         mat_name = self.read_name_and_brace()
         node = XNode("Material", mat_name)
-        for _ in range(4):   # diffuse RGBA
+        for _ in range(4):
             node.values.append((TOK_NUM, repr(self.read_float())))
-        node.values.append((TOK_NUM, repr(self.read_float())))  # shininess
-        for _ in range(3):   # specular RGB
+        node.values.append((TOK_NUM, repr(self.read_float())))
+        for _ in range(3):
             node.values.append((TOK_NUM, repr(self.read_float())))
-        for _ in range(3):   # emissive RGB
+        for _ in range(3):
             node.values.append((TOK_NUM, repr(self.read_float())))
         self.skip_sep()
         while self._p < self._end:
@@ -651,10 +636,6 @@ class _BinaryParser:
         self._get()
         return node
 
-
-# ─────────────────────────────────────────────────────────────
-#  MS-ZIP decompressor
-# ─────────────────────────────────────────────────────────────
 _MSZIP_MAGIC = 0x4B43
 
 def _mszip_decompress(buf: bytes, start: int) -> bytes:
@@ -671,14 +652,7 @@ def _mszip_decompress(buf: bytes, start: int) -> bytes:
             raise ValueError(f"X: zlib error in MSZIP chunk: {exc}") from exc
     return b"".join(chunks)
 
-
-# ─────────────────────────────────────────────────────────────
-#  Public entry point
-# ─────────────────────────────────────────────────────────────
 def parse_x_file(filepath: str) -> XNode:
-    """Parse a DirectX .x file (text, binary, or MS-ZIP compressed).
-    Returns an XNode tree with kind="ROOT".
-    """
     with open(filepath, "rb") as fh:
         raw = fh.read()
 
