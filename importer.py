@@ -43,11 +43,7 @@ def _mat4_from_list(vals):
     ]).transposed()
 
 class _SyntheticKeyNode:
-    """Minimal object mimicking an XNode AnimationKey for synthetic tracks.
-
-    Only .nums() is used by the AnimationKey consumer code, so we don't need
-    to implement the full XNode interface.
-    """
+    """Minimal object mimicking an XNode AnimationKey for synthetic tracks."""
     __slots__ = ("_nums",)
 
     def __init__(self, nums_list):
@@ -413,12 +409,18 @@ class _ImportState:
             mat["_x_face_color"] = (r, g, b, a)
         if len(nums) >= 5:
             shininess = nums[4]
-            roughness = max(0.0, min(1.0, 1.0 - math.log(max(shininess, 1e-6)) / math.log(128.0)))
+            # The .x format pre-dates PBR.  Most exporters (Blender's old
+            raw_roughness = max(0.0, min(1.0,
+                1.0 - math.log(max(shininess, 1e-6)) / math.log(128.0)))
+            ROUGHNESS_FLOOR = 0.5
+            roughness = ROUGHNESS_FLOOR + raw_roughness * (1.0 - ROUGHNESS_FLOOR)
             bsdf.inputs["Roughness"].default_value = roughness
             mat["_x_power"] = shininess
         if len(nums) >= 8:
             sr, sg, sb = nums[5], nums[6], nums[7]
             spec_val   = (sr + sg + sb) / 3.0
+            # Same rationale as above — the raw spec value in .x files is
+            spec_val = min(spec_val, 0.2)
             spec_input = (bsdf.inputs.get("Specular IOR Level")
                           or bsdf.inputs.get("Specular"))
             if spec_input:
@@ -429,33 +431,103 @@ class _ImportState:
         if len(nums) >= 11:
             mat["_x_emissive"] = (nums[8], nums[9], nums[10])
 
-        if self.import_textures:
-            tex_node = node.child("TextureFileName") or node.child("TextureFilename")
-            if tex_node:
-                strs = tex_node.strings()
-                if strs:
+        # Stash the texture filename on the material *unconditionally*
+        tex_node = node.child("TextureFileName") or node.child("TextureFilename")
+        original_tex_name = None
+        if tex_node:
+            strs = tex_node.strings()
+            if strs:
+                original_tex_name = strs[0].replace('\\\\', '\\')
+                mat["_x_texture_filename"] = original_tex_name
 
-                    original_tex_name = strs[0].replace('\\\\', '\\')
-                    mat["_x_texture_filename"] = original_tex_name
-                    tex_path  = original_tex_name.replace("\\", os.sep).replace("/", os.sep)
-                    full_path = os.path.join(base_dir, tex_path)
-                    stem      = os.path.splitext(full_path)[0]
-                    loaded    = False
-                    for candidate in [full_path,
-                                      stem + ".png", stem + ".jpg", stem + ".tga",
-                                      stem + ".dds"]:
-                        if os.path.exists(candidate):
-                            img          = bpy.data.images.load(candidate, check_existing=True)
-                            tex_img_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
-                            tex_img_node.image = img
-                            mat.node_tree.links.new(
-                                tex_img_node.outputs["Color"],
-                                bsdf.inputs["Base Color"],
-                            )
-                            loaded = True
+        if self.import_textures and original_tex_name:
+            tex_path  = original_tex_name.replace("\\", os.sep).replace("/", os.sep)
+            full_path = os.path.join(base_dir, tex_path)
+
+            # Build a list of plausible directories to look in.  xcache
+            tex_basename = os.path.basename(tex_path)
+            tex_subparts = tex_path.split(os.sep)
+
+            search_paths = []
+
+            # 1. Exact path from xcache, anchored at base_dir
+            search_paths.append(full_path)
+
+            # 2. Progressively shorter tails of the engine path under
+            #    base_dir (e.g. "Apple/Apple_D.dds", "Apple_D.dds")
+            for cut in range(1, len(tex_subparts)):
+                search_paths.append(os.path.join(base_dir, *tex_subparts[cut:]))
+
+            # 3. Common texture subfolders next to the xcache
+            for sub in ("Textures", "textures", "Tex", "tex"):
+                search_paths.append(os.path.join(base_dir, sub, tex_basename))
+
+            # 4. Walk up to 3 directory levels above base_dir, also with
+            ancestor = base_dir
+            for _ in range(3):
+                parent = os.path.dirname(ancestor)
+                if not parent or parent == ancestor:
+                    break
+                ancestor = parent
+                search_paths.append(os.path.join(ancestor, tex_path))
+                search_paths.append(os.path.join(ancestor, tex_basename))
+
+            # For each candidate location, try the requested extension
+            alt_exts = [".png", ".jpg", ".jpeg", ".tga", ".dds", ".bmp", ".tif", ".tiff", ".webp"]
+
+            def _expand_candidates(p):
+                yield p
+                stem, _ext = os.path.splitext(p)
+                for ext in alt_exts:
+                    yield stem + ext
+
+            img = None
+            tried = set()
+            for sp in search_paths:
+                for candidate in _expand_candidates(sp):
+                    if candidate in tried:
+                        continue
+                    tried.add(candidate)
+                    if os.path.exists(candidate):
+                        try:
+                            img = bpy.data.images.load(candidate, check_existing=True)
+                        except Exception:
+                            img = None
+                        if img is not None:
                             break
-                    if not loaded:
+                if img is not None:
+                    break
+
+            # Always create a TEX_IMAGE node and connect it to the
+            if img is None:
+                try:
+                    placeholder_name = os.path.basename(original_tex_name) or name
+                    img = bpy.data.images.get(placeholder_name)
+                    if img is None:
+                        img = bpy.data.images.new(
+                            placeholder_name, width=1, height=1, alpha=False,
+                        )
+                    # Point the placeholder at the path we wanted —
+                    try:
+                        img.filepath = full_path
+                        img.source = 'FILE'
+                    except Exception:
                         pass
+                except Exception:
+                    img = None
+
+            if img is not None:
+                tex_img_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+                tex_img_node.image = img
+                # Stash the original (engine-format) path on the
+                tex_img_node["_x_texture_filename"] = original_tex_name
+                try:
+                    mat.node_tree.links.new(
+                        tex_img_node.outputs["Color"],
+                        bsdf.inputs["Base Color"],
+                    )
+                except Exception:
+                    pass
 
         self.materials[name] = mat
         return mat

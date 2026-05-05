@@ -33,7 +33,7 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".x"
-    filter_glob: StringProperty(default="*.x", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.x;*.xcache", options={"HIDDEN"})
 
     use_apply_transform: BoolProperty(
         name="Apply Transform",
@@ -141,7 +141,7 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     bl_options = {"REGISTER"}
 
     filename_ext = ".x"
-    filter_glob: StringProperty(default="*.x", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.x;*.xcache", options={"HIDDEN"})
 
     use_selection: BoolProperty(
         name="Selected Only",
@@ -159,7 +159,8 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         name="Forward Axis",
         items=[("-Z","−Z",""),("Z","Z",""),("Y","Y",""),
                ("-Y","−Y",""),("X","X",""),("-X","−X","")],
-        default="-Z",
+        # Match the importer's default ("Z") so a re-export of an imported
+        default="Z",
     )
     axis_up: EnumProperty(
         name="Up Axis",
@@ -187,14 +188,17 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
-    binary_format: BoolProperty(
-        name="Binary Format",
-        description=(
-            "Write a DirectX binary (.x bin) file instead of text (.x txt). "
-            "Binary files are smaller and parse faster but are not human-readable. "
-            "Leave off (default) to produce standard text format."
-        ),
-        default=False,
+    export_format: EnumProperty(
+        name="Format",
+        description="Output file format",
+        items=[
+            ("TEXT_X",            "Text .x",              "DirectX text format (human-readable)"),
+            ("BINARY_X",          "Binary .x",            "DirectX binary format (smaller, faster to parse)"),
+            ("COMPRESSED_TEXT_X", "Compressed Text .x",   "DirectX text format compressed with MSZIP (tzip)"),
+            ("COMPRESSED_BIN_X",  "Compressed Binary .x", "DirectX binary format compressed with MSZIP (bzip)"),
+            ("XCACHE",            "Binary .xcache",      "Horsepower Engine SEMS .xcache (skeleton + animation only — no mesh)"),
+        ],
+        default="TEXT_X",
     )
 
     anim_fps:         FloatProperty(name="FPS", default=30.0, min=1.0, max=240.0)
@@ -246,7 +250,7 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
 
         box = layout.box()
         box.label(text="Format", icon="FILE_BLANK")
-        box.prop(self, "binary_format")
+        box.prop(self, "export_format")
 
         box = layout.box()
         box.label(text="Armature & Animation", icon="ARMATURE_DATA")
@@ -259,9 +263,79 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         row.prop(self, "anim_frame_start")
         row.prop(self, "anim_frame_end")
 
+    def invoke(self, context, event):
+        # Pre-populate the frame range from the current scene so that after
+        sc = context.scene
+        self.anim_frame_start = sc.frame_start
+        self.anim_frame_end   = sc.frame_end
+        return super().invoke(context, event)
+
+    def check(self, context):
+        """Update the filename extension when the format dropdown changes."""
+        import os as _os
+        fp = self.filepath or ""
+        base, cur_ext = _os.path.splitext(fp)
+        wanted_ext = ".xcache" if self.export_format == "XCACHE" else ".x"
+
+        changed = False
+        if cur_ext.lower() in (".x", ".xcache", ".xanim"):
+            # User-chosen extension — respect it.  Sync filename_ext so
+            # ExportHelper doesn't keep rewriting things behind our back.
+            self.filename_ext = cur_ext.lower()
+        elif not cur_ext:
+            self.filepath = fp + wanted_ext
+            self.filename_ext = wanted_ext
+            changed = True
+        else:
+            # Some unrelated extension — keep filename_ext aligned with
+            # the dropdown.
+            self.filename_ext = wanted_ext
+
+        # Defer to ExportHelper for any other normalization it wants to do
+        super_changed = super().check(context)
+        return changed or super_changed
+
     def execute(self, context):
         keywords = self.as_keywords(ignore=("filter_glob", "check_existing"))
-        result, warnings = export_x(context, **keywords)
+
+        # Pull format off keywords; default routes to text .x
+        fmt = keywords.pop("export_format", "TEXT_X")
+
+        # If the user explicitly typed a filename ending in .xcache, that
+        import os as _os
+        base, cur_ext = _os.path.splitext(self.filepath)
+        cur_ext_lower = cur_ext.lower()
+        if cur_ext_lower == ".xcache":
+            fmt = "XCACHE"
+        elif cur_ext_lower == ".x":
+            # Honour the dropdown's choice between TEXT_X and BINARY_X,
+            # but never let it pick XCACHE when the file is .x.
+            if fmt == "XCACHE":
+                fmt = "TEXT_X"
+        elif not cur_ext_lower:
+            # No extension at all — fall back to the dropdown and append
+            # the matching extension.
+            wanted_ext = ".xcache" if fmt == "XCACHE" else ".x"
+            self.filepath = base + wanted_ext
+            keywords["filepath"] = self.filepath
+
+        if fmt == "XCACHE":
+            from .exporter import export_xcache_from_blender
+            # The Blender bridge takes only the parameters it understands;
+            # filter the keyword dict to drop .x-specific options it ignores.
+            xc_keywords = {k: v for k, v in keywords.items() if k in (
+                "filepath", "use_selection", "use_mesh_modifiers", "global_scale",
+                "axis_forward", "axis_up",
+                "export_armature", "export_weights", "export_animation",
+                "anim_frame_start", "anim_frame_end",
+            )}
+            result, warnings = export_xcache_from_blender(context, **xc_keywords)
+        else:
+            # Map format choice to (binary_format, compress) flags
+            keywords["binary_format"] = fmt in ("BINARY_X", "COMPRESSED_BIN_X")
+            keywords["compress"]      = fmt in ("COMPRESSED_TEXT_X", "COMPRESSED_BIN_X")
+            result, warnings = export_x(context, **keywords)
+
         for msg in warnings:
             self.report({'WARNING'}, msg)
         return result
