@@ -378,14 +378,21 @@ def export_x(context, filepath,
                     local_bl = parent_world_bl.inverted() @ world_bl
 
                     dx_local = local_bl
+                    dx_rot = dx_local.to_3x3()
+                    dx_t   = dx_local.to_translation()
+                    dx_s   = dx_local.to_scale()
+                    q      = dx_rot.to_quaternion()
                 else:
-
-                    dx_local = _bl_bone_to_dx_world(world_bl, bl_to_dx_3, inv_scale)
-
-                dx_rot = dx_local.to_3x3()
-                dx_t   = dx_local.to_translation()
-                dx_s   = dx_local.to_scale()
-                q      = dx_rot.to_quaternion()
+                    # ROOT bone: rotation is the pose-bone-local pose offset
+                    # (matrix_basis), NOT the bone's world DX matrix.  The
+                    # importer treats the file's stored quaternion as the
+                    # pose offset for the skeleton root (local_rest_q is
+                    # identity), so the round-trip requires q = pose_q.
+                    # Position and scale still come from the world matrix.
+                    dx_world = _bl_bone_to_dx_world(world_bl, bl_to_dx_3, inv_scale)
+                    dx_t = dx_world.to_translation()
+                    dx_s = dx_world.to_scale()
+                    q    = pb.matrix_basis.to_3x3().to_quaternion()
 
                 qw, qx, qy, qz = q.w, -q.x, -q.y, -q.z
 
@@ -743,21 +750,80 @@ def _write_3x4_plus_translation(out: bytearray, m16: List[float]) -> None:
     out += struct.pack('<16f', *m16)
 
 
-def _write_decoration_block(out: bytearray, bind_translation: Tuple[float, float, float]) -> None:
-    """Write the 100-byte 'decoration' block that follows the 3 matrix copies"""
-    bx, by, bz = bind_translation
-    # 32 zero bytes
-    out += b'\x00' * 32
-    # (0, 1, 1, 0)
-    out += struct.pack('<4f', 0.0, 1.0, 1.0, 0.0)
-    # (-0, 0, 0, 1) — note negative-zero pattern observed in samples
-    out += struct.pack('<4f', -0.0, 0.0, 0.0, 1.0)
-    # (-0, 0, -0, -0)
-    out += struct.pack('<4f', -0.0, 0.0, -0.0, -0.0)
-    # (1, 0, 0, -by)
-    out += struct.pack('<4f', 1.0, 0.0, 0.0, -float(by))
-    # (-bz)
-    out += struct.pack('<f', -float(bz))
+def _invert_dx_matrix(m16):
+    """Invert a 4x4 matrix stored as 16 floats in DirectX row-major form,
+    returning the inverse in the same row-major form. Used to compute the
+    SkinWeights matrixOffset (= inverse of the bone's world bind pose).
+
+    Falls back to identity if the matrix is singular (very rare; usually
+    means a bone with zero scale baked into its bind, like the Lid* bones
+    on Apple/Celery — in which case identity is a sensible default).
+    """
+    # Treat the row-major DX form as a column-vec matrix by transposing,
+    # invert in column-vec form, then transpose back to row-major.
+    try:
+        # Build col-vec matrix: m_col[r][c] = m16[c*4 + r]
+        m_col = Matrix([
+            [m16[0],  m16[4],  m16[8],  m16[12]],
+            [m16[1],  m16[5],  m16[9],  m16[13]],
+            [m16[2],  m16[6],  m16[10], m16[14]],
+            [m16[3],  m16[7],  m16[11], m16[15]],
+        ])
+        inv_col = m_col.inverted()
+        # Transpose back to row-major DX form
+        out = []
+        for r in range(4):
+            for c in range(4):
+                out.append(float(inv_col[c][r]))
+        return out
+    except Exception:
+        # Identity fallback if matrix is singular
+        return [1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0]
+
+
+def _write_decoration_block(out: bytearray,
+                              skin_offset: Optional[List[float]] = None,
+                              bind_translation: Optional[Tuple[float, float, float]] = None) -> None:
+    """Write the 104-byte block that follows the 3 matrix copies in each
+    bone's data section.
+
+    Layout (verified against original game xcache files):
+        +0..+39   (40 bytes): 9 floats of 0.0 + 1 float of 1.0
+        +40..+103 (64 bytes): the bone's SkinWeights matrixOffset
+                              (= inverse of the bone's world-space bind pose,
+                               in DirectX row-major form)
+
+    For bones where we have the proper skin_offset matrix, write that
+    directly. For backwards compatibility (e.g. mesh frames that aren't
+    real bones), accept a bind_translation and synthesize an offset that
+    matches the historical hardcoded pattern (identity rotation + inverse
+    of the bind translation), which is what the old version of this
+    function produced.
+    """
+    # 40-byte prefix: 9 zero floats + 1.0
+    out += b'\x00' * 36
+    out += struct.pack('<f', 1.0)
+
+    # 64-byte skin offset matrix
+    if skin_offset is not None and len(skin_offset) == 16:
+        out += struct.pack('<16f', *skin_offset)
+    else:
+        # Fallback: identity rotation + inverse bind translation. This
+        # matches what the original 100-byte hardcoded decoration block
+        # produced for ROOT bones (and is correct for any bone whose bind
+        # has no rotation).
+        if bind_translation is None:
+            bx = by = bz = 0.0
+        else:
+            bx, by, bz = bind_translation
+        out += struct.pack('<16f',
+                            1.0, 0.0, -0.0, 0.0,
+                           -0.0, 1.0, -0.0, 0.0,
+                           -0.0, -0.0, 1.0, 0.0,
+                           -float(bx), -float(by), -float(bz), 1.0)
 
 
 def _write_position_stride16(out: bytearray, pos_keys: dict, max_tick: int) -> int:
@@ -1020,13 +1086,17 @@ def _write_mesh_block(out: bytearray, mesh: dict) -> None:
     out += name_bytes
     out += struct.pack('<16f', *mesh['ftm'])
 
-    # 292-byte standard bone-style pre-anim header.  We write three identity-
+    # 296-byte standard bone-style pre-anim header: 3 matrix copies (192)
+    # + 40-byte prefix + 64-byte skin offset matrix (104) = 296 bytes.
     ftm = mesh['ftm']
     bind_translation = (ftm[12], ftm[13], ftm[14])
     out += struct.pack('<16f', *ftm)   # bind copy 1
     out += struct.pack('<16f', *ftm)   # bind copy 2
     out += struct.pack('<16f', *ftm)   # bind copy 3 (= FTM)
-    _write_decoration_block(out, bind_translation)
+    # Mesh frames are not real bones; they have no SkinWeights matrixOffset.
+    # Use the bind_translation fallback path (= identity rotation + inverse
+    # translation), which is what the original game files store here.
+    _write_decoration_block(out, bind_translation=bind_translation)
 
     # 144-byte common material header
     bbox_min, bbox_max = _compute_bbox(mesh.get('verts', []))
@@ -1108,8 +1178,18 @@ def _write_bone_block(out: bytearray, bone: dict, animated: bool, max_tick: int)
     _write_3x4_plus_translation(out, bind)
     _write_3x4_plus_translation(out, bone['ftm'])
 
-    # 100-byte decoration block
-    _write_decoration_block(out, bind_translation)
+    # 104-byte block: 40-byte prefix + 64-byte SkinWeights matrixOffset
+    # (= inverse of the bone's world-space bind pose). This is read back
+    # by the parser at ftm_offset + 296 and used as the SkinWeights offset
+    # matrix for skinning. Without the proper offset matrix, vertices
+    # weighted to non-root bones get the bone's full world transform
+    # applied without subtracting their bind position, producing scattered
+    # bones and wrong mesh deformation during animation.
+    skin_offset = bone.get('skin_offset')
+    if skin_offset is None:
+        skin_offset = _invert_dx_matrix(bind)
+    _write_decoration_block(out, skin_offset=skin_offset,
+                              bind_translation=bind_translation)
 
     # Animation channels (only if animated)
     if animated and max_tick >= 1:
@@ -1288,6 +1368,7 @@ def collect_bones_from_armature(arm_obj, bl_to_dx_3, inv_scale, scene=None,
             'parent_idx': parent_idx,
             'ftm': ftm_floats,
             'bind_pose': bind_floats,
+            'skin_offset': _invert_dx_matrix(bind_floats),
             'pos_keys': {},
             'scale_keys': {},
             'rot_keys': {},
@@ -1315,12 +1396,22 @@ def collect_bones_from_armature(arm_obj, bl_to_dx_3, inv_scale, scene=None,
                         parent_world = pb.parent.matrix.copy()
                         local_bl = parent_world.inverted() @ world_bl
                         dx_local = local_bl
+                        rot = dx_local.to_3x3()
+                        t   = dx_local.to_translation()
+                        s   = dx_local.to_scale()
+                        q   = rot.to_quaternion()
                     else:
-                        dx_local = _bl_bone_to_dx_world(world_bl, bl_to_dx_3, inv_scale)
-                    rot = dx_local.to_3x3()
-                    t   = dx_local.to_translation()
-                    s   = dx_local.to_scale()
-                    q   = rot.to_quaternion()
+                        # ROOT: rotation is the pose-bone-local offset
+                        # (matrix_basis); position/scale come from world.
+                        # The importer's local_rest_q for a skel-root is the
+                        # identity quaternion, so it interprets the file's
+                        # stored quat as the pose offset directly — round-trip
+                        # therefore requires writing pose_q, not the bone's
+                        # absolute world rotation.
+                        dx_world = _bl_bone_to_dx_world(world_bl, bl_to_dx_3, inv_scale)
+                        t = dx_world.to_translation()
+                        s = dx_world.to_scale()
+                        q = pb.matrix_basis.to_3x3().to_quaternion()
                     # The .xcache animation rotation convention stores the
                     bone_dicts[bone_idx]['rot_keys']  [tick] = (-q.x, -q.y, -q.z, q.w)
                     bone_dicts[bone_idx]['scale_keys'][tick] = (s.x, s.y, s.z)

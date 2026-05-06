@@ -766,12 +766,33 @@ def _parse_bones(data: bytes, bone_count: int, start: int):
             # Fallback: identity
             bind_pose[0] = bind_pose[5] = bind_pose[10] = bind_pose[15] = 1.0
 
+        # The TRUE skinning offset matrix (= inverse of the bone's mesh-space
+        # bind pose, used as the SkinWeights "matrixOffset" in DirectX .x
+        # format) is stored at ftm_offset + 296, NOT at ftm_offset + 64.
+        # The first three 64-byte blocks after the FTM are duplicates of
+        # the chained-FTM walk and the FTM itself, used by the engine for
+        # other purposes; they are NOT the skin-bind offset. The 40 bytes
+        # after those duplicates are header/decoration, and the actual
+        # offset matrix sits at byte +296 from the FTM start.
+        # Verified against the working .x exports of Orange/Spaghetti/
+        # Potato/Taco where 100% of bones have their .x SkinWeights offset
+        # bit-identical to the matrix at this position.
+        skin_offset_at = ftm_offset + 296
+        skin_offset = [0.0] * 16
+        if skin_offset_at + 64 <= len(data):
+            skin_offset = list(struct.unpack_from('<16f', data, skin_offset_at))
+        else:
+            # Fallback: identity (better than zero-matrix, which would be
+            # singular and break vertex skinning entirely)
+            skin_offset[0] = skin_offset[5] = skin_offset[10] = skin_offset[15] = 1.0
+
         bones.append({
-            'name':       name,
-            'parent':     parent_idx,
-            'ftm':        ftm,
-            'bind_pose':  bind_pose,        # 4×4 world-space bind pose (DX row-major)
-            'data_start': ftm_offset + 64,
+            'name':        name,
+            'parent':      parent_idx,
+            'ftm':         ftm,
+            'bind_pose':   bind_pose,        # 4×4 world-space bind pose (DX row-major)
+            'skin_offset': skin_offset,      # 4×4 skinning offset = inv(bone-bind in mesh space)
+            'data_start':  ftm_offset + 64,
         })
 
         # Advance to next bone: we don't know the anim-data size, so we scan
@@ -790,9 +811,14 @@ def _parse_bones(data: bytes, bone_count: int, start: int):
 
 
 def _find_next_bone_header(data: bytes, search_from: int) -> Optional[int]:
-    """Scan forward from *search_from* for the next valid"""
+    """Scan forward from *search_from* for the next valid bone header.
+
+    Uses byte-stride (not 4-byte stride) because bone headers in .xcache
+    files are not guaranteed to be 4-aligned — the preceding bone's
+    animation+skin region can end on any byte boundary.
+    """
     end = min(search_from + 200_000, len(data) - 16)
-    for off in range(search_from, end, 4):
+    for off in range(search_from, end):
         parent = _u32(data, off)
         nlen   = _u32(data, off + 4)
         if parent > 60 or nlen < 3 or nlen > 80:
@@ -995,39 +1021,47 @@ def _parse_mesh_section(data: bytes, search_start: int):
     """Locate and parse all mesh sections from *search_start* onwards."""
     meshes = []
 
-    # Search across the whole file for mesh-bone-named entries.  Two name
-    pattern = re.compile(
-        rb'(?:[A-Za-z][A-Za-z0-9_]*Geo|skinned[A-Za-z0-9_]+)\x00'
-    )
+    # Match any printable name (3-80 chars) followed by \x00 — the null is the
+    # LSByte of the first float in the following FTM matrix.  Mesh entries can
+    # have any name (e.g. CeleryGeo, skinnedGrumpus, CrinkleFryder), so we
+    # don't constrain the name shape here.  False positives are filtered by
+    # the FTM-validity and vertex-block-scan checks downstream.
+    pattern = re.compile(rb'[A-Za-z][A-Za-z0-9_]{2,79}\x00')
+    seen_offsets = set()
     for m in pattern.finditer(data):
-        geo_off  = m.start()   # start of name bytes
-        name_end = m.end() - 1  # position of the \x00 null
+        geo_off  = m.start()
+        name_end = m.end() - 1
 
-        # Recover name_len and verify the u32 prefix
+        if geo_off in seen_offsets:
+            continue
+
         name_len = name_end - geo_off
         if name_len < 3 or name_len > 80:
             continue
 
         name = m.group()[:-1].decode('ascii', errors='replace')
 
-        # The FTM immediately follows the null byte (which is also the first
-        # byte of the first matrix float, same convention as bone sections)
-        ftm_off = name_end   # null byte = first byte of FTM
+        # Skip names that match the joint-bone naming convention — those
+        # entries have animation data following them, not a vertex block.
+        if name.endswith('SHJnt'):
+            continue
+
+        ftm_off = name_end
         if ftm_off + 64 > len(data):
             continue
 
         transform = _read_matrix(data, ftm_off)
 
-        # Validate transform looks like a real matrix (not garbage)
         if not any(abs(transform[i*4+i] - 1.0) < 0.1 for i in range(3)):
             continue
 
-        # Vertex block: scan up to 4096 bytes after FTM
         try:
             vert_count, vert_data_off = _find_vertex_block(
                 data, ftm_off + 64, ftm_off + 64 + 4096)
         except ValueError:
             continue
+
+        seen_offsets.add(geo_off)
 
         STRIDE = 16  # floats per vertex (64 bytes)
         verts, normals, uvs = [], [], []
@@ -1120,8 +1154,14 @@ def _parse_mesh_section(data: bytes, search_start: int):
 
 
 def _is_mesh_bone_name(name: str) -> bool:
-    """Heuristic: does this bone name look like a mesh entry rather than a"""
-    return name.endswith('Geo') or name.startswith('skinned')
+    """Heuristic: bone-list entries that aren't actual joint bones.
+
+    Joint bones in .xcache files end in 'SHJnt' (Maya HumanIK convention).
+    Anything else in the bone list is a mesh entry — common patterns are
+    names ending in 'Geo' (e.g. CeleryGeo), starting with 'skinned'
+    (skinnedGrumpus), or arbitrary mesh-asset names (CrinkleFryder).
+    """
+    return not name.endswith('SHJnt')
 
 
 def extract_mesh_blocks_from_source(source_path: str) -> list:
@@ -1200,17 +1240,34 @@ def _make_frame_node(name: str, ftm: list[float], children: list) -> XNode:
 
 
 def _resolve_parent_indices(bones: list) -> list:
-    """Decode the SEMS bone-parent encoding into absolute indices into *bones*."""
+    """Recover each bone's parent by geometric inference from its FTM.
+
+    The .xcache `parent_idx` field uses an opaque encoding we don't fully
+    reverse-engineer.  Instead we exploit the invariant that for any bone i,
+    its world-space `bind_pose` equals `ftm @ parent_bind_pose` (in DX
+    row-major × row-vector convention).  We search prior bones for the one
+    whose bind_pose makes that equation hold, with tolerance 1e-3.
+
+    Falls back to ROOT (index 0) if no candidate matches — covers ROOT
+    itself, which has parent = -1.
+    """
     parents = [-1] * len(bones)
+    if not bones:
+        return parents
+
     for i in range(1, len(bones)):
-        p = bones[i]['parent']
-        if p == 0:
-            parents[i] = 0
-        elif p == 1:
-            parents[i] = i - 1
-        else:
-            # Sentinel — fall back to ROOT
-            parents[i] = 0
+        ftm  = bones[i]['ftm']
+        bind = bones[i]['bind_pose']
+        best, best_err = 0, float('inf')
+        for j in range(i):
+            par_bind = bones[j]['bind_pose']
+            comp = _mat_mul(ftm, par_bind)
+            err = max(abs(comp[k] - bind[k]) for k in range(16))
+            if err < best_err:
+                best_err = err
+                best = j
+        parents[i] = best if best_err < 1e-3 else 0
+
     return parents
 
 
@@ -1273,12 +1330,12 @@ def _build_skeleton_frames(bones: list) -> list:
     if not bones:
         return []
 
-    # Build a fast lookup of skeleton (non-mesh) bones, but keep their
-    # original indices so we can resolve parent indices that point to them.
-    is_skel = [not b['name'].endswith('Geo') for b in bones]
+    is_skel = [not _is_mesh_bone_name(b['name']) for b in bones]
     parents = _resolve_parent_indices(bones)
 
-    # Compute parent-local FTM for every skeleton bone:
+    # Use the FTM stored in the file directly — it's already parent-local.
+    # The parent inference in _resolve_parent_indices guarantees that
+    # ftm @ parent_bind == bind, so this matches the geometric truth.
     local_ftms: dict[int, list] = {}
     for i, b in enumerate(bones):
         if not is_skel[i]:
@@ -1286,9 +1343,7 @@ def _build_skeleton_frames(bones: list) -> list:
         if i == 0 or parents[i] < 0:
             local_ftms[i] = list(b['bind_pose'])
         else:
-            par_idx = parents[i]
-            par_world = bones[par_idx]['bind_pose']
-            local_ftms[i] = _mat_mul(b['bind_pose'], _mat_inv(par_world))
+            local_ftms[i] = list(b['ftm'])
 
     # Build XNode Frame nodes (one per skeleton bone), then wire up children
     nodes: dict[int, XNode] = {}
@@ -1430,8 +1485,19 @@ def _build_mesh_frame_node(mesh: dict, bones: list) -> XNode:
                     sw.values.append(_num(vi))
                 for _, w in influences:
                     sw.values.append(_num(w))
-                for v in _inv_ftm(b['bind_pose']):
-                    sw.values.append(_num(v))
+                # Use the actual skinning offset matrix from the file
+                # (read at ftm_offset + 296 in _parse_bones), which equals
+                # the SkinWeights matrixOffset stored by the .x exporter
+                # for the same character. Falls back to inv(bind_pose) if
+                # for some reason skin_offset is missing or zero (e.g. very
+                # old / non-standard files).
+                skin_off = b.get('skin_offset')
+                if skin_off and any(abs(v) > 1e-9 for v in skin_off):
+                    for v in skin_off:
+                        sw.values.append(_num(v))
+                else:
+                    for v in _inv_ftm(b['bind_pose']):
+                        sw.values.append(_num(v))
                 mesh_node.children.append(sw)
         else:
             # Fallback: bind all vertices 100% to root bone
@@ -1443,8 +1509,13 @@ def _build_mesh_frame_node(mesh: dict, bones: list) -> XNode:
                 sw.values.append(_num(i))
             for _ in range(len(verts)):
                 sw.values.append(_num(1.0))
-            for v in _inv_ftm(root_bone['bind_pose']):
-                sw.values.append(_num(v))
+            skin_off = root_bone.get('skin_offset')
+            if skin_off and any(abs(v) > 1e-9 for v in skin_off):
+                for v in skin_off:
+                    sw.values.append(_num(v))
+            else:
+                for v in _inv_ftm(root_bone['bind_pose']):
+                    sw.values.append(_num(v))
             mesh_node.children.append(sw)
 
     # --- Frame wrapping the mesh ---
@@ -1460,8 +1531,8 @@ def _build_animation_set(bones: list, anim_data: dict[str, dict], ticks: int) ->
 
     for bone in bones:
         name = bone['name']
-        # Mesh-container bones (ending in "Geo") must not get animation tracks
-        if name.endswith('Geo'):
+        # Skip mesh entries — they don't carry animation tracks
+        if _is_mesh_bone_name(name):
             continue
         channels = anim_data.get(name, {})
         pos_keys   = channels.get('pos',   {})

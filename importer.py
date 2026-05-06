@@ -1059,7 +1059,23 @@ class _ImportState:
                         local_rest_q  = local_rest_bl.to_quaternion()
                     elif is_skel_root:
 
-                        local_rest_q = Quaternion()
+                        # The skeleton root has no Blender parent, but its
+                        # bind pose may have a non-identity rotation (e.g.
+                        # Celery's ROOT is tilted ~2.2°, SweetFry's ~3°).
+                        # For those, we need to subtract the bind rotation
+                        # from abs_q so that pose_q represents the animated
+                        # rotation relative to the bind — the same thing
+                        # the non-root branch does implicitly.
+                        #
+                        # bone.matrix_local = conv @ src_bind_col, so the
+                        # un-conv'd bind rotation is conv.inv @ matrix_local.
+                        # For characters with identity ROOT bind (Apple,
+                        # ChiDog, Lizbert, etc.) this is identity and
+                        # local_rest_q is identity — matching the previous
+                        # behaviour exactly.
+                        _src_bind_bl = (self._conv_mat.inverted()
+                                        @ pb.bone.matrix_local)
+                        local_rest_q = _src_bind_bl.to_3x3().to_quaternion()
                     else:
 
                         local_rest_q = pb.bone.matrix_local.to_quaternion()
