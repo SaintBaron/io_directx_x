@@ -278,10 +278,16 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         wanted_ext = ".xcache" if self.export_format == "XCACHE" else ".x"
 
         changed = False
-        if cur_ext.lower() in (".x", ".xcache", ".xanim"):
-            # User-chosen extension — respect it.  Sync filename_ext so
-            # ExportHelper doesn't keep rewriting things behind our back.
-            self.filename_ext = cur_ext.lower()
+        cur_ext_lower = cur_ext.lower()
+        if cur_ext_lower in (".x", ".xcache", ".xanim"):
+            # One of our extensions is already there.  If it matches what
+            # the dropdown wants, keep it.  Otherwise swap it for the
+            # dropdown's choice so the user doesn't have to retype the
+            # filename when toggling between .x and .xcache.
+            if cur_ext_lower != wanted_ext:
+                self.filepath = base + wanted_ext
+                changed = True
+            self.filename_ext = wanted_ext
         elif not cur_ext:
             self.filepath = fp + wanted_ext
             self.filename_ext = wanted_ext
