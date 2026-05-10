@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 1, 0),
+    "version": (1, 0, 1),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -33,7 +33,13 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".x"
-    filter_glob: StringProperty(default="*.x;*.xcache", options={"HIDDEN"})
+    filter_glob: StringProperty(
+        # Include uppercase variants because Project Zomboid (and some
+        # legacy DirectX SDK exports) ship files as `.X` rather than `.x`,
+        # and fnmatch is case-sensitive on Linux/macOS.
+        default="*.x;*.X;*.xcache;*.XCACHE",
+        options={"HIDDEN"},
+    )
 
     use_apply_transform: BoolProperty(
         name="Apply Transform",
@@ -60,6 +66,17 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
     import_uvs:       BoolProperty(name="Import UVs",       default=True)
     import_materials: BoolProperty(name="Import Materials", default=True)
     import_textures:  BoolProperty(name="Import Textures",  default=True)
+    smooth_shade_from_faces: BoolProperty(
+        name="Smooth Shade from Faces",
+        description=(
+            "Apply Blender's shade-smooth pass to imported meshes so face "
+            "normals are averaged at shared vertices.  Useful for files "
+            "where the file-stored per-loop normals don't render cleanly "
+            "(e.g. faceting that the artist didn't intend).  Untick to "
+            "keep the file's authored normals exactly as-is"
+        ),
+        default=False,
+    )
 
     import_armature:  BoolProperty(name="Import Armature",  default=True)
     import_weights:   BoolProperty(name="Import Weights",   default=True)
@@ -116,6 +133,7 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         box = layout.box()
         box.label(text="Data", icon="MESH_DATA")
         box.prop(self, "import_normals")
+        box.prop(self, "smooth_shade_from_faces")
         box.prop(self, "import_uvs")
         box.prop(self, "import_materials")
         box.prop(self, "import_textures")
@@ -141,7 +159,10 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     bl_options = {"REGISTER"}
 
     filename_ext = ".x"
-    filter_glob: StringProperty(default="*.x;*.xcache", options={"HIDDEN"})
+    filter_glob: StringProperty(
+        default="*.x;*.X;*.xcache;*.XCACHE",
+        options={"HIDDEN"},
+    )
 
     use_selection: BoolProperty(
         name="Selected Only",
@@ -201,7 +222,30 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         default="TEXT_X",
     )
 
-    anim_fps:         FloatProperty(name="FPS", default=30.0, min=1.0, max=240.0)
+    pz_compat: BoolProperty(
+        name="High-precision animation ticks",
+        description=(
+            "Write the animation block with the conventions used by 3DS Max "
+            "biped exports (and games like Project Zomboid):\n"
+            "  • AnimTicksPerSecond = 4800 (vs the FPS field's value)\n"
+            "  • AnimationKey nodes named 'R', 'S', 'T' (rotation/scale/translation)\n"
+            "Blender frame numbers are scaled to the 4800-tick rate so the "
+            "animation plays at the correct real-time speed. Has no effect "
+            "when exporting .xcache."
+        ),
+        default=False,
+    )
+
+    anim_fps: FloatProperty(
+        name="FPS",
+        description=(
+            "Animation tick rate (AnimTicksPerSecond) and target real-time "
+            "playback rate. Blender frame numbers are written directly as "
+            "tick values. When Project Zomboid Compatibility is on, this "
+            "field is ignored and 4800 is used instead."
+        ),
+        default=30.0, min=1.0, max=10000.0,
+    )
     anim_frame_start: IntProperty(name="Frame Start", default=1)
     anim_frame_end:   IntProperty(name="Frame End",   default=250)
 
@@ -257,6 +301,10 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.prop(self, "export_armature")
         box.prop(self, "export_weights")
         box.prop(self, "export_animation")
+        # The high-precision-ticks option only affects .x animation
+        # output; .xcache has its own engine-specific layout.
+        if self.export_format != "XCACHE":
+            box.prop(self, "pz_compat")
         row = box.row()
         row.prop(self, "anim_fps")
         row = box.row()

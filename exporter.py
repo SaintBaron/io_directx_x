@@ -43,6 +43,179 @@ _BT_CBRACE    = 0x000b
 _BT_COMMA     = 0x0013
 _BT_SEMICOLON = 0x0014
 
+# Standard DirectX .x template declarations. Many DirectX consumers
+# (including Project Zomboid's engine and 3DS Max's loader) expect these
+# templates to be declared at the top of every text-format .x file —
+# they describe the layout of subsequent data nodes. When we have a
+# stashed template block from an importer round-trip we use that;
+# otherwise we fall back to this canonical set covering everything our
+# exporter can emit.
+_DEFAULT_TEMPLATES = """template ColorRGBA {
+ <35ff44e0-6c7c-11cf-8f52-0040333594a3>
+ FLOAT red;
+ FLOAT green;
+ FLOAT blue;
+ FLOAT alpha;
+}
+
+template ColorRGB {
+ <d3e16e81-7835-11cf-8f52-0040333594a3>
+ FLOAT red;
+ FLOAT green;
+ FLOAT blue;
+}
+
+template Material {
+ <3d82ab4d-62da-11cf-ab39-0020af71e433>
+ ColorRGBA faceColor;
+ FLOAT power;
+ ColorRGB specularColor;
+ ColorRGB emissiveColor;
+ [...]
+}
+
+template TextureFilename {
+ <a42790e1-7810-11cf-8f52-0040333594a3>
+ STRING filename;
+}
+
+template Frame {
+ <3d82ab46-62da-11cf-ab39-0020af71e433>
+ [...]
+}
+
+template Matrix4x4 {
+ <f6f23f45-7686-11cf-8f52-0040333594a3>
+ array FLOAT matrix[16];
+}
+
+template FrameTransformMatrix {
+ <f6f23f41-7686-11cf-8f52-0040333594a3>
+ Matrix4x4 frameMatrix;
+}
+
+template Vector {
+ <3d82ab5e-62da-11cf-ab39-0020af71e433>
+ FLOAT x;
+ FLOAT y;
+ FLOAT z;
+}
+
+template MeshFace {
+ <3d82ab5f-62da-11cf-ab39-0020af71e433>
+ DWORD nFaceVertexIndices;
+ array DWORD faceVertexIndices[nFaceVertexIndices];
+}
+
+template Mesh {
+ <3d82ab44-62da-11cf-ab39-0020af71e433>
+ DWORD nVertices;
+ array Vector vertices[nVertices];
+ DWORD nFaces;
+ array MeshFace faces[nFaces];
+ [...]
+}
+
+template MeshFaceWraps {
+ <ed1ec5c0-c0a8-11d0-941c-0080c80cfa7b>
+ DWORD nFaceWrapValues;
+ array Boolean2d faceWrapValues[nFaceWrapValues];
+}
+
+template MeshTextureCoords {
+ <f6f23f40-7686-11cf-8f52-0040333594a3>
+ DWORD nTextureCoords;
+ array Coords2d textureCoords[nTextureCoords];
+}
+
+template Coords2d {
+ <f6f23f44-7686-11cf-8f52-0040333594a3>
+ FLOAT u;
+ FLOAT v;
+}
+
+template MeshNormals {
+ <f6f23f43-7686-11cf-8f52-0040333594a3>
+ DWORD nNormals;
+ array Vector normals[nNormals];
+ DWORD nFaceNormals;
+ array MeshFace faceNormals[nFaceNormals];
+}
+
+template MeshMaterialList {
+ <f6f23f42-7686-11cf-8f52-0040333594a3>
+ DWORD nMaterials;
+ DWORD nFaceIndexes;
+ array DWORD faceIndexes[nFaceIndexes];
+ [Material <3d82ab4d-62da-11cf-ab39-0020af71e433>]
+}
+
+template VertexElement {
+ <f752461c-1e23-48f6-b9f8-8350850f336f>
+ DWORD Type;
+ DWORD Method;
+ DWORD Usage;
+ DWORD UsageIndex;
+}
+
+template DeclData {
+ <bf22e553-292c-4781-9fea-62bd554bdd93>
+ DWORD nElements;
+ array VertexElement Elements[nElements];
+ DWORD nDWords;
+ array DWORD data[nDWords];
+}
+
+template XSkinMeshHeader {
+ <3cf169ce-ff7c-44ab-93c0-f78f62d172e2>
+ WORD nMaxSkinWeightsPerVertex;
+ WORD nMaxSkinWeightsPerFace;
+ WORD nBones;
+}
+
+template SkinWeights {
+ <6f0d123b-bad2-4167-a0d0-80224f25fabb>
+ STRING transformNodeName;
+ DWORD nWeights;
+ array DWORD vertexIndices[nWeights];
+ array FLOAT weights[nWeights];
+ Matrix4x4 matrixOffset;
+}
+
+template AnimTicksPerSecond {
+ <9e415a43-7ba6-4a73-8743-b73d47e88476>
+ DWORD AnimTicksPerSecond;
+}
+
+template Animation {
+ <3d82ab4f-62da-11cf-ab39-0020af71e433>
+ [...]
+}
+
+template AnimationSet {
+ <3d82ab50-62da-11cf-ab39-0020af71e433>
+ [Animation <3d82ab4f-62da-11cf-ab39-0020af71e433>]
+}
+
+template FloatKeys {
+ <10dd46a9-775b-11cf-8f52-0040333594a3>
+ DWORD nValues;
+ array FLOAT values[nValues];
+}
+
+template TimedFloatKeys {
+ <f406b180-7b3b-11cf-8f52-0040333594a3>
+ DWORD time;
+ FloatKeys tfkeys;
+}
+
+template AnimationKey {
+ <10dd46a8-775b-11cf-8f52-0040333594a3>
+ DWORD keyType;
+ DWORD nKeys;
+ array TimedFloatKeys keys[nKeys];
+}"""
+
 class _BinarySerializer:
     """Convert the text-oriented write stream to DirectX binary tokens."""
 
@@ -174,6 +347,23 @@ def _get_principled(mat):
             return node
     return None
 
+
+def _effective_materials(obj):
+    """Return the list of materials assigned to a mesh object, falling
+    back to the mesh's data-block materials when the object has no
+    material slots. This handles the case where materials live on the
+    mesh datablock (the default for our importer) but obj.material_slots
+    appears empty — which can happen when the object's slot link mode
+    diverges, or in older Blender versions where the slot list is lazy."""
+    slot_mats = [s.material for s in obj.material_slots if s.material]
+    if slot_mats:
+        return slot_mats
+    # Fall back to the mesh data block.
+    me = getattr(obj, "data", None)
+    if me is not None:
+        return [m for m in getattr(me, "materials", []) if m]
+    return []
+
 def _tex_path(mat):
     if not mat or not mat.use_nodes:
         return ""
@@ -213,6 +403,7 @@ def export_x(context, filepath,
              triangulate=False,
              binary_format=False,
              compress=False,
+             pz_compat=False,
              **_):
 
     scene     = context.scene
@@ -233,14 +424,64 @@ def export_x(context, filepath,
         out  = []
         w    = out.append
 
+    # AnimTicksPerSecond is both the file's declared tick rate AND the
+    # target real-time playback rate. To preserve real-time correctness
+    # regardless of scene FPS, we scale Blender frame numbers up/down so
+    # that the written tick values represent the same wall-clock duration:
+    #   file_tick = frame * (anim_ticks_per_second / scene_fps)
+    # When scene_fps == anim_fps the scale is 1.0 and ticks equal frames.
+    # When pz_compat is on, anim_fps is forced to 4800 (PZ convention)
+    # regardless of what the FPS field says.
+    if pz_compat:
+        file_ticks_per_second = 4800
+    else:
+        file_ticks_per_second = int(anim_fps)
+
+    if hasattr(scene.render, "fps_base"):
+        scene_fps = scene.render.fps / max(scene.render.fps_base, 1e-6)
+    else:
+        scene_fps = float(scene.render.fps)
+    if scene_fps <= 0:
+        scene_fps = 30.0
+    tick_scale_out = float(file_ticks_per_second) / scene_fps
+
+    # Pull the source-file passthrough text (templates and auxiliary
+    # frames like Translation_Data) off the armature, if it was set by
+    # the importer. These are re-emitted verbatim so a load → save round
+    # trip preserves the original file layout for blocks the exporter
+    # doesn't natively reproduce.
+    arm_objs_for_passthrough = [o for o in objects if o.type == "ARMATURE"]
+    _passthrough_templates = ""
+    _passthrough_aux_frames = ""
+    _passthrough_aux_animations = ""
+    if arm_objs_for_passthrough:
+        _ad = arm_objs_for_passthrough[0].data
+        try:
+            _passthrough_templates       = str(_ad.get("_x_templates", "") or "")
+            _passthrough_aux_frames      = str(_ad.get("_x_aux_frames", "") or "")
+            _passthrough_aux_animations  = str(_ad.get("_x_aux_animations", "") or "")
+        except Exception:
+            pass
+
     if binary_format:
 
         _bin_header = b"xof 0303bin 0032"
 
-        w(f"AnimTicksPerSecond {{ {int(anim_fps)}; }}\n")
+        w(f"AnimTicksPerSecond {{ {file_ticks_per_second}; }}\n")
     else:
         w("xof 0303txt 0032\n\n")
-        w(f"AnimTicksPerSecond {{\n\t{int(anim_fps)};\n}}\n")
+        # Emit DirectX templates. Prefer the stashed source-file copy
+        # for byte-identical round-trips; fall back to the canonical
+        # set when there's nothing stashed (e.g. a from-scratch model
+        # in Blender) so that PZ-style engines that expect templates
+        # at the top of the file still get them.
+        if _passthrough_templates:
+            w(_passthrough_templates)
+            w("\n\n")
+        elif pz_compat:
+            w(_DEFAULT_TEMPLATES)
+            w("\n\n")
+        w(f"AnimTicksPerSecond {{\n\t{file_ticks_per_second};\n}}\n")
 
     mesh_objs     = [o for o in objects if o.type == "MESH"]
     armature_objs = [o for o in objects if o.type == "ARMATURE"]
@@ -249,8 +490,7 @@ def export_x(context, filepath,
     written_mats = {}
     if export_materials:
         for obj in mesh_objs:
-            for slot in obj.material_slots:
-                mat = slot.material
+            for mat in _effective_materials(obj):
                 if not mat or mat.name in written_mats:
                     continue
                 written_mats[mat.name] = mat
@@ -343,6 +583,13 @@ def export_x(context, filepath,
         for rb in (b for b in arm_data.bones if not b.parent):
             write_bone(rb, 0)
 
+    # Re-emit any auxiliary top-level frames (e.g. Translation_Data)
+    # captured from the source .x file. These sit between the skeleton
+    # and the mesh in the original layout, so that's where we put them.
+    if _passthrough_aux_frames and not binary_format:
+        w(_passthrough_aux_frames)
+        w("\n\n")
+
     armature_set = set(armature_objs)
     all_warnings = []
     for obj in mesh_objs:
@@ -355,9 +602,6 @@ def export_x(context, filepath,
 
     if export_animation and arm_obj:
         orig_frame = scene.frame_current
-        frame_count = anim_frame_end - anim_frame_start + 1
-
-        rest_arm_bl = {b.name: b.matrix_local.copy() for b in arm_obj.data.bones}
 
         baked = {b.name: {"rot": {}, "scale": {}, "pos": {}} for b in arm_obj.pose.bones}
 
@@ -365,11 +609,92 @@ def export_x(context, filepath,
         conv_inv_3 = bl_to_dx_3
         conv_3 = conv_inv_3.transposed()
 
-        for fr in range(anim_frame_start, anim_frame_end + 1):
+        # Collect per-bone keyframe times directly from the F-curves so
+        # that a sparse imported animation stays sparse on export — the
+        # original PZ file has e.g. 41 rotation keys but only 2 scale
+        # keys, and we want to preserve that pattern. If the user added
+        # keyframes in Blender, those will appear in the F-curves and
+        # naturally extend the exported key set. If there are no F-curves
+        # (a static skeleton), fall back to dense per-frame baking so a
+        # constant pose still gets written.
+        action = None
+        try:
+            ad = arm_obj.animation_data
+            if ad is not None:
+                action = ad.action
+        except Exception:
+            action = None
+
+        def _fcurve_frames(channels_paths_indices):
+            """Collect the union of keyframe x-coords across the given
+            (data_path, array_index) pairs. Returns a sorted list of
+            int frames, restricted to [anim_frame_start, anim_frame_end]."""
+            frames = set()
+            if action is None:
+                return []
+            # Blender 4.4+ may store F-curves under action.layers[].strips[]
+            # .channelbags[].fcurves; older versions use action.fcurves
+            # directly. Try both.
+            fcurves_iters = []
+            if hasattr(action, "fcurves") and action.fcurves:
+                fcurves_iters.append(action.fcurves)
+            if hasattr(action, "layers"):
+                for layer in action.layers:
+                    for strip in layer.strips:
+                        for cb in strip.channelbags:
+                            fcurves_iters.append(cb.fcurves)
+            for fcurves in fcurves_iters:
+                for path, idx in channels_paths_indices:
+                    fc = fcurves.find(path, index=idx)
+                    if fc is None:
+                        continue
+                    for kp in fc.keyframe_points:
+                        f = int(round(kp.co[0]))
+                        if anim_frame_start <= f <= anim_frame_end:
+                            frames.add(f)
+            return sorted(frames)
+
+        def _bone_key_frames(bone_name):
+            rot_paths = [(f'pose.bones["{bone_name}"].rotation_quaternion', i)
+                         for i in range(4)]
+            sc_paths  = [(f'pose.bones["{bone_name}"].scale', i)
+                         for i in range(3)]
+            tr_paths  = [(f'pose.bones["{bone_name}"].location', i)
+                         for i in range(3)]
+            return (_fcurve_frames(rot_paths),
+                    _fcurve_frames(sc_paths),
+                    _fcurve_frames(tr_paths))
+
+        # First pass: figure out for each bone which frames have which
+        # kind of key. Build a master set of all frames we need to sample.
+        per_bone_frames = {}
+        all_sample_frames = set()
+        for pb in arm_obj.pose.bones:
+            rot_fr, sc_fr, tr_fr = _bone_key_frames(pb.name)
+            # If a bone has NO keyframes anywhere (static), fall back to
+            # writing two keys (start and end) so the file still records
+            # the bone's pose. This keeps DirectX consumers that expect
+            # at least one key from getting confused.
+            if not rot_fr and not sc_fr and not tr_fr:
+                fallback = [anim_frame_start, anim_frame_end]
+                if fallback[0] == fallback[1]:
+                    fallback = [anim_frame_start]
+                rot_fr = sc_fr = tr_fr = list(fallback)
+            per_bone_frames[pb.name] = (set(rot_fr), set(sc_fr), set(tr_fr))
+            all_sample_frames.update(rot_fr)
+            all_sample_frames.update(sc_fr)
+            all_sample_frames.update(tr_fr)
+
+        # Second pass: for each frame we need, set the scene to that
+        # frame and bake whichever bones have a key there.
+        for fr in sorted(all_sample_frames):
             scene.frame_set(fr)
 
             for pb in arm_obj.pose.bones:
                 name = pb.name
+                rot_set, sc_set, tr_set = per_bone_frames[name]
+                if fr not in rot_set and fr not in sc_set and fr not in tr_set:
+                    continue
 
                 world_bl = pb.matrix.copy()
 
@@ -383,26 +708,68 @@ def export_x(context, filepath,
                     dx_s   = dx_local.to_scale()
                     q      = dx_rot.to_quaternion()
                 else:
-                    # ROOT bone: rotation is the pose-bone-local pose offset
-                    # (matrix_basis), NOT the bone's world DX matrix.  The
-                    # importer treats the file's stored quaternion as the
-                    # pose offset for the skeleton root (local_rest_q is
-                    # identity), so the round-trip requires q = pose_q.
+                    # ROOT bone: write the bone's ABSOLUTE rotation in
+                    # un-conv'd file space, not just the pose offset.
+                    #
+                    # The importer reconstructs the skel-root's pose from
+                    # the file via:
+                    #     local_rest_q = (conv.inv @ matrix_local).to_quaternion()
+                    #     pose_q       = local_rest_q.inv @ abs_q
+                    # so for a roundtrip identity-pose, abs_q must equal
+                    # local_rest_q. More generally the exporter must write
+                    # abs_q = local_rest_q @ matrix_basis_q, which is just
+                    # the rotation of (conv.inv @ pb.matrix) — pb.matrix
+                    # already includes the pose offset for the root since
+                    # it has no parent contribution.
+                    #
                     # Position and scale still come from the world matrix.
                     dx_world = _bl_bone_to_dx_world(world_bl, bl_to_dx_3, inv_scale)
                     dx_t = dx_world.to_translation()
                     dx_s = dx_world.to_scale()
-                    q    = pb.matrix_basis.to_3x3().to_quaternion()
+                    un_conv_pose = bl_to_dx_3 @ pb.matrix.to_3x3()
+                    q = un_conv_pose.to_quaternion()
 
                 qw, qx, qy, qz = q.w, -q.x, -q.y, -q.z
 
-                baked[name]["rot"]  [fr] = (qw, qx, qy, qz)
-                baked[name]["scale"][fr] = (dx_s.x, dx_s.y, dx_s.z)
-                baked[name]["pos"]  [fr] = (dx_t.x, dx_t.y, dx_t.z)
+                if fr in rot_set:
+                    baked[name]["rot"]  [fr] = (qw, qx, qy, qz)
+                if fr in sc_set:
+                    baked[name]["scale"][fr] = (dx_s.x, dx_s.y, dx_s.z)
+                if fr in tr_set:
+                    baked[name]["pos"]  [fr] = (dx_t.x, dx_t.y, dx_t.z)
 
         scene.frame_set(orig_frame)
 
-        w("AnimationSet anim {\n")
+        # AnimationSet name: prefer the active action's name (which the
+        # importer sets from the source file's AnimationSet name), falling
+        # back to a generic "anim" if no action is currently bound.
+        _animset_name = "anim"
+        try:
+            _ad = arm_obj.animation_data
+            if _ad is not None and _ad.action is not None:
+                _nm = _ad.action.name
+                # Strip any Blender-added suffix like ".001" so the exported
+                # name is closer to the original source. Blender appends
+                # .001/.002/etc. to avoid name collisions when the same
+                # file is re-imported, but the engine that consumes the
+                # .x file expects the original AnimationSet name.
+                if _nm:
+                    import re as _re
+                    _nm = _re.sub(r'\.\d{3}$', '', _nm)
+                    _animset_name = _nm
+        except Exception:
+            pass
+        w(f"AnimationSet {_animset_name} {{\n")
+        # Project Zomboid / 3DS Max biped exports name the AnimationKey
+        # nodes 'R', 'S', 'T' for rotation/scale/translation. Plain DirectX
+        # leaves them unnamed.
+        _ak_rot   = "AnimationKey R" if pz_compat else "AnimationKey"
+        _ak_scale = "AnimationKey S" if pz_compat else "AnimationKey"
+        _ak_trans = "AnimationKey T" if pz_compat else "AnimationKey"
+        # Helper: scale a Blender frame number to a file tick value.
+        # int(round(...)) keeps the file's tick field DWORD-compatible.
+        def _tick(fr):
+            return int(round(fr * tick_scale_out))
         for pb in arm_obj.pose.bones:
             name = pb.name
             rot_keys   = baked[name]["rot"]
@@ -411,22 +778,33 @@ def export_x(context, filepath,
 
             w(f"\tAnimation {{\n\t\t{{ {name} }}\n")
 
-            w(f"\t\tAnimationKey {{\n\t\t\t0;\n\t\t\t{len(rot_keys)};\n")
-            entries = [f"\t\t\t{fr};4;{qw:.6f},{qx:.6f},{qy:.6f},{qz:.6f};;"
+            w(f"\t\t{_ak_rot} {{\n\t\t\t0;\n\t\t\t{len(rot_keys)};\n")
+            entries = [f"\t\t\t{_tick(fr)};4;{qw:.6f},{qx:.6f},{qy:.6f},{qz:.6f};;"
                        for fr, (qw, qx, qy, qz) in sorted(rot_keys.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
 
-            w(f"\t\tAnimationKey {{\n\t\t\t1;\n\t\t\t{len(scale_keys)};\n")
-            entries = [f"\t\t\t{fr};3;{sx:.6f},{sy:.6f},{sz:.6f};;"
+            w(f"\t\t{_ak_scale} {{\n\t\t\t1;\n\t\t\t{len(scale_keys)};\n")
+            entries = [f"\t\t\t{_tick(fr)};3;{sx:.6f},{sy:.6f},{sz:.6f};;"
                        for fr, (sx, sy, sz) in sorted(scale_keys.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
 
-            w(f"\t\tAnimationKey {{\n\t\t\t2;\n\t\t\t{len(pos_keys)};\n")
-            entries = [f"\t\t\t{fr};3;{px:.6f},{py:.6f},{pz:.6f};;"
+            w(f"\t\t{_ak_trans} {{\n\t\t\t2;\n\t\t\t{len(pos_keys)};\n")
+            entries = [f"\t\t\t{_tick(fr)};3;{px:.6f},{py:.6f},{pz:.6f};;"
                        for fr, (px, py, pz) in sorted(pos_keys.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
 
             w("\t}\n")
+
+        # Auxiliary-frame animations (e.g. Translation_Data on PZ
+        # files): re-emit the source-file text verbatim so the
+        # AnimationSet has a track for every Frame in the file, not
+        # just the bones we baked from the armature.
+        if _passthrough_aux_animations and not binary_format:
+            _aa = str(_passthrough_aux_animations).strip()
+            # Indent each line to sit one level inside the AnimationSet.
+            _aa = "\n".join(f"\t{ln.lstrip()}" if ln.strip() else ln
+                            for ln in _aa.split("\n"))
+            w("\n" + _aa + "\n")
 
         w("}\n")
 
@@ -547,19 +925,88 @@ def _write_mesh_frame(obj, out, indent,
     conv_inv_3 = bl_to_dx_3
 
     bl_verts = me_work.vertices
+
+    # Check whether we're going to re-emit a stashed DeclData block. If
+    # so, the output vertex order must match the original file's order
+    # exactly — DeclData is indexed by vertex position. Use a 1-to-1
+    # vert mapping (no dedup) in that case so bl_verts[i] lines up with
+    # the stashed DeclData's i-th vertex entry. This is the same
+    # condition the writer below uses; computing it here lets us pick
+    # the right vertex strategy upfront.
+    _check_stashed_decldata = obj.get("_x_decldata")
+    _check_stashed_orig_vc = obj.get("_x_orig_vert_count")
+    _preserve_vert_order = bool(
+        _check_stashed_decldata
+        and _check_stashed_orig_vc is not None
+        and int(_check_stashed_orig_vc) == len(bl_verts)
+    )
+
+    # Collect per-loop normal and UV so we can decide which loops can
+    # share a vertex. Loops sharing the same Blender vertex index AND the
+    # same normal AND the same UV collapse to a single output vertex;
+    # any disagreement forces a split. This keeps clean meshes clean on
+    # export while still producing valid DirectX geometry on meshes with
+    # UV/normal seams.
+    raw_loop_normals = _get_corner_normals(me_work) if export_normals else None
+    uv_layer_active = me_work.uv_layers.active if (export_uvs and me_work.uv_layers) else None
+
     new_to_src = []
+    new_loop_normal = []   # per output vertex
+    new_uv          = []   # per output vertex
     faces = []
     loop_to_new_vi = [0] * len(me_work.loops)
+    key_to_new_vi = {}
 
-    for poly in me_work.polygons:
-        face_indices = []
-        for li in poly.loop_indices:
-            src_vi = me_work.loops[li].vertex_index
-            new_vi = len(new_to_src)
-            new_to_src.append(src_vi)
-            loop_to_new_vi[li] = new_vi
-            face_indices.append(new_vi)
-        faces.append(face_indices)
+    def _round(v, q=1e-6):
+        # Quantise floats so near-equal normals/UVs collapse to the same
+        # key without falling foul of float rounding noise.
+        return round(v / q) * q
+
+    if _preserve_vert_order:
+        # Identity mapping: every Blender vertex becomes one output
+        # vertex at the same index. Each loop refers to its underlying
+        # vertex directly. This guarantees the output's vertex ordering
+        # matches the stashed DeclData's expected ordering.
+        for vi in range(len(bl_verts)):
+            new_to_src.append(vi)
+            new_loop_normal.append(None)
+            new_uv.append(None)
+        for poly in me_work.polygons:
+            face_indices = []
+            for li in poly.loop_indices:
+                vi = me_work.loops[li].vertex_index
+                loop_to_new_vi[li] = vi
+                face_indices.append(vi)
+            faces.append(face_indices)
+    else:
+        for poly in me_work.polygons:
+            face_indices = []
+            for li in poly.loop_indices:
+                src_vi = me_work.loops[li].vertex_index
+
+                if raw_loop_normals is not None:
+                    n = raw_loop_normals[li]
+                    norm_key = (_round(n[0]), _round(n[1]), _round(n[2]))
+                else:
+                    norm_key = None
+
+                if uv_layer_active is not None:
+                    uv = uv_layer_active.data[li].uv
+                    uv_key = (_round(uv[0]), _round(uv[1]))
+                else:
+                    uv_key = None
+
+                key = (src_vi, norm_key, uv_key)
+                new_vi = key_to_new_vi.get(key)
+                if new_vi is None:
+                    new_vi = len(new_to_src)
+                    key_to_new_vi[key] = new_vi
+                    new_to_src.append(src_vi)
+                    new_loop_normal.append(raw_loop_normals[li] if raw_loop_normals is not None else None)
+                    new_uv.append(tuple(uv_layer_active.data[li].uv) if uv_layer_active is not None else None)
+                loop_to_new_vi[li] = new_vi
+                face_indices.append(new_vi)
+            faces.append(face_indices)
 
     n_verts = len(new_to_src)
     n_faces = len(faces)
@@ -567,7 +1014,14 @@ def _write_mesh_frame(obj, out, indent,
     verts_dx = [(conv_inv_3 @ Vector(bl_verts[src_vi].co)) * inv_scale
                 for src_vi in new_to_src]
 
-    loop_normals = _get_corner_normals(me_work) if export_normals else []
+    # Build a loop-aligned normal list for the MeshNormals writer below.
+    # The downstream code expects one entry per loop in poly-iteration
+    # order; since we no longer have a 1-to-1 loop→new_vert mapping, we
+    # rebuild this view explicitly from raw_loop_normals.
+    if raw_loop_normals is not None:
+        loop_normals = list(raw_loop_normals)
+    else:
+        loop_normals = []
 
     frame_name = obj.get("_x_frame_name") or obj.name
     mesh_name  = obj.get("_x_mesh_name")  or (f"{obj.name}Geo"
@@ -598,7 +1052,22 @@ def _write_mesh_frame(obj, out, indent,
     face_lines = [f"{ind}\t\t{len(f)};{','.join(str(i) for i in f)};" for f in faces]
     w(",\n".join(face_lines) + ";\n")
 
-    if export_normals and loop_normals:
+    # Round-trip preservation for PZ-style meshes: if this object was
+    # imported from a file that used a DeclData block instead of the
+    # standard MeshNormals + MeshTextureCoords blocks, re-emit DeclData
+    # verbatim and skip the standard blocks. Falls back to standard
+    # blocks if the user has edited the mesh and the vertex count no
+    # longer matches the stashed data.
+    _stashed_decldata = obj.get("_x_decldata")
+    _stashed_xskinheader = obj.get("_x_xskinheader")
+    _stashed_orig_vc = obj.get("_x_orig_vert_count")
+    _use_stashed_decl = bool(
+        _stashed_decldata
+        and _stashed_orig_vc is not None
+        and int(_stashed_orig_vc) == len(bl_verts)
+    )
+
+    if export_normals and loop_normals and not _use_stashed_decl:
 
         dx_loop_normals = [conv_inv_3 @ Vector(n) for n in loop_normals]
 
@@ -631,7 +1100,7 @@ def _write_mesh_frame(obj, out, indent,
         w(",\n".join(face_norm_lines) + ";\n")
         w(f"{ind}\t\t}}\n")
 
-    if export_uvs and me_work.uv_layers:
+    if export_uvs and me_work.uv_layers and not _use_stashed_decl:
         uv_layer = me_work.uv_layers.active
 
         new_uvs = [(0.0, 0.0)] * n_verts
@@ -646,8 +1115,8 @@ def _write_mesh_frame(obj, out, indent,
         w(",\n".join(uv_lines) + ";\n")
         w(f"{ind}\t\t}}\n")
 
-    if export_materials and obj.material_slots:
-        mats = [s.material for s in obj.material_slots if s.material]
+    if export_materials:
+        mats = _effective_materials(obj)
         if mats:
             w(f"\n{ind}\t\tMeshMaterialList {{\n{ind}\t\t\t{len(mats)};\n{ind}\t\t\t{n_faces};\n")
             w(",\n".join(f"{ind}\t\t\t{p.material_index}" for p in me_work.polygons) + ";\n")
@@ -655,6 +1124,16 @@ def _write_mesh_frame(obj, out, indent,
 
                 w(f"{ind}\t\t\t{{{mat.name}}}\n")
             w(f"{ind}\t\t}}\n")
+
+    # Re-emit the original DeclData block verbatim when this mesh was
+    # imported from a file that used one and the vertex count is
+    # unchanged. Sits between MeshMaterialList and XSkinMeshHeader to
+    # match the original PZ / 3DS Max biped layout.
+    if _use_stashed_decl:
+        _dd = str(_stashed_decldata).strip()
+        _dd = "\n".join(f"{ind}\t\t{ln.lstrip()}" if ln.strip() else ln
+                        for ln in _dd.split("\n"))
+        w("\n" + _dd + "\n")
 
     if export_weights and arm_obj and obj.vertex_groups:
         bone_names = {b.name for b in arm_obj.data.bones}
@@ -681,15 +1160,51 @@ def _write_mesh_frame(obj, out, indent,
                             for nv in src_to_new.get(v.index, []):
                                 influences.append((nv, g.weight))
                             break
-                if influences:
-                    group_influences.append((vg, influences))
+                # Include the group even if it has no influences: PZ
+                # / 3DS Max biped exports declare a SkinWeights entry
+                # for every bone in the skin set, including ones the
+                # artist hasn't painted any weights onto. Skipping them
+                # changes the XSkinMeshHeader bone count seen by the
+                # engine and can mis-index downstream lookups.
+                group_influences.append((vg, influences))
 
             if group_influences:
                 n_groups = len(group_influences)
 
-                w(f"\n{ind}\t\tXSkinMeshHeader {{\n")
-                w(f"{ind}\t\t\t{n_groups};\n{ind}\t\t\t{n_groups};\n{ind}\t\t\t{n_groups};\n")
-                w(f"{ind}\t\t}}\n")
+                if _stashed_xskinheader:
+                    # Re-emit the original XSkinMeshHeader text verbatim
+                    # whenever we have it stashed — this is independent
+                    # of whether DeclData round-trips, since the header
+                    # is just metadata (max-weights-per-vertex/face and
+                    # bone count) not vertex-indexed data.
+                    _xs = str(_stashed_xskinheader).strip()
+                    _xs = "\n".join(f"{ind}\t\t{ln.lstrip()}" if ln.strip() else ln
+                                    for ln in _xs.split("\n"))
+                    w("\n" + _xs + "\n")
+                else:
+                    # Compute proper max-weights-per-vertex and
+                    # max-weights-per-face for the XSkinMeshHeader.
+                    # Per-vertex: count how many vertex groups each
+                    # vertex belongs to (capped by what we actually
+                    # exported, which is the same set as group_influences).
+                    influence_set_by_vert = {}
+                    for vg_idx, (_vg, infs) in enumerate(group_influences):
+                        for nv, _w in infs:
+                            influence_set_by_vert.setdefault(nv, set()).add(vg_idx)
+                    max_per_vert = max((len(s) for s in influence_set_by_vert.values()),
+                                       default=0)
+                    # Per-face: union of vertex influences across the
+                    # face's corners. Bounded above by 3 * max_per_vert.
+                    max_per_face = 0
+                    for face_corners in faces:
+                        face_infs = set()
+                        for nv in face_corners:
+                            face_infs |= influence_set_by_vert.get(nv, set())
+                        if len(face_infs) > max_per_face:
+                            max_per_face = len(face_infs)
+                    w(f"\n{ind}\t\tXSkinMeshHeader {{\n")
+                    w(f"{ind}\t\t\t{max_per_vert};\n{ind}\t\t\t{max_per_face};\n{ind}\t\t\t{n_groups};\n")
+                    w(f"{ind}\t\t}}\n")
 
                 for vg, influences in group_influences:
                     bone = arm_obj.data.bones.get(vg.name)
@@ -1598,8 +2113,7 @@ def collect_meshes_from_blender(mesh_objs, arm_obj, bl_to_dx_3, inv_scale,
         # Texture paths: pull from material slots if any of them have a
         tex_paths = []
         seen_paths = set()
-        for slot in obj.material_slots:
-            mat = slot.material
+        for mat in _effective_materials(obj):
             if mat is None:
                 continue
             stashed = mat.get('_x_texture_filename')

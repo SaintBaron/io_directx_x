@@ -53,6 +53,18 @@ class _SyntheticKeyNode:
         return self._nums
 
 def _compose_type4_from_trs(rot_node, scale_node, trans_node):
+    """Compose per-channel TRS animation keys into a single type-4 (matrix)
+    key sequence.
+
+    This is an optimization for files where rotation, scale, and translation
+    tracks share identical tick sequences (e.g. Bugsnax xcache exports).
+    For files where the tracks have different key densities — e.g. Project
+    Zomboid, where scale is often just 2 keys while rotation has 21 — the
+    composition cannot be done by simple index-pairing without distorting
+    the animation. In that case we return None and let the caller fall back
+    to per-track processing, which handles arbitrary key densities correctly
+    via Blender's separate F-curve channels.
+    """
     def _parse(node, expected):
         nums = node.nums()
         if len(nums) < 2:
@@ -77,7 +89,18 @@ def _compose_type4_from_trs(rot_node, scale_node, trans_node):
     if not rot_frames or not scale_frames or not trans_frames:
         return None
 
-    n = min(len(rot_frames), len(scale_frames), len(trans_frames))
+    # Bail out unless all three tracks have the SAME tick sequence.  This
+    # is the only case where simple index-pairing produces a correct
+    # composition. Track-count mismatch (or matching counts with diverging
+    # ticks) means the file stores TRS at different sample densities and
+    # the per-track path must handle them independently.
+    if len(rot_frames) != len(scale_frames) or len(rot_frames) != len(trans_frames):
+        return None
+    for (rt, _), (st, _), (tt, _) in zip(rot_frames, scale_frames, trans_frames):
+        if rt != st or rt != tt:
+            return None
+
+    n = len(rot_frames)
     if n == 0:
         return None
 
@@ -207,10 +230,112 @@ def import_x(context, filepath,
              sharp_angle_deg=75.0,
              lock_root_translation=False,
              lock_leaf_translation=False,
+             smooth_shade_from_faces=False,
              **_):
 
     root     = parse_x_file(filepath)
     base_dir = os.path.dirname(filepath)
+
+    # ----- Passthrough text capture -----
+    # The exporter doesn't natively re-emit template declarations or
+    # "auxiliary" frames like PZ's Translation_Data (which exists at the
+    # top level of the file but isn't part of the skeleton or mesh
+    # hierarchy). To make round-trip lossless, capture those blocks as
+    # raw source text now and stash them so the exporter can spit them
+    # back out verbatim. This only works for the text .x format; binary
+    # .x and .xcache have no template equivalent.
+    passthrough_templates = []
+    passthrough_frames = {}
+    passthrough_decldata = {}        # mesh_name -> raw DeclData block text
+    passthrough_xskinheader = {}     # mesh_name -> raw XSkinMeshHeader block text
+    passthrough_animations = {}      # target_name -> raw Animation block text
+    try:
+        with open(filepath, 'rb') as _fh:
+            _raw = _fh.read(64)
+        if _raw[:16] == b"xof 0303txt 0032":
+            with open(filepath, 'r', encoding='latin-1', errors='replace') as _fh:
+                _full_text = _fh.read()
+
+            def _extract_braced_block(text, start_idx):
+                # Given index pointing at a `{`, walk the matching brace.
+                depth = 0
+                j = start_idx
+                while j < len(text):
+                    if text[j] == '{':
+                        depth += 1
+                    elif text[j] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            return j + 1
+                    j += 1
+                return j
+
+            # All `template Foo { ... }` declarations
+            import re as _re
+            for _m in _re.finditer(r'\btemplate\s+\w+\s*\{', _full_text):
+                _start = _m.start()
+                _open_brace = _full_text.index('{', _start)
+                _end = _extract_braced_block(_full_text, _open_brace)
+                passthrough_templates.append(_full_text[_start:_end].rstrip())
+
+            # Any top-level Frame in the source file
+            top_frame_names = {c.name for c in root.children if c.kind == "Frame"}
+            for _m in _re.finditer(r'(?m)^\s*Frame\s+(\w+)\s*\{', _full_text):
+                _name = _m.group(1)
+                if _name not in top_frame_names:
+                    continue
+                _start = _full_text.find('Frame', _m.start())
+                _open_brace = _full_text.index('{', _start)
+                _end = _extract_braced_block(_full_text, _open_brace)
+                passthrough_frames[_name] = _full_text[_start:_end].rstrip()
+
+            # Per-mesh DeclData and XSkinMeshHeader
+            for _m in _re.finditer(r'(?m)^\s*Mesh\s+(\w+)\s*\{', _full_text):
+                _mesh_name = _m.group(1)
+                _mesh_start = _full_text.find('Mesh', _m.start())
+                _mesh_open  = _full_text.index('{', _mesh_start)
+                _mesh_end   = _extract_braced_block(_full_text, _mesh_open)
+                _mesh_text  = _full_text[_mesh_start:_mesh_end]
+                for _kind, _stash in [
+                    ('DeclData', passthrough_decldata),
+                    ('XSkinMeshHeader', passthrough_xskinheader),
+                ]:
+                    _km = _re.search(r'\b' + _kind + r'\s*\{', _mesh_text)
+                    if _km is None:
+                        continue
+                    _ks = _km.start()
+                    _ko = _mesh_text.index('{', _ks)
+                    _ke = _extract_braced_block(_mesh_text, _ko)
+                    _stash[_mesh_name] = _mesh_text[_ks:_ke].rstrip()
+
+            # Per-target Animation blocks (so non-bone frames like
+            # Translation_Data still get a track on round-trip)
+            for _m in _re.finditer(r'AnimationSet\s+\w+\s*\{', _full_text):
+                _line_start = _full_text.rfind('\n', 0, _m.start()) + 1
+                if 'template' in _full_text[_line_start:_m.start()]:
+                    continue
+                _as_start = _m.start()
+                _as_open  = _full_text.index('{', _as_start)
+                _as_end   = _extract_braced_block(_full_text, _as_open)
+                _as_text  = _full_text[_as_start:_as_end]
+                for _am in _re.finditer(r'Animation\s*\{', _as_text):
+                    _aline_start = _as_text.rfind('\n', 0, _am.start()) + 1
+                    if 'template' in _as_text[_aline_start:_am.start()]:
+                        continue
+                    _a_start = _am.start()
+                    _a_open  = _as_text.index('{', _a_start)
+                    _a_end   = _extract_braced_block(_as_text, _a_open)
+                    _a_text  = _as_text[_a_start:_a_end]
+                    _ref = _re.search(r'\{\s*(\w+)\s*\}', _a_text)
+                    if _ref:
+                        passthrough_animations[_ref.group(1)] = _a_text.rstrip()
+                break
+    except Exception:
+        passthrough_templates = []
+        passthrough_frames = {}
+        passthrough_decldata = {}
+        passthrough_xskinheader = {}
+        passthrough_animations = {}
 
     state = _ImportState(
         base_dir=base_dir,
@@ -228,15 +353,37 @@ def import_x(context, filepath,
         sharp_angle_deg=sharp_angle_deg,
         lock_root_translation=lock_root_translation,
         lock_leaf_translation=lock_leaf_translation,
+        smooth_shade_from_faces=smooth_shade_from_faces,
     )
+    state._passthrough_decldata = passthrough_decldata
+    state._passthrough_xskinheader = passthrough_xskinheader
 
+    file_ticks_per_second = None
     for node in root.children:
         if node.kind == "AnimTicksPerSecond":
             nums = node.nums()
             if nums:
+                file_ticks_per_second = nums[0]
                 state.ticks_per_second = nums[0]
+
     if anim_fps and anim_fps > 0:
-        state.ticks_per_second = anim_fps
+        # User-specified FPS: use that as the target Blender scene FPS,
+        # and scale tick values from the file's resolution to match.
+        target_fps = anim_fps
+        if file_ticks_per_second and file_ticks_per_second > 0:
+            state.tick_scale = float(target_fps) / float(file_ticks_per_second)
+        state.ticks_per_second = target_fps
+    elif file_ticks_per_second is not None and file_ticks_per_second > 240:
+        # High-precision tick rate (e.g. Project Zomboid uses 4800) —
+        # Blender's scene FPS field is integer with effective max around
+        # 240 in normal use, and using 4800 as the frame-number unit makes
+        # the timeline confusing (animations that are <1 second land at
+        # frames 0..3200 instead of 0..20).
+        # Normalize to 30 fps: scale tick values down so animation length
+        # in frames matches duration-in-seconds × 30.
+        target_fps = 30.0
+        state.tick_scale = target_fps / float(file_ticks_per_second)
+        state.ticks_per_second = target_fps
 
     mat_nodes = [n for n in root.children if n.kind == "Material"]
     for node in mat_nodes:
@@ -258,6 +405,39 @@ def import_x(context, filepath,
         _cm3 = conv_mat.to_3x3()
 
         state.build_armature(frame_nodes, context, bind_poses, ftm_globals, conv_mat)
+
+        # Stash passthrough text on the armature so the exporter can
+        # re-emit templates and auxiliary frames verbatim on round-trip.
+        if state.armature_obj is not None:
+            arm_data = state.armature_obj.data
+            if passthrough_templates:
+                arm_data["_x_templates"] = "\n\n".join(passthrough_templates)
+
+            def _frame_owns_skeleton_or_mesh(node):
+                if node.name in state._skel_root_names:
+                    return True
+                for ch in node.children:
+                    if ch.kind == "Mesh":
+                        return True
+                    if ch.kind == "Frame" and _frame_owns_skeleton_or_mesh(ch):
+                        return True
+                return False
+
+            aux_blocks = []
+            aux_anim_blocks = []
+            for fn in frame_nodes:
+                if _frame_owns_skeleton_or_mesh(fn):
+                    continue
+                txt = passthrough_frames.get(fn.name)
+                if txt:
+                    aux_blocks.append(txt)
+                anim_txt = passthrough_animations.get(fn.name)
+                if anim_txt:
+                    aux_anim_blocks.append(anim_txt)
+            if aux_blocks:
+                arm_data["_x_aux_frames"] = "\n\n".join(aux_blocks)
+            if aux_anim_blocks:
+                arm_data["_x_aux_animations"] = "\n\n".join(aux_anim_blocks)
 
     for anim_set in [n for n in root.children if n.kind == "AnimationSet"]:
         for anim_node in anim_set.children_of("Animation"):
@@ -293,6 +473,11 @@ def import_x(context, filepath,
         frame_range = _compute_animation_frame_range(root)
         if frame_range:
             fstart, fend = frame_range
+            # Apply the same tick → frame scale used for animation keys, so
+            # the scene frame range matches where the keys actually land.
+            if state.tick_scale != 1.0:
+                fstart = int(round(fstart * state.tick_scale))
+                fend   = int(round(fend   * state.tick_scale))
 
             if fend < fstart:
                 fend = fstart
@@ -346,6 +531,106 @@ def _get_or_create_fcurve(action, anim_data, data_path, index, group_name):
         fc = cb.fcurves.new(data_path, index=index, group_name=group_name)
     return fc
 
+def _decode_decl_data(decl_node, expected_vert_count):
+    """Decode a DeclData node into per-vertex normals and UVs.
+
+    DirectX's DeclData packs an arbitrary list of per-vertex elements
+    (positions, normals, tangents, UVs, etc.) into a single DWORD
+    stream, with a small element table at the start describing the
+    layout. PZ / 3DS Max biped exports use this instead of separate
+    MeshNormals and MeshTextureCoords blocks.
+
+    Layout per the DirectX template:
+        DWORD nElements;
+        VertexElement Elements[nElements];   # 4 DWORDs each (Type, Method, Usage, UsageIndex)
+        DWORD nDWords;
+        DWORD data[nDWords];                 # raw stream, reinterpret as floats per the type table
+
+    Element Type codes used here:
+        1 = D3DDECLTYPE_FLOAT2 (2 floats)
+        2 = D3DDECLTYPE_FLOAT3 (3 floats)
+        3 = D3DDECLTYPE_FLOAT4 (4 floats)
+
+    Element Usage codes used here:
+        0 = POSITION   3 = NORMAL   5 = TEXCOORD   6 = TANGENT
+
+    Returns (per_vert_normals, per_vert_uvs) where each is a list of
+    tuples or None if not present in the layout. Returns None overall
+    if the data is malformed.
+    """
+    import struct
+    nums = decl_node.nums()
+    if not nums:
+        return None
+    try:
+        n_elements = int(nums[0])
+        if n_elements <= 0 or n_elements > 32:
+            return None
+        # Element table: 4 ints per element
+        if 1 + n_elements * 4 + 1 > len(nums):
+            return None
+        elements = []
+        i = 1
+        for _ in range(n_elements):
+            t  = int(nums[i]);     i += 1
+            m  = int(nums[i]);     i += 1
+            u  = int(nums[i]);     i += 1
+            ui = int(nums[i]);     i += 1
+            elements.append((t, m, u, ui))
+        n_dwords = int(nums[i]); i += 1
+        if i + n_dwords > len(nums):
+            return None
+        # Reinterpret each DWORD's 32 bits as a float.
+        floats = []
+        for j in range(n_dwords):
+            raw = int(nums[i + j]) & 0xFFFFFFFF
+            floats.append(struct.unpack('<f', struct.pack('<I', raw))[0])
+
+        # Compute per-vertex stride in floats and locate normal / UV
+        # offsets within each vertex.
+        type_floats = {1: 2, 2: 3, 3: 4}
+        stride = 0
+        norm_off = None
+        uv_off   = None
+        for t, _m, u, _ui in elements:
+            n_f = type_floats.get(t)
+            if n_f is None:
+                # Unknown / unsupported type — bail
+                return None
+            if u == 3 and norm_off is None and n_f == 3:
+                norm_off = (stride, 3)
+            elif u == 5 and uv_off is None and n_f >= 2:
+                uv_off = (stride, 2)
+            stride += n_f
+        if stride == 0:
+            return None
+        if n_dwords % stride != 0:
+            return None
+        n_verts = n_dwords // stride
+        if expected_vert_count and n_verts != expected_vert_count:
+            # Layout doesn't match the mesh vertex count — refuse to
+            # apply rather than risk corrupting unrelated data.
+            return None
+
+        per_vert_normals = None
+        if norm_off is not None:
+            off, count = norm_off
+            per_vert_normals = []
+            for v in range(n_verts):
+                base = v * stride + off
+                per_vert_normals.append((floats[base], floats[base + 1], floats[base + 2]))
+        per_vert_uvs = None
+        if uv_off is not None:
+            off, _ = uv_off
+            per_vert_uvs = []
+            for v in range(n_verts):
+                base = v * stride + off
+                per_vert_uvs.append((floats[base], floats[base + 1]))
+        return (per_vert_normals, per_vert_uvs)
+    except Exception:
+        return None
+
+
 def _apply_custom_normals(me, loop_normals):
     if hasattr(me, "normals_split_custom_set"):
 
@@ -360,6 +645,40 @@ def _apply_custom_normals(me, loop_normals):
         for i, n in enumerate(loop_normals):
             attr.data[i].vector = n
 
+
+def _clear_custom_split_normals(me):
+    """Remove any custom per-loop normals on the mesh and disable
+    auto-smooth, so Blender renders using face-averaged normals (the
+    standard "shade smooth" appearance)."""
+    try:
+        # Pre-4.x: there's an explicit "free custom split normals" call,
+        # plus a use_auto_smooth toggle. Disabling auto-smooth makes the
+        # poly use_smooth flag drive the result directly.
+        if hasattr(me, "free_normals_split"):
+            me.free_normals_split()
+        if hasattr(me, "use_auto_smooth"):
+            me.use_auto_smooth = False
+    except Exception:
+        pass
+    try:
+        # 4.1+: custom normals live in a CORNER FLOAT_VECTOR attribute
+        # (or sometimes the mesh attribute "custom_normal"). Drop them
+        # so geometry-derived normals win.
+        attr = me.attributes.get("custom_normal")
+        if attr is not None:
+            me.attributes.remove(attr)
+    except Exception:
+        pass
+    try:
+        # Belt-and-braces: apply identity-ish normals via the split-normals
+        # API to nuke any cached overrides Blender may have already
+        # baked. Using me.calc_normals() / me.update() forces a recompute.
+        if hasattr(me, "calc_normals"):
+            me.calc_normals()
+        me.update()
+    except Exception:
+        pass
+
 class _ImportState:
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -367,11 +686,16 @@ class _ImportState:
         self.materials:          dict  = {}
         self.armature_obj:       object = None
         self.ticks_per_second:   float  = 30.0
+        self.tick_scale:         float  = 1.0   # multiplier from file ticks → Blender frames
         self.created_objects:    list   = []
         self._conv_mat           = Matrix.Identity(4)
         self._always_hidden_bones: set = set()
         self._skel_root_names:   set    = set()
         self._bone_rebind:       dict   = {}
+        # Per-mesh source-text passthroughs (filled in by import_x);
+        # default to empty so non-import code paths don't crash.
+        self._passthrough_decldata: dict = {}
+        self._passthrough_xskinheader: dict = {}
 
     def parse_material(self, node, base_dir):
         name = node.name or "Material"
@@ -659,6 +983,24 @@ class _ImportState:
         obj = bpy.data.objects.new(name_hint, me)
         context.collection.objects.link(obj)
         self.created_objects.append(obj)
+
+        # Stash the original DeclData and XSkinMeshHeader source-text
+        # blobs (if this file has them) so the exporter can re-emit the
+        # exact original bytes on round-trip.  We index by the mesh
+        # node's name in the source file.
+        _src_mesh_name = mesh_node.name or ""
+        if _src_mesh_name:
+            decl_text = self._passthrough_decldata.get(_src_mesh_name)
+            if decl_text:
+                obj["_x_decldata"] = decl_text
+            xs_text = self._passthrough_xskinheader.get(_src_mesh_name)
+            if xs_text:
+                obj["_x_xskinheader"] = xs_text
+            # Record the original file's vertex count too: if the user
+            # later edits the mesh and the count changes, the exporter
+            # will know the stashed DeclData no longer applies.
+            obj["_x_orig_vert_count"] = vcount
+
         M = self._conv_mat
         s = self.global_scale
         if M != Matrix.Identity(4) or s != 1.0:
@@ -731,6 +1073,47 @@ class _ImportState:
                         uv_miss += 1
             if uv_miss:
                 pass
+
+        # PZ / 3DS Max biped exports often skip MeshNormals and
+        # MeshTextureCoords entirely, packing per-vertex normals,
+        # tangents, and UVs into a DeclData block instead. If we have a
+        # DeclData node and didn't already get normals/UVs from the
+        # standard blocks, decode it.
+        decl_node = mesh_node.child("DeclData")
+        if decl_node is not None and (
+            (_pending_loop_normals is None and self.import_normals) or
+            (not me.uv_layers and self.import_uvs)
+        ):
+            decoded = _decode_decl_data(decl_node, vcount)
+            if decoded is not None:
+                per_vert_normals, per_vert_uvs = decoded
+                if (per_vert_normals is not None
+                        and self.import_normals
+                        and _pending_loop_normals is None):
+                    conv_rot = self._conv_mat.to_3x3()
+                    converted = [
+                        (conv_rot @ Vector(n)).normalized().to_tuple()
+                        for n in per_vert_normals
+                    ]
+                    loop_normals = []
+                    for poly in me.polygons:
+                        for loop_idx in poly.loop_indices:
+                            vi = me.loops[loop_idx].vertex_index
+                            if vi < len(converted):
+                                loop_normals.append(converted[vi])
+                            else:
+                                loop_normals.append((0.0, 0.0, 1.0))
+                    _pending_loop_normals = loop_normals
+                if (per_vert_uvs is not None
+                        and self.import_uvs
+                        and not me.uv_layers):
+                    uv_layer = me.uv_layers.new(name="UVMap")
+                    for poly in me.polygons:
+                        for loop_idx in poly.loop_indices:
+                            vi = me.loops[loop_idx].vertex_index
+                            if vi < len(per_vert_uvs):
+                                u, v = per_vert_uvs[vi]
+                                uv_layer.data[loop_idx].uv = (u, 1.0 - v)
 
         mat_list_node = mesh_node.child("MeshMaterialList")
         if self.import_materials and mat_list_node:
@@ -913,8 +1296,18 @@ class _ImportState:
             for poly in obj.data.polygons:
                 poly.use_smooth = True
             obj.data.update()
-            if _pending_loop_normals is not None and self.infer_sharps:
-                self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
+            if getattr(self, "smooth_shade_from_faces", False):
+                # Smooth-shade from faces: every poly is marked smooth so
+                # Blender averages face normals at shared vertices. Any
+                # custom split normals on the mesh are explicitly cleared
+                # so they don't override the auto-smoothed result.
+                _clear_custom_split_normals(obj.data)
+            elif _pending_loop_normals is not None:
+                # File-authored normals path: apply the exact per-loop
+                # normals decoded from MeshNormals or DeclData.
+                _apply_custom_normals(obj.data, _pending_loop_normals)
+                if self.infer_sharps:
+                    self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
 
         else:
 
@@ -923,8 +1316,12 @@ class _ImportState:
             for poly in obj.data.polygons:
                 poly.use_smooth = True
             obj.data.update()
-            if _pending_loop_normals is not None and self.infer_sharps:
-                self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
+            if getattr(self, "smooth_shade_from_faces", False):
+                _clear_custom_split_normals(obj.data)
+            elif _pending_loop_normals is not None:
+                _apply_custom_normals(obj.data, _pending_loop_normals)
+                if self.infer_sharps:
+                    self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
 
     def _infer_sharps_from_normal_list(self, me, loop_normals):
         import math as _math
@@ -1099,7 +1496,12 @@ class _ImportState:
                 _dbg_done   = False
 
                 for frame_tick, vals in all_key_vals:
-                    frame = float(frame_tick)
+                    # Scale file ticks to Blender frame numbers. tick_scale
+                    # is normally 1.0; for files with very high tick rates
+                    # (e.g. PZ's 4800/sec) it normalizes the timeline to a
+                    # sane FPS so the animation isn't spread across
+                    # thousands of frames.
+                    frame = float(frame_tick) * self.tick_scale
                     try:
                         if key_type == 0:
                             abs_q  = Quaternion((vals[0], -vals[1], -vals[2], -vals[3]))
