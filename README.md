@@ -14,6 +14,7 @@ weights, and keyframe animation in both directions.
 |---|---|
 | fragMOTION exports (text format) | ✅ Full support |
 | Bugsnax / Horsepower `.xcache` (SEMS) | ✅ Full round-trip (mesh + skeleton + animation + textures) |
+| Project Zomboid / 3DS Max biped (`.x`) | ✅ Round-trip preserves DeclData, Translation_Data, templates, AnimTicksPerSecond = 4800 |
 | DirectX text format (`txt `) | ✅ |
 | DirectX binary format (`bin `) | ✅ |
 | MS-ZIP compressed text (`tzip`) | ✅ import + export |
@@ -51,8 +52,9 @@ The importer auto-detects the file format by magic bytes (`xof ` for DirectX,
 ### Data
 | Option | Default | Description |
 |---|---|---|
-| Import Normals | On | Read per-loop split normals from `MeshNormals`; infers sharp edges |
-| Import UVs | On | Read the first UV channel from `MeshTextureCoords` (V-flip corrected) |
+| Import Normals | On | Read per-loop split normals from `MeshNormals` (or `DeclData` on PZ / 3DS Max biped files); infers sharp edges |
+| Smooth Shade from Faces | Off | Apply Blender's shade-smooth pass instead of using the file's authored per-loop normals. Useful when the file's normals don't render cleanly |
+| Import UVs | On | Read the first UV channel from `MeshTextureCoords` or `DeclData` (V-flip corrected) |
 | Import Materials | On | Create Principled BSDF materials from `Material` blocks |
 | Import Textures | On | Link image textures from `TextureFileName`. Searches the xcache folder, common subfolders (`Textures/`, `tex/`), parent dirs, and tries `.png`, `.jpg`, `.tga`, `.dds`, `.bmp`, `.tif`, `.webp` extensions. If the file isn't on disk a placeholder image is created so the texture path is still visible in Blender and round-trips on export |
 
@@ -143,8 +145,9 @@ without an extension and the dropdown decides.
 |---|---|---|
 | Export Armature | On | Write `Frame` hierarchy from the armature bones |
 | Export Weights | On | Write `SkinWeights` blocks from vertex groups |
-| Export Animation | On | Bake pose-bone keyframes into `AnimationSet` / `AnimationKey` blocks |
-| FPS | 30 | Written as `AnimTicksPerSecond` (`.x` only — `.xcache` uses a fixed 25.0) |
+| Export Animation | On | Bake pose-bone keyframes into `AnimationSet` / `AnimationKey` blocks (sparse keyframes preserved — only frames with actual F-curve keys are emitted) |
+| High-precision Animation Ticks | Off | Write `AnimTicksPerSecond = 4800` and scale ticks accordingly. Required for Project Zomboid and other 3DS Max biped consumers. Also emits the default DirectX template declarations for engines that require them |
+| FPS | 30 | Written as `AnimTicksPerSecond` when High-precision is off (`.x` only — `.xcache` uses a fixed 25.0) |
 | Frame Start / End | 1 / 250 | Animation range to bake |
 
 ### Non-manifold warning
@@ -168,6 +171,13 @@ game engines, so it is worth resolving before export.
 - **UV seams** are preserved on `.xcache` export by duplicating vertices that
   carry multiple distinct UVs across their loops. Skin weights are replicated
   onto every duplicate so animation keeps deforming correctly.
+- **Passthrough preservation** — when importing a text-format `.x` file,
+  blocks the exporter doesn't natively reproduce (top-level template
+  declarations, auxiliary frames like Project Zomboid's `Translation_Data`,
+  per-mesh `DeclData` and `XSkinMeshHeader`, and Animation entries for
+  non-bone frames) are stashed as custom properties and re-emitted verbatim
+  on export. Sparse animation keyframe density (e.g. 41/2/33 R/S/T) is also
+  preserved on round-trip.
 
 ---
 
@@ -182,6 +192,8 @@ game engines, so it is worth resolving before export.
 | `Mesh` (vertices + N-gon faces) | ✅ | ✅ (triangulated optional) |
 | `MeshNormals` | ✅ | ✅ |
 | `MeshTextureCoords` (V-flipped) | ✅ | ✅ |
+| `DeclData` (per-vertex normals/tangents/UVs, PZ / 3DS Max biped) | ✅ | ✅ verbatim on round-trip |
+| `VertexElement` (DeclData element table) | ✅ | ✅ |
 | `MeshMaterialList` | ✅ | ✅ |
 | `Material` (diffuse / shininess / specular / emissive) | ✅ | ✅ |
 | `TextureFileName` / `TextureFilename` | ✅ both spellings | ✅ |
