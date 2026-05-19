@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 1, 1),
+    "version": (1, 1, 2),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -86,20 +86,23 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         name="Rest Pose Source",
         description=(
             "Where to read bone rest poses from.\n\n"
-            "Bind Pose: uses the SkinWeights offset matrices — the geometry is "
-            "correct and joints sit at their authored positions, but some files "
-            "have an arbitrary rotation baked into the root bone that makes the "
-            "armature face the wrong way in edit mode.\n\n"
-            "Frame Hierarchy: uses the FrameTransformMatrix chain, matching "
-            "fragMOTION's behaviour — the armature and mesh face the same "
-            "direction in edit mode, but for files where the FTM encodes an "
-            "animated pose the legs may appear crunched at rest"
+            "Frame Hierarchy (default): uses the FrameTransformMatrix "
+            "chain. With the fixed xcache parser, top-level bones in "
+            "Bugsnax skeletons carry their world bind matrix directly in "
+            "FTM, and nested bones (Tail_02, lid/pupil) carry their "
+            "parent-local transform — matching what the dev-supplied .x "
+            "files contain. Animation keys interpret cleanly under this "
+            "convention.\n\n"
+            "Bind Pose: uses the SkinWeights offset matrices directly. "
+            "For most files this gives the same result as Frame Hierarchy; "
+            "kept for backwards compatibility with files whose FTM data "
+            "is ambiguous or where the user wants to override."
         ),
         items=[
-            ('BIND',            "Bind Pose",       "Use SkinWeights offset matrices (correct joint positions)"),
-            ('FRAME_TRANSFORM', "Frame Hierarchy", "Use FrameTransformMatrix chain (armature/mesh aligned in edit mode)"),
+            ('FRAME_TRANSFORM', "Frame Hierarchy", "Use FrameTransformMatrix chain (canonical .x convention)"),
+            ('BIND',            "Bind Pose",       "Use SkinWeights offset matrices (legacy)"),
         ],
-        default='BIND',
+        default='FRAME_TRANSFORM',
     )
 
     anim_fps: FloatProperty(
