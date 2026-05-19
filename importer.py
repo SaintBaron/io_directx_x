@@ -32,6 +32,48 @@ _KEY_TYPE_VALUES = {
     4: 16,
 }
 
+def _fill_unweighted_from_neighbours(obj):
+    """For each vertex with no skin weights, copy the bone assignment of
+    the geometrically closest weighted vertex. Used to repair meshes
+    where a SkinWeights block went missing in the source file (e.g.
+    BurgerB's right-tusk tip, where Burger_r_Tusk_01_05SHJnt is declared
+    as a bone but has no SkinWeights entry, leaving 12 mirrored verts
+    floating in rest pose while the rest of the tusk animates).
+    """
+    me = obj.data
+    n_verts = len(me.vertices)
+    if n_verts == 0 or not obj.vertex_groups:
+        return
+
+    weighted = []
+    unweighted = []
+    for v in me.vertices:
+        if v.groups:
+            weighted.append(v.index)
+        else:
+            unweighted.append(v.index)
+    if not unweighted or not weighted:
+        return
+
+    # Look up coords once; vertices.foreach_get is overkill for this size.
+    coords = [me.vertices[i].co for i in range(n_verts)]
+
+    for u_vi in unweighted:
+        up = coords[u_vi]
+        # Closest weighted vert by squared distance.
+        best_vi = weighted[0]
+        best_d2 = (up - coords[best_vi]).length_squared
+        for w_vi in weighted:
+            d2 = (up - coords[w_vi]).length_squared
+            if d2 < best_d2:
+                best_d2 = d2
+                best_vi = w_vi
+        # Copy each (group, weight) pair from the donor onto the orphan.
+        for g in me.vertices[best_vi].groups:
+            vg = obj.vertex_groups[g.group]
+            vg.add([u_vi], g.weight, "REPLACE")
+
+
 def _mat4_from_list(vals):
     if len(vals) < 16:
         return Matrix.Identity(4)
@@ -225,7 +267,7 @@ def import_x(context, filepath,
              import_animation=True,
              anim_fps=0.0,
              set_frame_range=True,
-             rest_pose_source='BIND',
+             rest_pose_source='FRAME_TRANSFORM',
              infer_sharps=True,
              sharp_angle_deg=75.0,
              lock_root_translation=False,
@@ -862,8 +904,16 @@ class _ImportState:
         use_ftm_rest = (self.rest_pose_source == 'FRAME_TRANSFORM')
         self._bone_rebind = {}
 
+        # A Frame is a skeleton root if it isn't carrying a Mesh. The
+        # previous test ("has at least one Frame child") accidentally
+        # excluded leaf bones — fine when bones formed a deep chain
+        # (each bone had the next as a Frame child), broken for flat
+        # hierarchies where every bone sits at top level with no Frame
+        # children of its own. In Bugsnax xcaches the corrected parser
+        # now emits the spine bones as top-level siblings, which under
+        # the old rule were all silently dropped.
         skel_roots = [f for f in frame_nodes
-                      if any(c.kind == "Frame" for c in f.children)]
+                      if not any(c.kind == "Mesh" for c in f.children)]
 
         self._skel_root_names = {f.name for f in skel_roots}
         skipped = [f.name for f in frame_nodes if f not in skel_roots]
@@ -888,6 +938,22 @@ class _ImportState:
             name = frame_node.name or "Bone"
 
             if use_ftm_rest:
+
+                # FTM-rest path (canonical .x convention):
+                # bone.matrix_local = FTM_global. Animation keys are absolute
+                # local TRS replacements for FTM.
+                #
+                # The xcache parser (see parser._resolve_parent_indices) now
+                # detects top-level bones via `ftm == bind_pose` and writes
+                # the world bind matrix as their FrameTransformMatrix, so for
+                # Bugsnax skeletons FTM_global == engine bind world directly
+                # — matching the dev-supplied .x files exactly.
+                #
+                # The `_bone_rebind` matrix below is kept for safety: if a
+                # file's FTM and SkinWeights still disagree after parsing, it
+                # rewrites vertex positions so binding still works. For the
+                # common case where they agree, this matrix evaluates to
+                # identity and the rebind step is a harmless no-op.
 
                 new_rest_bl = conv_mat @ ftm_globals[name] if name in ftm_globals else None
                 old_bind_bl = conv_mat @ bind_poses[name]  if name in bind_poses  else None
@@ -1293,6 +1359,19 @@ class _ImportState:
 
                         pass
 
+            # Some source meshes have verts that no SkinWeights block
+            # touches — usually a SkinWeights entry was lost when the
+            # cache was baked, leaving (often mirrored) tip verts with
+            # zero total weight. They'd stay at rest pose while the rest
+            # of the mesh animates, which manifests as a small cluster
+            # hanging in space (e.g. the right-tusk tip on BurgerB).
+            #
+            # Fill them in by copying the weight assignment from the
+            # geometrically closest weighted vert. This is what 3DS Max
+            # and Maya do when displaying partially-weighted skins; the
+            # engine appears to do the same implicitly at load time.
+            _fill_unweighted_from_neighbours(obj)
+
             for poly in obj.data.polygons:
                 poly.use_smooth = True
             obj.data.update()
@@ -1352,8 +1431,18 @@ class _ImportState:
                 edge.use_edge_sharp = True
                 sharp_count += 1
 
+        # Replace the file's per-loop normals with Blender-computed smooth
+        # shading that breaks at the sharp edges we just marked. This gives
+        # a clean smooth-shaded appearance while preserving the hard creases
+        # the geometry asked for (the file's loop normals are typically
+        # already smoothed, but go through them verbatim and you get the
+        # mesh's flat-shading character baked in).
+        _clear_custom_split_normals(me)
+        for poly in me.polygons:
+            poly.use_smooth = True
         if hasattr(me, "use_auto_smooth"):
             me.use_auto_smooth = True
+        me.update()
 
     def import_animation_set(self, anim_set_node, context):
         if not self.armature_obj:
