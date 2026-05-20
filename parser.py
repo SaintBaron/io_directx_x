@@ -887,19 +887,30 @@ def _find_rot20_section(data: bytes, search_start: int, search_end: int):
 
 
 def _read_skin_weights(data: bytes, offset: int, bone_end: int):
-    """Parse the skin-weight block that immediately follows the rotation section."""
+    """Parse the skin-weight block that immediately follows the rotation section.
+
+    Returns (influences, pad, reset_at).
+      • pad=0 means full-weight bones; pad=1 means partial-weight bones.
+      • reset_at is the index in `influences` where the vi sequence drops
+        back to near zero (indicating a continuation onto a second mesh).
+        For Honey's root bone, this is at index 2200 — the first 2200
+        entries reference mesh1, the remaining reference mesh2 (with
+        vi-relative-to-mesh2 indexing). reset_at=None means no reset.
+    """
     if offset + 6 > bone_end:
-        return []
+        return [], 0, None
     count = struct.unpack_from('<I', data, offset)[0]
     if count == 0 or count > 50_000:
-        return []
+        return [], 0, None
     pad = struct.unpack_from('<H', data, offset + 4)[0]
-    if pad != 0:
-        return []
+    if pad not in (0, 1):
+        return [], 0, None
     entries_start = offset + 6
-    if entries_start + count * 10 > bone_end + 20:  # small tolerance
-        return []
+    if entries_start + count * 10 > bone_end + 20:
+        return [], 0, None
     influences = []
+    reset_at = None
+    prev_vi = -1
     for i in range(count):
         off = entries_start + i * 10
         if off + 10 > len(data):
@@ -908,10 +919,16 @@ def _read_skin_weights(data: bytes, offset: int, bone_end: int):
         w  = struct.unpack_from('<f', data, off + 4)[0]
         if not math.isfinite(w) or w < 0 or w > 1.0 + 1e-4:
             break
+        # Detect reset: vi drops by 100+ from previous vi. This signals
+        # a continuation onto another mesh (Honey's root SkinWeights
+        # crosses from mesh1's high indices back to mesh2's vi=0).
+        if reset_at is None and prev_vi >= 100 and vi < prev_vi - 100:
+            reset_at = i
         influences.append((vi, w))
+        prev_vi = vi
     if len(influences) != count:
-        return []
-    return influences
+        return [], 0, None
+    return influences, pad, reset_at
 
 
 def _extract_anim(data: bytes, bone: dict, next_bone_start: int):
@@ -1022,9 +1039,10 @@ def _extract_anim(data: bytes, bone: dict, next_bone_start: int):
                 for tick, (qx, qy, qz, qw) in rot_keys.items()}
 
     # --- Skin weight section (follows rotation section) ---
-    skin = _read_skin_weights(data, rot_end, anim_end)
+    skin, skin_pad, skin_reset = _read_skin_weights(data, rot_end, anim_end)
 
-    return {'pos': pos_keys, 'scale': scale_keys, 'rot': rot_keys, 'skin': skin}
+    return {'pos': pos_keys, 'scale': scale_keys, 'rot': rot_keys,
+            'skin': skin, 'skin_pad': skin_pad, 'skin_reset': skin_reset}
 
 
 # Mesh parsing
@@ -1160,7 +1178,97 @@ def _parse_mesh_section(data: bytes, search_start: int):
             'uvs':       uvs,
             'faces':     faces,
             'tex_paths': tex_paths,
+            'data_end':  scan,   # offset where this mesh's face buffer ended
         })
+
+    # Pass 2: scan for UNNAMED continuation meshes that follow the
+    # named ones. Honey.xcache stores its model in two parts:
+    #   • Mesh1 (named "HoneyStick") = the honey-stick body
+    #   • Mesh2 (unnamed)            = the goop overlay (head + wings)
+    # Mesh2 starts immediately after mesh1's face buffer with a
+    # bbox(6 floats) + 4x4 identity transform + texture paths +
+    # vert block layout — same shape as mesh1's data, just without
+    # a preceding name. The pad=1 SkinWeights (wing/aux bones)
+    # reference verts in this mesh.
+    while meshes:
+        last_end = meshes[-1].get('data_end')
+        if last_end is None or last_end + 88 > len(data):
+            break
+        # Try to read a bbox+matrix header. 6 floats bbox + 16 floats matrix = 88 bytes.
+        try:
+            hdr = struct.unpack_from('<22f', data, last_end)
+        except struct.error:
+            break
+        # Validate: matrix diag should be ~1 (identity), and bbox should be finite.
+        if not all(math.isfinite(v) for v in hdr[:22]):
+            break
+        # The 16-float matrix is at index 6. Diag positions in row-major are 6+0, 6+5, 6+10, 6+15.
+        if not (abs(hdr[6] - 1.0) < 0.1 and abs(hdr[11] - 1.0) < 0.1 and
+                abs(hdr[16] - 1.0) < 0.1 and abs(hdr[21] - 1.0) < 0.1):
+            break
+        # Find the vert block in the region after the header.
+        try:
+            vert_count, vert_data_off = _find_vertex_block(
+                data, last_end + 88, last_end + 88 + 8192)
+        except ValueError:
+            break
+
+        STRIDE = 16
+        verts, normals, uvs = [], [], []
+        for vi in range(vert_count):
+            off = vert_data_off + vi * STRIDE * 4
+            if off + STRIDE * 4 > len(data):
+                break
+            f = struct.unpack_from('<16f', data, off)
+            verts.append((f[0], f[1], f[2]))
+            normals.append((f[3], f[4], f[5]))
+            uvs.append((f[7], f[8]))
+        if len(verts) < vert_count:
+            break
+
+        # Face buffer: simple sequential read (no buf1/buf2 split for the
+        # continuation mesh; faces just stop when index >= vert_count).
+        after_verts = vert_data_off + vert_count * STRIDE * 4
+        buf1_start  = after_verts + 8
+        faces = []
+        scan = buf1_start
+        while scan + 6 <= len(data):
+            a, b, c = struct.unpack_from('<3H', data, scan)
+            if max(a, b, c) >= vert_count:
+                break
+            if a == b == c == 0 and len(faces) > 0:
+                # trailing zero padding past real faces
+                break
+            faces.append((a, b, c))
+            scan += 6
+
+        # Texture paths inside the header region (between bbox+matrix and vert data).
+        tex_paths = []
+        tex_pat = re.compile(rb'Content/[^\x00]+\.dds\x00')
+        for tm in tex_pat.finditer(data[last_end + 88:vert_data_off]):
+            path = tm.group()[:-1].decode('ascii', errors='replace')
+            if path not in tex_paths:
+                tex_paths.append(path)
+
+        # Synthesize a unique name for this continuation mesh.
+        anon_name = f"{meshes[-1]['name']}_Part{len(meshes)+1}"
+        # Build a 4x4 transform matrix from the header floats.
+        transform = list(hdr[6:22])
+
+        meshes.append({
+            'name':      anon_name,
+            'transform': transform,
+            'verts':     verts,
+            'normals':   normals,
+            'uvs':       uvs,
+            'faces':     faces,
+            'tex_paths': tex_paths,
+            'data_end':  scan,
+        })
+
+    # Strip the bookkeeping field before returning.
+    for m in meshes:
+        m.pop('data_end', None)
 
     return meshes
 
@@ -1254,40 +1362,54 @@ def _make_frame_node(name: str, ftm: list[float], children: list) -> XNode:
 def _resolve_parent_indices(bones: list) -> list:
     """Recover each bone's parent by geometric inference.
 
-    Two rules:
-    1. Top-level bones have `ftm == bind_pose` (engine marker for
-       parent-less / sibling-at-top-level).
-    2. Nested bones satisfy `bind = ftm @ parent_bind` (DX row-vec) —
-       search prior bones for the parent that makes that hold within
-       tolerance.
+    Strategy: search prior bones for the parent that satisfies
+    `ftm @ parent_bind == bind` within tolerance. Only joint bones
+    (names ending in 'SHJnt') are considered as parent candidates —
+    mesh frames like 'CarrotGeo' or 'HoneyStick' happen to have
+    identity transforms and would otherwise match falsely.
 
-    The naive single-search approach mis-assigned every flat-top-level
-    spine bone in Carrot to `Spine_TopSHJnt`; rule 1 catches that.
+    If no good parent is found, fall back to top-level (parent = -1).
+    This correctly handles both:
+      - Honey-style hierarchies where '_01' wing bones (FTM == bind
+        in world space) belong under an identity-bind root bone, and
+      - Carrot-style flat hierarchies where every spine bone is a
+        top-level sibling because no other joint bone has the right
+        bind to be its parent.
     """
     parents = [-1] * len(bones)
     if not bones:
         return parents
 
     TOL = 1e-3
-    for i in range(1, len(bones)):
+    is_joint = [b['name'].endswith('SHJnt') for b in bones]
+
+    for i in range(len(bones)):
         ftm  = bones[i]['ftm']
         bind = bones[i]['bind_pose']
 
-        # Rule 1: ftm == bind_pose ⇒ top-level (parent = -1)
-        if max(abs(ftm[k] - bind[k]) for k in range(16)) < TOL:
-            parents[i] = -1
-            continue
-
-        # Rule 2: search for parent satisfying ftm @ parent_bind == bind
-        best, best_err = 0, float('inf')
-        for j in range(i):
+        # Search for parent satisfying ftm @ parent_bind == bind.
+        # Only joint bones are eligible as parents.
+        best, best_err = -1, float('inf')
+        for j in range(len(bones)):
+            if j == i or not is_joint[j]:
+                continue
             par_bind = bones[j]['bind_pose']
             comp = _mat_mul(ftm, par_bind)
             err = max(abs(comp[k] - bind[k]) for k in range(16))
             if err < best_err:
                 best_err = err
                 best = j
-        parents[i] = best if best_err < TOL else 0
+
+        if best_err < TOL and best != -1:
+            # Self-parenting would mean ftm == bind AND this bone's
+            # own bind happens to satisfy ftm @ bind == bind, which
+            # only holds when bind is identity-ish. Avoid that.
+            if best != i:
+                parents[i] = best
+            else:
+                parents[i] = -1
+        else:
+            parents[i] = -1
 
     return parents
 
@@ -1647,7 +1769,9 @@ def parse_xcache_file(filepath: str) -> XNode:
             # window is safe.
             next_bone_hdr = min(bone['data_start'] + 200_000, len(data))
         channels = _extract_anim(data, bone, next_bone_hdr)
-        bone['skin'] = channels.get('skin', [])   # attach skin weights to bone dict
+        bone['skin']       = channels.get('skin', [])
+        bone['skin_pad']   = channels.get('skin_pad', 0)
+        bone['skin_reset'] = channels.get('skin_reset', None)
         if channels['pos'] or channels['scale'] or channels['rot']:
             anim_data[bone['name']] = channels
 
@@ -1661,6 +1785,59 @@ def parse_xcache_file(filepath: str) -> XNode:
 
     # --- Parse meshes ---
     meshes = _parse_mesh_section(data, after_bones)
+
+    # If we found a continuation mesh (e.g. Honey's goop overlay), merge
+    # it into the primary mesh. pad=1 SkinWeights reference the
+    # continuation's verts using LOW indices [0, len(mesh2.verts)) —
+    # after merging, those indices need to be offset by len(mesh1.verts)
+    # so they index into the combined vert array. pad=0 SkinWeights
+    # keep their original indices (they reference mesh1).
+    if len(meshes) > 1:
+        primary = meshes[0]
+        n_primary_verts = len(primary['verts'])
+        # Concatenate verts/normals/uvs from continuation meshes.
+        # Faces from continuation meshes get their indices shifted by
+        # the cumulative vert count.
+        merged_faces = list(primary['faces'])
+        cumulative = n_primary_verts
+        offsets_per_mesh = [0]  # mesh i's verts start at offsets_per_mesh[i]
+        for cont in meshes[1:]:
+            offsets_per_mesh.append(cumulative)
+            primary['verts'].extend(cont['verts'])
+            primary['normals'].extend(cont['normals'])
+            primary['uvs'].extend(cont['uvs'])
+            for a, b, c in cont['faces']:
+                merged_faces.append((a + cumulative, b + cumulative, c + cumulative))
+            # Texture paths: append unique
+            for tp in cont['tex_paths']:
+                if tp not in primary['tex_paths']:
+                    primary['tex_paths'].append(tp)
+            cumulative += len(cont['verts'])
+        primary['faces'] = merged_faces
+        meshes = [primary]
+
+        # Remap SkinWeights vi to point into the merged vert array.
+        # Two cases:
+        #   • pad=1 bones: every entry references the continuation
+        #     mesh, so the whole list gets offset by cont_offset.
+        #   • pad=0 bones with a reset_at boundary: the entries up to
+        #     reset_at reference mesh1 (no shift), and entries from
+        #     reset_at onwards reference the continuation mesh and
+        #     get shifted by cont_offset. Honey's root bone is the
+        #     canonical case — 2200 mesh1 entries followed by 1224
+        #     mesh2 entries inside a single SkinWeights block.
+        cont_offset = offsets_per_mesh[1] if len(offsets_per_mesh) > 1 else 0
+        for b in bones:
+            skin = b.get('skin')
+            if not skin:
+                continue
+            pad = b.get('skin_pad', 0)
+            reset_at = b.get('skin_reset')
+            if pad == 1:
+                b['skin'] = [(vi + cont_offset, w) for vi, w in skin]
+            elif reset_at is not None and 0 < reset_at < len(skin):
+                b['skin'] = (skin[:reset_at]
+                             + [(vi + cont_offset, w) for vi, w in skin[reset_at:]])
 
     # --- Build XNode tree ---
     root = XNode("ROOT", "")

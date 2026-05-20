@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 1, 4),
+    "version": (1, 1 5),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -146,7 +146,11 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         keywords = self.as_keywords(ignore=("filter_glob",))
-        result = import_x(context, **keywords)
+        try:
+            result = import_x(context, **keywords)
+        except Exception as e:
+            self.report({'ERROR'}, f"Import failed: {e}")
+            return {'CANCELLED'}
         return result
 
 class ExportDirectX(bpy.types.Operator, ExportHelper):
