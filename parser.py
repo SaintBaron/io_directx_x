@@ -861,12 +861,24 @@ def _find_rot20_section(data: bytes, search_start: int, search_end: int):
         # Full scan
         entries = {}
         cur = start
+        prev_frame = -1
         while cur + 20 <= len(data):
             f = struct.unpack_from('<5f', data, cur)
+            # NaN / Inf check before qlen — NaN compares False against
+            # every threshold and would let the scanner walk past the
+            # real end of the section.
+            if not all(math.isfinite(v) for v in f):
+                break
             qlen = math.sqrt(f[1]*f[1] + f[2]*f[2] + f[3]*f[3] + f[4]*f[4])
             if abs(qlen - 1.0) > 0.05:
                 break
-            entries[int(f[0])] = (f[1], f[2], f[3], f[4])
+            # Enforce frame validity on every record, not just the
+            # first 5 in the pre-check.
+            frame = f[0]
+            if not (0 < frame < 1_000_000) or frame <= prev_frame:
+                break
+            prev_frame = frame
+            entries[int(frame)] = (f[1], f[2], f[3], f[4])
             cur += 20
         if len(entries) > 10:
             return entries, cur
@@ -1242,34 +1254,15 @@ def _make_frame_node(name: str, ftm: list[float], children: list) -> XNode:
 def _resolve_parent_indices(bones: list) -> list:
     """Recover each bone's parent by geometric inference.
 
-    The .xcache `parent_idx` field uses an opaque encoding we don't fully
-    reverse-engineer.  We exploit two invariants:
+    Two rules:
+    1. Top-level bones have `ftm == bind_pose` (engine marker for
+       parent-less / sibling-at-top-level).
+    2. Nested bones satisfy `bind = ftm @ parent_bind` (DX row-vec) —
+       search prior bones for the parent that makes that hold within
+       tolerance.
 
-    1.  **Top-level bones have `ftm == bind_pose`.**  In the dev `.x`
-        file the rigger emits a single top-level Frame per bone whose
-        `FrameTransformMatrix` IS its world bind matrix.  In the xcache
-        re-pack the same bones carry an `ftm` field that's bit-identical
-        to their `bind_pose` field — that equality is the marker that
-        engine treats the bone as parent-less (i.e. a sibling at top
-        level, not nested inside another bone).
-
-        Verified against the dev-supplied Carrot.x: all 18 of Carrot's
-        Frame nodes that sit at top level there match `ftm == bind_pose`
-        in the xcache; the 4+ bones that DON'T match (Tail_02 inside
-        Tail_01, lid / pupil bones inside EyeRoot) are exactly the ones
-        that ARE nested in the dev file.
-
-    2.  For genuinely nested bones (`ftm != bind_pose`), the bone's
-        world bind equals `ftm @ parent_bind` (DX row-major × row-vec).
-        We search prior bones for the one whose bind_pose makes that
-        equation hold within 1e-3.
-
-    Previously every bone went through the geometric search, and the
-    search found false-positive parents for bones whose data happened to
-    fit `ftm @ parent_bind == bind` — most visibly making every spine
-    bone in Carrot a child of `Carrot_Spine_TopSHJnt` when the dev file
-    has them all as top-level siblings.  Wrong hierarchy produced wrong
-    skeleton-vs-mesh alignment in Blender's viewport.
+    The naive single-search approach mis-assigned every flat-top-level
+    spine bone in Carrot to `Spine_TopSHJnt`; rule 1 catches that.
     """
     parents = [-1] * len(bones)
     if not bones:
@@ -1280,9 +1273,8 @@ def _resolve_parent_indices(bones: list) -> list:
         ftm  = bones[i]['ftm']
         bind = bones[i]['bind_pose']
 
-        # Rule 1: ftm == bind_pose ⇒ top-level (parent_idx = -1)
-        ftm_eq_bind = max(abs(ftm[k] - bind[k]) for k in range(16)) < TOL
-        if ftm_eq_bind:
+        # Rule 1: ftm == bind_pose ⇒ top-level (parent = -1)
+        if max(abs(ftm[k] - bind[k]) for k in range(16)) < TOL:
             parents[i] = -1
             continue
 
@@ -1362,9 +1354,10 @@ def _build_skeleton_frames(bones: list) -> list:
     is_skel = [not _is_mesh_bone_name(b['name']) for b in bones]
     parents = _resolve_parent_indices(bones)
 
-    # Use the FTM stored in the file directly — it's already parent-local.
-    # The parent inference in _resolve_parent_indices guarantees that
-    # ftm @ parent_bind == bind, so this matches the geometric truth.
+    # Use the FTM stored in the file directly — already parent-local
+    # for nested bones, world-bind for top-level. For top-level bones
+    # we substitute bind_pose since by rule 1 ftm == bind_pose anyway,
+    # and for the root it disambiguates the fallback case.
     local_ftms: dict[int, list] = {}
     for i, b in enumerate(bones):
         if not is_skel[i]:
@@ -1381,11 +1374,8 @@ def _build_skeleton_frames(bones: list) -> list:
             continue
         nodes[i] = _make_frame_node(b['name'], local_ftms[i], [])
 
-    # Attach each child to its parent's children list. Top-level frames
-    # (parents[i] < 0 — i.e. ftm == bind_pose, no real parent) are collected
-    # as separate siblings; this matches the dev .x file structure where
-    # most Bugsnax skeletons present a flat top-level list of Frame blocks
-    # rather than a single deep chain rooted at one bone.
+    # Top-level frames are collected as siblings (matches the dev .x
+    # layout where most Bugsnax skeletons are flat at top level).
     root_nodes: list[XNode] = []
     for i, b in enumerate(bones):
         if not is_skel[i]:
@@ -1396,15 +1386,12 @@ def _build_skeleton_frames(bones: list) -> list:
             par_idx = parents[i]
             if par_idx in nodes:
                 nodes[par_idx].children.append(nodes[i])
+            elif root_nodes:
+                # Orphaned (parent isn't a skeleton bone) — attach to
+                # the first top-level frame to keep the tree connected.
+                root_nodes[0].children.append(nodes[i])
             else:
-                # Fallback: orphaned child whose inferred parent isn't a
-                # skeleton bone (e.g. a mesh bone). Attach to the first
-                # top-level frame to keep the tree connected.
-                if root_nodes:
-                    root_nodes[0].children.append(nodes[i])
-                else:
-                    # No top-level frame found yet — treat this as a root.
-                    root_nodes.append(nodes[i])
+                root_nodes.append(nodes[i])
 
     return root_nodes
 
@@ -1648,8 +1635,17 @@ def parse_xcache_file(filepath: str) -> XNode:
     # --- Extract animation data and skin weights per bone ---
     anim_data: dict[str, dict] = {}
     for i, bone in enumerate(bones):
-        next_bone_hdr = after_bones if i + 1 >= len(bones) else (
-            bones[i + 1]['data_start'] - 64 - len(bones[i + 1]['name']))
+        if i + 1 < len(bones):
+            next_bone_hdr = bones[i + 1]['data_start'] - 64 - len(bones[i + 1]['name'])
+        else:
+            # Last bone: there's no following bone header, so
+            # `after_bones` equals this bone's data_start (zero-sized
+            # region) and the rotation / skin scanners would have
+            # nothing to scan. Use a generous lookahead instead — the
+            # rotation scanner terminates on non-quat data and the
+            # skin reader rejects bogus counts, so an over-large
+            # window is safe.
+            next_bone_hdr = min(bone['data_start'] + 200_000, len(data))
         channels = _extract_anim(data, bone, next_bone_hdr)
         bone['skin'] = channels.get('skin', [])   # attach skin weights to bone dict
         if channels['pos'] or channels['scale'] or channels['rot']:

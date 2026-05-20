@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 1, 2),
+    "version": (1, 1, 4),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -87,16 +87,10 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         description=(
             "Where to read bone rest poses from.\n\n"
             "Frame Hierarchy (default): uses the FrameTransformMatrix "
-            "chain. With the fixed xcache parser, top-level bones in "
-            "Bugsnax skeletons carry their world bind matrix directly in "
-            "FTM, and nested bones (Tail_02, lid/pupil) carry their "
-            "parent-local transform — matching what the dev-supplied .x "
-            "files contain. Animation keys interpret cleanly under this "
-            "convention.\n\n"
-            "Bind Pose: uses the SkinWeights offset matrices directly. "
-            "For most files this gives the same result as Frame Hierarchy; "
-            "kept for backwards compatibility with files whose FTM data "
-            "is ambiguous or where the user wants to override."
+            "chain — the canonical .x convention, matching dev-supplied "
+            ".x files.\n\n"
+            "Bind Pose: uses the SkinWeights offset matrices. Kept for "
+            "backwards compatibility with files whose FTM is ambiguous."
         ),
         items=[
             ('FRAME_TRANSFORM', "Frame Hierarchy", "Use FrameTransformMatrix chain (canonical .x convention)"),
