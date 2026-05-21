@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 1 5),
+    "version": (1, 1, 6),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -146,11 +146,30 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         keywords = self.as_keywords(ignore=("filter_glob",))
+        import os, tempfile, traceback
+        debug = bool(os.environ.get("SNAKFORGE_DEBUG"))
+        log_path = os.path.join(tempfile.gettempdir(), "snakforge_import.log")
         try:
             result = import_x(context, **keywords)
         except Exception as e:
-            self.report({'ERROR'}, f"Import failed: {e}")
+            # When debug logging is on, dump the traceback so it
+            # survives even if Blender was launched without a console.
+            # When debug is off, skip the file I/O entirely — Blender's
+            # own error reporting will still surface the exception.
+            if debug:
+                try:
+                    with open(log_path, "a", encoding="utf-8") as fh:
+                        fh.write("\n!!! UNHANDLED EXCEPTION in execute():\n")
+                        fh.write(traceback.format_exc())
+                        fh.flush()
+                except Exception:
+                    pass
+                self.report({'ERROR'}, f"Import failed: {e}. Log: {log_path}")
+            else:
+                self.report({'ERROR'}, f"Import failed: {e}")
             return {'CANCELLED'}
+        if debug:
+            self.report({'INFO'}, f"Import OK. Log: {log_path}")
         return result
 
 class ExportDirectX(bpy.types.Operator, ExportHelper):

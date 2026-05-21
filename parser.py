@@ -864,16 +864,11 @@ def _find_rot20_section(data: bytes, search_start: int, search_end: int):
         prev_frame = -1
         while cur + 20 <= len(data):
             f = struct.unpack_from('<5f', data, cur)
-            # NaN / Inf check before qlen — NaN compares False against
-            # every threshold and would let the scanner walk past the
-            # real end of the section.
             if not all(math.isfinite(v) for v in f):
                 break
             qlen = math.sqrt(f[1]*f[1] + f[2]*f[2] + f[3]*f[3] + f[4]*f[4])
             if abs(qlen - 1.0) > 0.05:
                 break
-            # Enforce frame validity on every record, not just the
-            # first 5 in the pre-check.
             frame = f[0]
             if not (0 < frame < 1_000_000) or frame <= prev_frame:
                 break
@@ -884,6 +879,72 @@ def _find_rot20_section(data: bytes, search_start: int, search_end: int):
             return entries, cur
 
     return {}, search_start
+
+
+def _find_skin_block(data: bytes, search_start: int, search_end: int):
+    """Scan forward from *search_start* for a plausible skin-block header.
+
+    Returns the offset of (count: u32, pad: u16) if found, else None.
+    Used for "fixup" bones (e.g. Olive's RootFix) that have no rotation
+    section between their FTM data and skin block — for those,
+    _find_rot20_section returns search_start unchanged, leaving us
+    pointed at the FTM data rather than the skin block. This function
+    scans byte-by-byte for the next location where (count, pad, first
+    20 entries) look like valid skin weights.
+    """
+    end = min(search_end - 6, search_start + 100_000)
+    for off in range(search_start, end):
+        count = struct.unpack_from('<I', data, off)[0]
+        if count < 10 or count > 20_000:
+            continue
+        pad = struct.unpack_from('<H', data, off + 4)[0]
+        if pad not in (0, 1):
+            continue
+        block_end = off + 6 + count * 10
+        if block_end > search_end:
+            continue
+        # Validate by checking the first 20 entries look like skin data:
+        # each is (vi: u16, _: u32, w: float) with sane values, and
+        # weights must be REAL skin weights (≥ 0.001) — not denormalized
+        # noise (~1e-39) that happens to pass a 0 ≤ w ≤ 1 check.
+        sample_n = min(count, 20)
+        prev_vi = -1
+        ok = True
+        n_real_weights = 0
+        max_vi = 0
+        for j in range(sample_n):
+            eo = off + 6 + j * 10
+            vi = struct.unpack_from('<H', data, eo)[0]
+            w  = struct.unpack_from('<f', data, eo + 4)[0]
+            # Reject denormalized floats by requiring weight to be
+            # zero exactly OR ≥ 0.001. (Most real skin weights are
+            # 0.25, 0.5, 1.0; the smallest meaningful weight in any
+            # production file is well above 0.001.)
+            if not math.isfinite(w):
+                ok = False; break
+            if not (0.0 <= w <= 1.001):
+                ok = False; break
+            if 0 < w < 0.001:
+                # denormalized noise
+                ok = False; break
+            if w >= 0.001:
+                n_real_weights += 1
+            if vi >= 50_000:
+                ok = False; break
+            if vi > max_vi:
+                max_vi = vi
+            # Allow ONE reset (mesh2 continuation pattern from Honey)
+            # but not multiple disorder events.
+            if prev_vi >= 0 and vi < prev_vi:
+                if prev_vi - vi < 100:
+                    ok = False; break
+            prev_vi = vi
+        # Require at least half of the sampled weights to be real
+        # (≥ 0.001). Skin blocks may have a few padding zeros, but
+        # not 18-of-20 noise.
+        if ok and n_real_weights >= sample_n // 2:
+            return off
+    return None
 
 
 def _read_skin_weights(data: bytes, offset: int, bone_end: int):
@@ -968,7 +1029,15 @@ def _extract_anim(data: bytes, bone: dict, next_bone_start: int):
                 break
 
     if stride16_start is None:
-        return {'pos': pos_keys, 'scale': scale_keys, 'rot': {}, 'skin': []}
+        # No animation data for this bone, but a skin block might
+        # still exist further along (e.g. Olive's RootFix fixup
+        # bone has 1136 skin weights but no rotation/pos/scale).
+        skin, skin_pad, skin_reset = [], 0, None
+        scan_from = _find_skin_block(data, anim_start, anim_end)
+        if scan_from is not None:
+            skin, skin_pad, skin_reset = _read_skin_weights(data, scan_from, anim_end)
+        return {'pos': pos_keys, 'scale': scale_keys, 'rot': {},
+                'skin': skin, 'skin_pad': skin_pad, 'skin_reset': skin_reset}
 
     # --- Parse stride-16 POSITION records ---
 
@@ -1039,7 +1108,16 @@ def _extract_anim(data: bytes, bone: dict, next_bone_start: int):
                 for tick, (qx, qy, qz, qw) in rot_keys.items()}
 
     # --- Skin weight section (follows rotation section) ---
+    # For mesh-frame bones like Olive's "OliveRig_RootFix" there is
+    # no rotation section, so _find_rot20_section returns rot_end ==
+    # stride16_end — pointing at FTM/matrix data rather than the
+    # skin block. The skin block still exists further along the
+    # bone's data, so scan for it by signature.
     skin, skin_pad, skin_reset = _read_skin_weights(data, rot_end, anim_end)
+    if not skin:
+        scan_from = _find_skin_block(data, rot_end, anim_end)
+        if scan_from is not None:
+            skin, skin_pad, skin_reset = _read_skin_weights(data, scan_from, anim_end)
 
     return {'pos': pos_keys, 'scale': scale_keys, 'rot': rot_keys,
             'skin': skin, 'skin_pad': skin_pad, 'skin_reset': skin_reset}
@@ -1091,8 +1169,6 @@ def _parse_mesh_section(data: bytes, search_start: int):
         except ValueError:
             continue
 
-        seen_offsets.add(geo_off)
-
         STRIDE = 16  # floats per vertex (64 bytes)
         verts, normals, uvs = [], [], []
         for vi in range(vert_count):
@@ -1106,6 +1182,58 @@ def _parse_mesh_section(data: bytes, search_start: int):
 
         if len(verts) < vert_count:
             continue  # truncated
+
+        # Sanity check: reject obviously bogus "meshes" where the
+        # purported vert block is actually some other binary
+        # structure (matrix dumps, animation curves, etc).
+        # Real meshes have all-finite positions in a reasonable
+        # range; fixup frames (e.g. Olive's "OliveRig_RootFix")
+        # have a regex-matchable name but no real geometry — the
+        # bytes scanned as "verts" are mostly identity-matrix
+        # patterns or garbage that misleads _find_vertex_block.
+        bad = 0
+        n_zero = 0
+        sx_min = sx_max = verts[0][0]
+        sy_min = sy_max = verts[0][1]
+        sz_min = sz_max = verts[0][2]
+        for x, y, z in verts:
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                bad += 1
+                continue
+            if abs(x) > 1e6 or abs(y) > 1e6 or abs(z) > 1e6:
+                bad += 1
+                continue
+            if x == 0.0 and y == 0.0 and z == 0.0:
+                n_zero += 1
+            if x < sx_min: sx_min = x
+            if x > sx_max: sx_max = x
+            if y < sy_min: sy_min = y
+            if y > sy_max: sy_max = y
+            if z < sz_min: sz_min = z
+            if z > sz_max: sz_max = z
+        # If more than 5% of "verts" are non-finite or absurdly
+        # large, this isn't a real mesh — skip it without marking
+        # seen_offsets, so the real mesh (later in the file) can
+        # still be picked up.
+        if bad > max(8, vert_count // 20):
+            continue
+        # All-zero vert ratio: real character meshes have
+        # essentially zero verts at the exact origin. Fixup-frame
+        # fake "vert blocks" are dominated by zeros (the matrix
+        # entries that aren't on the diagonal). Reject if >5% of
+        # verts are at (0, 0, 0).
+        if n_zero > max(4, vert_count // 20):
+            continue
+        # Tight bbox check: a real character mesh has spatial
+        # extent in all three axes. Fixup-frame fake "vert blocks"
+        # are typically clamped to the unit cube with most entries
+        # at integer coordinates. Require at least one axis to
+        # span > 0.1 units.
+        spans = (sx_max - sx_min, sy_max - sy_min, sz_max - sz_min)
+        if max(spans) < 0.1:
+            continue
+
+        seen_offsets.add(geo_off)
 
         # Index buffers
         after_verts = vert_data_off + vert_count * STRIDE * 4
@@ -1473,7 +1601,18 @@ def _build_skeleton_frames(bones: list) -> list:
     if not bones:
         return []
 
-    is_skel = [not _is_mesh_bone_name(b['name']) for b in bones]
+    # A bone counts as a skeleton bone if it either ends in 'SHJnt'
+    # (the standard Bugsnax joint naming convention) OR has skin
+    # weights attached. The skin-weight case picks up "fixup" frames
+    # like Olive's RootFix — it has 1136 verts weighted to it, so
+    # even though the name doesn't follow the SHJnt convention, the
+    # body geometry depends on it animating with the root. Excluding
+    # it leaves the olive body sitting at world origin while the
+    # rest of the model animates.
+    is_skel = [
+        (not _is_mesh_bone_name(b['name'])) or bool(b.get('skin'))
+        for b in bones
+    ]
     parents = _resolve_parent_indices(bones)
 
     # Use the FTM stored in the file directly — already parent-local

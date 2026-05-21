@@ -21,9 +21,54 @@ are NOT added to the armature as bones.
 import os
 import math
 import bpy
+import tempfile
+import traceback
 from mathutils import Matrix, Vector, Quaternion
 
 from .parser import parse_x_file
+
+
+# ---------------------------------------------------------------------------
+# Logging — opt-in via the SNAKFORGE_DEBUG env var. OFF by default
+# because the per-call file-handle churn (open/write/flush/close on
+# every _log call, hundreds per import) is implicated in intermittent
+# crashes under Steam's pressure-vessel sandbox on Linux.
+#
+# To enable: launch Blender with SNAKFORGE_DEBUG=1 in the environment.
+# When enabled, logs go to <tempdir>/snakforge_import.log.
+# ---------------------------------------------------------------------------
+_DEBUG_LOG = bool(os.environ.get("SNAKFORGE_DEBUG"))
+_LOG_PATH = os.path.join(tempfile.gettempdir(), "snakforge_import.log")
+
+def _log(msg):
+    """Append a line to the log file when SNAKFORGE_DEBUG is set."""
+    if not _DEBUG_LOG:
+        return
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+            fh.flush()
+    except Exception:
+        # Logging must NEVER take down the import — swallow.
+        pass
+
+def _log_reset():
+    """Clear the log file at the start of an import."""
+    if not _DEBUG_LOG:
+        return
+    try:
+        with open(_LOG_PATH, "w", encoding="utf-8") as fh:
+            fh.write("")
+    except Exception:
+        pass
+
+def _log_exception(stage):
+    """Log the current exception with a stack trace."""
+    try:
+        _log(f"!!! EXCEPTION in {stage}")
+        _log(traceback.format_exc())
+    except Exception:
+        pass
 
 
 _KEY_TYPE_VALUES = {
@@ -235,7 +280,27 @@ def import_x(context, filepath,
              smooth_shade_from_faces=False,
              **_):
 
-    root = parse_x_file(filepath)
+    _log_reset()
+    _log(f"=== import_x: filepath={filepath}")
+    _log(f"    options: armature={import_armature} weights={import_weights} anim={import_animation} rest_pose={rest_pose_source}")
+
+    try:
+        root = parse_x_file(filepath)
+    except Exception:
+        _log_exception("parse_x_file")
+        raise
+    _log(f"    parsed; root has {len(root.children)} top-level children")
+
+    # Log Frame/Mesh/SkinWeights/Animation summary
+    def _count(node, kind, n=[0]):
+        if node.kind == kind: n[0] += 1
+        for c in node.children: _count(c, kind, n)
+        return n[0]
+    n_frames = _count(root, 'Frame', [0])
+    n_meshes = _count(root, 'Mesh', [0])
+    n_sw = _count(root, 'SkinWeights', [0])
+    n_anim = _count(root, 'Animation', [0])
+    _log(f"    counts: Frames={n_frames}, Meshes={n_meshes}, SkinWeights={n_sw}, Animations={n_anim}")
 
     base_dir = os.path.dirname(filepath)
 
@@ -407,7 +472,15 @@ def import_x(context, filepath,
 
         _cm3 = conv_mat.to_3x3()
 
-        state.build_armature(frame_nodes, context, bind_poses, ftm_globals, conv_mat)
+        _log(f"--- build_armature: {len(frame_nodes)} top-level frame_nodes")
+        try:
+            state.build_armature(frame_nodes, context, bind_poses, ftm_globals, conv_mat)
+        except Exception:
+            _log_exception("build_armature")
+            raise
+        _log(f"    build_armature done; armature_obj={state.armature_obj.name if state.armature_obj else None}")
+        if state.armature_obj:
+            _log(f"    bones in armature: {len(state.armature_obj.data.bones)}")
 
         # Stash passthrough text on the armature so the exporter can
         # re-emit templates and auxiliary frames verbatim on round-trip.
@@ -461,14 +534,27 @@ def import_x(context, filepath,
                 if scale_vals and all(abs(v) < 0.01 for v in scale_vals):
                     state._always_hidden_bones.add(bname)
 
-    for node in root.children:
-        if node.kind == "Frame":
-            state.import_frame_meshes(node, context)
+    _log("--- import_frame_meshes (mesh build phase)")
+    try:
+        for node in root.children:
+            if node.kind == "Frame":
+                _log(f"    importing meshes under top-level Frame '{node.name}'")
+                state.import_frame_meshes(node, context)
+    except Exception:
+        _log_exception("import_frame_meshes")
+        raise
+    _log(f"    mesh build done; {len(state.created_objects)} objects created")
 
     if import_animation:
-        anim_sets = [n for n in root.children if n.kind == "AnimationSet"]
-        for node in anim_sets:
-            state.import_animation_set(node, context)
+        _log("--- import_animation_set")
+        try:
+            anim_sets = [n for n in root.children if n.kind == "AnimationSet"]
+            for node in anim_sets:
+                state.import_animation_set(node, context)
+        except Exception:
+            _log_exception("import_animation_set")
+            raise
+        _log("    animation import done")
 
     if import_animation and set_frame_range:
         frame_range = _compute_animation_frame_range(root)
@@ -486,6 +572,7 @@ def import_x(context, filepath,
             context.scene.frame_end   = fend
             context.scene.frame_set(fstart)
 
+    _log(f"=== import_x complete; log at {_LOG_PATH}")
     return {"FINISHED"}
 
 def _iter_action_fcurves(action, anim_data=None):
@@ -641,68 +728,23 @@ def _apply_custom_normals(me, loop_normals):
     # mismatch; geometry-derived normals are correct enough.
     n_loops = len(me.loops)
     if len(loop_normals) != n_loops:
+        _log(f"        _apply_custom_normals: SIZE MISMATCH (got {len(loop_normals)} normals, mesh has {n_loops} loops) — skipping custom normals to avoid crash")
         # Make sure auto-smooth is off and any stale custom normals
         # are dropped, so geometry-derived shading takes over cleanly.
         _clear_custom_split_normals(me)
         return
 
-    # Scrub the normal list. normals_split_custom_set crashes
-    # asynchronously (next viewport redraw / edit-mode toggle, deep
-    # inside bm_mesh_loops_calc_normals) if any entry is NaN, inf,
-    # or a zero vector — Blender normalises internally but does not
-    # robustly reject those inputs. Replace any bad entry with +Z so
-    # the topology stays shaded rather than corrupted, and force-
-    # normalise the rest. Honey.xcache is the known repro.
-    safe = [None] * n_loops
-    any_bad = False
-    for i, n in enumerate(loop_normals):
-        try:
-            x, y, z = float(n[0]), float(n[1]), float(n[2])
-        except (TypeError, ValueError, IndexError):
-            safe[i] = (0.0, 0.0, 1.0)
-            any_bad = True
-            continue
-        # NaN/inf check: NaN != NaN; inf - inf is NaN; both fail isfinite-ish.
-        if not (x == x and y == y and z == z) or \
-           x in (float("inf"), float("-inf")) or \
-           y in (float("inf"), float("-inf")) or \
-           z in (float("inf"), float("-inf")):
-            safe[i] = (0.0, 0.0, 1.0)
-            any_bad = True
-            continue
-        L = (x * x + y * y + z * z) ** 0.5
-        if L < 1e-8:
-            safe[i] = (0.0, 0.0, 1.0)
-            any_bad = True
-            continue
-        safe[i] = (x / L, y / L, z / L)
-    _ = any_bad  # noted but not actioned; the scrubbed list is what we pass
-
     if hasattr(me, "normals_split_custom_set"):
 
         if hasattr(me, "use_auto_smooth"):
             me.use_auto_smooth = True
-        # Wrap the C-API call: even after scrubbing, Blender 5.1.x has
-        # been observed to leave the mesh's custom-normal cache in a
-        # state that segfaults the next time the viewport reads it
-        # (e.g. Honey.xcache via .config/blender/.../io_directx_x).
-        # If the call raises (rare) or we want to bail defensively,
-        # fall back to face-shading by clearing custom normals.
-        try:
-            me.normals_split_custom_set(safe)
-            # Force the custom-data cache to flush. Without an explicit
-            # update() here, downstream reads (next viewport redraw,
-            # edit-mode toggle) can race with a partially-written
-            # cache and segfault.
-            me.update()
-        except Exception:
-            _clear_custom_split_normals(me)
+        me.normals_split_custom_set(loop_normals)
     else:
 
         attr = me.attributes.get("custom_normal")
         if attr is None:
             attr = me.attributes.new("custom_normal", "FLOAT_VECTOR", "CORNER")
-        for i, n in enumerate(safe):
+        for i, n in enumerate(loop_normals):
             attr.data[i].vector = n
 
 
@@ -946,6 +988,7 @@ class _ImportState:
         def add_bone(frame_node, parent_edit_bone):
             name = frame_node.name or "Bone"
             parent_name = parent_edit_bone.name if parent_edit_bone else None
+            _log(f"      add_bone: {name!r}  parent={parent_name!r}")
 
             if use_ftm_rest:
 
@@ -1000,9 +1043,12 @@ class _ImportState:
                 if child.kind == "Frame":
                     add_bone(child, eb)
 
+        _log(f"    skel_roots: {[f.name for f in skel_roots]}")
+        _log(f"    skel_root_names: {sorted(self._skel_root_names)}")
         for fn in skel_roots:
             add_bone(fn, None)
 
+        _log(f"    add_bone recursion complete; {bone_count[0]} bones, {fallback_count[0]} fallbacks")
         bpy.ops.object.mode_set(mode="OBJECT")
 
     def import_frame_meshes(self, frame_node, context, parent_matrix=None):
@@ -1019,12 +1065,15 @@ class _ImportState:
 
     def _build_mesh(self, mesh_node, context, world_mat, frame_name):
         name_hint = mesh_node.name or frame_name or "Mesh"
+        _log(f"      _build_mesh: {name_hint!r} (frame={frame_name!r})")
 
         nums = mesh_node.nums()
         if not nums:
+            _log(f"        no nums, skipping")
             return
 
         vcount = int(nums[0])
+        _log(f"        vcount={vcount}")
         verts  = []
         idx    = 1
         for _ in range(vcount):
@@ -1076,14 +1125,7 @@ class _ImportState:
         me.update()
 
         _pending_loop_normals = None
-        # Per-vertex normal table, kept separately so we can rebuild
-        # _pending_loop_normals after the bmesh weld if one happens.
-        # Without this, loop_normals reflects pre-weld loop order, and
-        # passing it to me.normals_split_custom_set after the weld
-        # corrupts Blender's custom-normal cache (intermittent crashes
-        # observed on Honey.xcache in Blender 5.1, deep inside
-        # bm_mesh_loops_calc_normals on next viewport redraw).
-        _pending_vertex_normals = None
+        _pending_per_vi_normal = None
         normals_node = mesh_node.child("MeshNormals")
         if self.import_normals and normals_node:
             norms = normals_node.nums()
@@ -1102,6 +1144,9 @@ class _ImportState:
                 if ni < len(norms):
                     ni += 1
 
+                # Build a per-(pre-vert, per-corner) normal table that
+                # survives the weld. After weld we re-walk me.polygons
+                # and look up the normal by the surviving vert's index.
                 face_norm_indices = []
                 for face in faces:
                     cc = len(face)
@@ -1112,6 +1157,22 @@ class _ImportState:
                     ni += cc
                     face_norm_indices.append(idxs)
 
+                # Per-pre-vi normal lookup: average all the corner
+                # normals that referenced this pre-vi. (For most verts
+                # the corner normals are identical anyway; this just
+                # picks something reasonable when they differ.)
+                pre_vi_normal: dict = {}
+                for face_idx, face in enumerate(faces):
+                    for corner_idx, pre_vi in enumerate(face):
+                        if corner_idx >= len(face_norm_indices[face_idx]):
+                            continue
+                        ni_val = face_norm_indices[face_idx][corner_idx]
+                        if ni_val < len(normals_list):
+                            pre_vi_normal.setdefault(pre_vi, normals_list[ni_val])
+                _pending_per_vi_normal = pre_vi_normal
+                # Keep the pre-weld loop_normals build for the
+                # no-weld path (no armature). The post-weld path
+                # rebuilds from _pending_per_vi_normal instead.
                 loop_normals = []
                 for poly, norm_idxs in zip(me.polygons, face_norm_indices):
                     for corner, _ in enumerate(poly.loop_indices):
@@ -1120,27 +1181,6 @@ class _ImportState:
                             normals_list[ni_val] if ni_val < len(normals_list) else (0.0, 0.0, 1.0)
                         )
                 _pending_loop_normals = loop_normals
-
-                # If face_norm_indices is the identity mapping (each face
-                # uses normal-index = its own vertex-index for every
-                # corner), the per-vertex normals_list is a sufficient
-                # representation. Stash it so we can rebuild
-                # _pending_loop_normals correctly after a post-weld
-                # reindex. For non-identity mappings (sharp-edge files
-                # with per-corner normals), leave it None — those don't
-                # round-trip through a per-vertex table and we fall back
-                # to the pre-weld loop_normals as before.
-                identity_norm_map = (
-                    len(face_norm_indices) == len(faces)
-                    and all(
-                        len(face_norm_indices[fi]) == len(faces[fi])
-                        and all(face_norm_indices[fi][c] == faces[fi][c]
-                                for c in range(len(faces[fi])))
-                        for fi in range(len(faces))
-                    )
-                )
-                if identity_norm_map and len(normals_list) >= vcount:
-                    _pending_vertex_normals = normals_list[:vcount]
 
         uv_node = mesh_node.child("MeshTextureCoords")
         if self.import_uvs and uv_node:
@@ -1190,11 +1230,6 @@ class _ImportState:
                             else:
                                 loop_normals.append((0.0, 0.0, 1.0))
                     _pending_loop_normals = loop_normals
-                    # DeclData normals are per-vertex by construction; stash
-                    # the converted table for post-weld rebuild (see comment
-                    # at _pending_vertex_normals definition).
-                    if len(converted) >= vcount:
-                        _pending_vertex_normals = converted[:vcount]
                 if (per_vert_uvs is not None
                         and self.import_uvs
                         and not me.uv_layers):
@@ -1300,6 +1335,7 @@ class _ImportState:
             import bmesh as _bmesh
             pre_weld_positions = [tuple(v.co) for v in me.vertices]
             _pre_count = len(pre_weld_positions)
+            _log(f"        pre-weld vert count: {_pre_count}, skin blocks: {len(pre_weld_skin)}")
 
             EPS = 5
 
@@ -1335,10 +1371,12 @@ class _ImportState:
             for vi in range(_pre_count):
                 pre_to_post[vi] = keep_to_post[pre_to_keep[vi]]
             _post_count = len(keeper_pre_vis)
+            _log(f"        weld groups: {len(key_to_vis)}, post-weld vert count: {_post_count}")
 
             _bm = _bmesh.new()
             _bm.from_mesh(obj.data)
             _bm.verts.ensure_lookup_table()
+            _log(f"        bmesh has {len(_bm.verts)} verts (should match pre-weld count)")
 
             targetmap = {}
             for vis in key_to_vis.values():
@@ -1346,18 +1384,22 @@ class _ImportState:
                     continue
                 keep = min(vis)
                 if keep >= len(_bm.verts):
+                    _log(f"        !! keep index {keep} >= {len(_bm.verts)} bmesh verts; skipping")
                     continue
                 keep_v = _bm.verts[keep]
                 for other in vis:
                     if other != keep:
                         if other >= len(_bm.verts):
+                            _log(f"        !! other index {other} >= {len(_bm.verts)}; skipping")
                             continue
                         targetmap[_bm.verts[other]] = keep_v
+            _log(f"        weld targetmap has {len(targetmap)} entries")
 
             if targetmap:
                 try:
                     _bmesh.ops.weld_verts(_bm, targetmap=targetmap)
                 except Exception:
+                    _log_exception("_bmesh.ops.weld_verts")
                     _bm.free()
                     raise
 
@@ -1365,13 +1407,16 @@ class _ImportState:
             try:
                 _bm.to_mesh(obj.data)
             except Exception:
+                _log_exception("_bm.to_mesh")
                 _bm.free()
                 raise
             _bm.free()
             obj.data.update()
+            _log(f"        mesh now has {len(obj.data.vertices)} verts after weld")
 
             post_vert_pre_vis: dict = {}
 
+            _log(f"        writing vertex group weights ({len(pre_weld_skin)} bones)")
             for bone_name, influences in pre_weld_skin:
                 vg = obj.vertex_groups.get(bone_name) or obj.vertex_groups.new(name=bone_name)
                 for pre_vi, w in influences:
@@ -1386,6 +1431,7 @@ class _ImportState:
                         vg.add([post_vi], w, "REPLACE")
                     # else: this post-vert was already claimed by a different
                     # pre-vert from another bone — skip to avoid clobbering.
+            _log(f"        vertex groups written")
 
             # Per-vert normalization. The xcache stores raw per-bone
             # weights that aren't guaranteed to sum to 1.0 per vert —
@@ -1415,66 +1461,11 @@ class _ImportState:
                 n_norm += 1
             for post_vi, group_idx, new_w in rewrites:
                 obj.vertex_groups[group_idx].add([post_vi], new_w, "REPLACE")
+            _log(f"        weight normalization: {n_norm} verts rebalanced, {n_zero} unweighted")
 
             for poly in obj.data.polygons:
                 poly.use_smooth = True
             obj.data.update()
-
-            # CRITICAL: validate the mesh before any C-side custom-data
-            # writes. bmesh.ops.weld_verts followed by _bm.to_mesh can
-            # leave Blender's loop/poly cross-references in a state
-            # that is internally consistent for *most* reads but trips
-            # an out-of-bounds write inside normals_split_custom_set
-            # when degenerate faces were dropped during the weld
-            # (Honey.xcache drops 2 faces → 6 stale loop slots). The
-            # bad write corrupts the custom-normal cache, which then
-            # segfaults the next viewport redraw / edit-mode toggle.
-            # validate() with clean_customdata=False reconciles the
-            # topology while preserving the layers we just populated.
-            # The crash was intermittent because whether the OOB write
-            # hits a fatal address depends on heap state.
-            try:
-                obj.data.validate(verbose=False, clean_customdata=False)
-            except TypeError:
-                # Older Blender signatures without clean_customdata kwarg.
-                obj.data.validate(verbose=False)
-            obj.data.update()
-
-            # Post-weld loop-normal rebuild. _pending_loop_normals was
-            # captured against the pre-weld me.polygons / me.loops. After
-            # bmesh.ops.weld_verts + _bm.to_mesh(), Blender's loop/poly
-            # buffers are reordered and reindexed, so the stale list no
-            # longer corresponds to the current loop layout. Passing it
-            # to me.normals_split_custom_set then writes mis-matched
-            # normals into the custom-normal cache; the cache poisons
-            # the next viewport read and Blender segfaults deep inside
-            # bm_mesh_loops_calc_normals. The crash is intermittent
-            # because whether the corruption hits something fatal
-            # depends on the heap state at the time of the bad write.
-            # Honey.xcache is the known repro.
-            #
-            # Fix: rebuild loop_normals from the per-vertex normal table
-            # using each post-weld loop's vertex index, mapped back to a
-            # representative pre-weld vertex.
-            if _pending_vertex_normals is not None:
-                post_to_pre = {}
-                for pre_vi, post_vi in pre_to_post.items():
-                    # Any pre-vert that maps to this post-vert will do —
-                    # they all share the same rounded position and weight
-                    # signature, so their per-vertex normals are
-                    # interchangeable for shading purposes.
-                    post_to_pre.setdefault(post_vi, pre_vi)
-                rebuilt = []
-                for poly in obj.data.polygons:
-                    for loop_idx in poly.loop_indices:
-                        post_vi = obj.data.loops[loop_idx].vertex_index
-                        pre_vi = post_to_pre.get(post_vi)
-                        if pre_vi is not None and pre_vi < len(_pending_vertex_normals):
-                            rebuilt.append(_pending_vertex_normals[pre_vi])
-                        else:
-                            rebuilt.append((0.0, 0.0, 1.0))
-                _pending_loop_normals = rebuilt
-
             if getattr(self, "smooth_shade_from_faces", False):
                 # Smooth-shade from faces: every poly is marked smooth so
                 # Blender averages face normals at shared vertices. Any
@@ -1487,6 +1478,7 @@ class _ImportState:
                 _apply_custom_normals(obj.data, _pending_loop_normals)
                 if self.infer_sharps:
                     self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
+            _log(f"        normals applied; _build_mesh done for {name_hint!r}")
 
         else:
 
@@ -1541,7 +1533,9 @@ class _ImportState:
         me.update()
 
     def import_animation_set(self, anim_set_node, context):
+        _log(f"      import_animation_set: {anim_set_node.name!r}")
         if not self.armature_obj:
+            _log(f"        no armature_obj, returning")
             return
 
         arm_obj = self.armature_obj
@@ -1576,6 +1570,7 @@ class _ImportState:
         bpy.ops.object.mode_set(mode="POSE")
 
         anim_nodes = anim_set_node.children_of("Animation")
+        _log(f"        {len(anim_nodes)} Animation nodes to process")
         keyframe_errors = 0
 
         for _anim_idx, anim_node in enumerate(anim_nodes):
@@ -1586,7 +1581,9 @@ class _ImportState:
             if not bone_name:
                 continue
             if bone_name not in arm_obj.pose.bones:
+                _log(f"        [{_anim_idx}] anim refers to {bone_name!r} not in armature")
                 continue
+            _log(f"        [{_anim_idx}/{len(anim_nodes)}] anim for {bone_name!r}")
 
             pose_bone = arm_obj.pose.bones[bone_name]
             key_nodes = anim_node.children_of("AnimationKey")
