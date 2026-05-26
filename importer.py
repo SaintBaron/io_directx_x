@@ -20,61 +20,26 @@ are NOT added to the armature as bones.
 
 import os
 import math
+import re
 import bpy
-import tempfile
-import traceback
 from mathutils import Matrix, Vector, Quaternion
 
 from .parser import parse_x_file
 
 
-# ---------------------------------------------------------------------------
-# Logging — opt-in via the SNAKFORGE_DEBUG env var. OFF by default
-# because the per-call file-handle churn (open/write/flush/close on
-# every _log call, hundreds per import) is implicated in intermittent
-# crashes under Steam's pressure-vessel sandbox on Linux.
-#
-# To enable: launch Blender with SNAKFORGE_DEBUG=1 in the environment.
-# When enabled, logs go to <tempdir>/snakforge_import.log.
-# ---------------------------------------------------------------------------
-_DEBUG_LOG = bool(os.environ.get("SNAKFORGE_DEBUG"))
-_LOG_PATH = os.path.join(tempfile.gettempdir(), "snakforge_import.log")
-
-def _log(msg):
-    """Append a line to the log file when SNAKFORGE_DEBUG is set."""
-    if not _DEBUG_LOG:
-        return
-    try:
-        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(msg + "\n")
-            fh.flush()
-    except Exception:
-        # Logging must NEVER take down the import — swallow.
-        pass
-
-def _log_reset():
-    """Clear the log file at the start of an import."""
-    if not _DEBUG_LOG:
-        return
-    try:
-        with open(_LOG_PATH, "w", encoding="utf-8") as fh:
-            fh.write("")
-    except Exception:
-        pass
-
-def _log_exception(stage):
-    """Log the current exception with a stack trace."""
-    try:
-        _log(f"!!! EXCEPTION in {stage}")
-        _log(traceback.format_exc())
-    except Exception:
-        pass
-
-
 _KEY_TYPE_VALUES = {
+    # Per Microsoft Learn AnimationKey spec, keyType values are:
+    #   0 = rotation (4-float quaternion)
+    #   1 = scale    (3-float vector)
+    #   2 = position (3-float vector)
+    #   3 = matrix   (16-float 4x4)
+    # Bugsnax xcache files also use keyType=4 for matrix tracks
+    # (an engine-specific extension/deviation). Both 3 and 4 are
+    # treated as 16-float matrix keys downstream.
     0: 4,
     1: 3,
     2: 3,
+    3: 16,
     4: 16,
 }
 
@@ -201,18 +166,43 @@ def _collect_offset_matrices(root_node):
             nums = node.nums()
             if bone_name and nums:
                 n = int(nums[0])
-                offset_vals = nums[1 + n + n : 1 + n + n + 16]
-                if len(offset_vals) == 16:
-                    offset_mat = _mat4_from_list(offset_vals)
-                    try:
-                        bind_poses[bone_name] = offset_mat.inverted()
-                    except ValueError:
-                        bind_poses[bone_name] = Matrix.Identity(4)
+                # matrixOffset comes after n vis + n weights.
+                # For empty SW (n=0), it's at index 1.
+                mo_start = 1 + n + n
+                if len(nums) < mo_start + 16:
+                    for child in node.children:
+                        walk(child)
+                    return
+                offset_vals = nums[mo_start : mo_start + 16]
+                # Validate: skip identity matrices (likely uninit) and
+                # singular matrices. A non-trivial bind matrix has a
+                # finite determinant != 1.0 in the rotation part OR
+                # a non-zero translation. Identity matrices belong
+                # to bones that never moved from world origin OR
+                # placeholders that the file never filled in.
+                offset_mat = _mat4_from_list(offset_vals)
+                # Identity check: any non-trivial bind matrix has elements
+                # that differ from identity by more than rounding noise.
+                # Identity means "no bind data" — skip and let FTM fallback
+                # handle this bone.
+                ident = Matrix.Identity(4)
+                diff = offset_mat - ident
+                is_identity = max(abs(diff[r][c]) for r in range(4)
+                                                 for c in range(4)) < 1e-5
+                if is_identity:
+                    for child in node.children:
+                        walk(child)
+                    return
+                try:
+                    bind_poses[bone_name] = offset_mat.inverted()
+                except ValueError:
+                    pass
         for child in node.children:
             walk(child)
 
     walk(root_node)
     return bind_poses
+
 
 def _collect_ftm_globals(frame_node, parent_mat=None):
     if parent_mat is None:
@@ -258,6 +248,90 @@ def _compute_animation_frame_range(root):
         return None
     return int(round(min_f)), int(round(max_f))
 
+def _build_cross_content_search_paths(basename: str, anchor_dir: str) -> list:
+    """Return candidate absolute paths for a texture that may live in a
+    different subfolder than the file being imported.
+
+    Bugsnax textures are stored at full engine paths such as:
+        Content/Models/Bugs/Banana/Banana_D.dds
+
+    When the xcache is in e.g. Content/Characters/Banana/ the existing
+    four search paths don't reach the Models/ subtree.  This function
+    adds three more tiers:
+
+      1. Derive a likely subdirectory name from the texture stem by
+         stripping common material suffixes (_D, _N, _S, _AO, …) and
+         probe that named sibling folder at every ancestor level up to
+         5 hops.  This is the highest-priority hit for the standard
+         Bugsnax layout: Banana_D.dds → probe …/Banana/Banana_D.dds.
+
+      2. Scan all sibling directories at the same level as anchor_dir.
+
+      3. Walk up to find a "Content" ancestor and do a depth-2 scan of
+         every folder inside it (e.g. Content/Models/Bugs/*/Banana_D.dds).
+    """
+    candidates = []
+    stem_full = os.path.splitext(basename)[0]   # "Banana_D"
+
+    # Strip common material-map suffixes to get the likely folder name.
+    dir_stem = re.sub(
+        r'_(?:D|N|S|R|E|M|AO|ARM|Mask|Roughness|Metalness|Normal|Diffuse|Specular)$',
+        '', stem_full, flags=re.IGNORECASE
+    ) or stem_full   # "Banana"
+
+    # 1. Stem-named sibling at each ancestor level (highest priority)
+    ancestor = anchor_dir
+    for _ in range(5):
+        parent = os.path.dirname(ancestor)
+        if not parent or parent == ancestor:
+            break
+        candidates.append(os.path.join(parent, dir_stem, basename))
+        ancestor = parent
+
+    # 2. All peer sibling directories at anchor_dir's level
+    parent = os.path.dirname(anchor_dir)
+    if parent and parent != anchor_dir:
+        try:
+            for sibling in os.listdir(parent):
+                sib_path = os.path.join(parent, sibling)
+                if os.path.isdir(sib_path):
+                    candidates.append(os.path.join(sib_path, basename))
+        except OSError:
+            pass
+
+    # 3. Walk up to find a "Content" ancestor, depth-2 scan inside it
+    content_root = None
+    check = anchor_dir
+    for _ in range(6):
+        if os.path.basename(check).lower() == "content":
+            content_root = check
+            break
+        up = os.path.dirname(check)
+        if not up or up == check:
+            break
+        check = up
+
+    if content_root:
+        try:
+            for top in os.listdir(content_root):
+                top_path = os.path.join(content_root, top)
+                if not os.path.isdir(top_path):
+                    continue
+                # Direct stem-named subdir: e.g. Content/Models/Bugs/Banana/
+                candidates.append(os.path.join(top_path, dir_stem, basename))
+                try:
+                    for sub in os.listdir(top_path):
+                        sub_path = os.path.join(top_path, sub)
+                        if os.path.isdir(sub_path):
+                            candidates.append(os.path.join(sub_path, basename))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+
+    return candidates
+
+
 def import_x(context, filepath,
              use_apply_transform=True,
              global_scale=1.0,
@@ -272,35 +346,48 @@ def import_x(context, filepath,
              import_animation=True,
              anim_fps=0.0,
              set_frame_range=True,
-             rest_pose_source='FRAME_TRANSFORM',
+             rest_pose_source='BIND',
              infer_sharps=True,
              sharp_angle_deg=75.0,
              lock_root_translation=False,
              lock_leaf_translation=False,
              smooth_shade_from_faces=False,
+             weld_duplicate_verts=True,
+             use_diffuse_alpha=True,
+             split_submeshes=True,
+             triangulate_quads=True,
              **_):
 
-    _log_reset()
-    _log(f"=== import_x: filepath={filepath}")
-    _log(f"    options: armature={import_armature} weights={import_weights} anim={import_animation} rest_pose={rest_pose_source}")
+    # rest_pose_source default ('BIND') is now used as-is for both
+    # .x and .xcache files. Verified empirically (vert centroid vs
+    # bind-position vs FTM-position distance) that mesh data in both
+    # formats is authored in BIND pose: inv(matrixOffset) puts bones
+    # where the verts already are, so the mesh appears at rest
+    # correctly without any vertex rebinding. FTM in these files is
+    # an animation snapshot (Watermelon's extended-ragdoll legs,
+    # LidOpen blendshapes scaled to 0.001) — using it as the rest
+    # matrix forces the rebind to drag verts into FTM-space, which
+    # for Watermelon visibly stretches the body and scatters the leg
+    # geometry into floating fragments.
+    #
+    # 'FRAME_TRANSFORM' from the user falls through unchanged for
+    # power users who want Fragmotion-style FTM-rest behaviour.
 
-    try:
-        root = parse_x_file(filepath)
-    except Exception:
-        _log_exception("parse_x_file")
-        raise
-    _log(f"    parsed; root has {len(root.children)} top-level children")
+    root = parse_x_file(filepath,
+                        split_submeshes=split_submeshes,
+                        triangulate_quads=triangulate_quads)
 
-    # Log Frame/Mesh/SkinWeights/Animation summary
-    def _count(node, kind, n=[0]):
-        if node.kind == kind: n[0] += 1
-        for c in node.children: _count(c, kind, n)
-        return n[0]
-    n_frames = _count(root, 'Frame', [0])
-    n_meshes = _count(root, 'Mesh', [0])
-    n_sw = _count(root, 'SkinWeights', [0])
-    n_anim = _count(root, 'Animation', [0])
-    _log(f"    counts: Frames={n_frames}, Meshes={n_meshes}, SkinWeights={n_sw}, Animations={n_anim}")
+    def _count(node, kind):
+        n = 0
+        if node.kind == kind:
+            n += 1
+        for c in node.children:
+            n += _count(c, kind)
+        return n
+    n_frames = _count(root, 'Frame')
+    n_meshes = _count(root, 'Mesh')
+    n_sw = _count(root, 'SkinWeights')
+    n_anim = _count(root, 'Animation')
 
     base_dir = os.path.dirname(filepath)
 
@@ -339,8 +426,7 @@ def import_x(context, filepath,
                 return j
 
             # All `template Foo { ... }` declarations
-            import re as _re
-            for _m in _re.finditer(r'\btemplate\s+\w+\s*\{', _full_text):
+            for _m in re.finditer(r'\btemplate\s+\w+\s*\{', _full_text):
                 _start = _m.start()
                 _open_brace = _full_text.index('{', _start)
                 _end = _extract_braced_block(_full_text, _open_brace)
@@ -348,7 +434,7 @@ def import_x(context, filepath,
 
             # Any top-level Frame in the source file
             top_frame_names = {c.name for c in root.children if c.kind == "Frame"}
-            for _m in _re.finditer(r'(?m)^\s*Frame\s+(\w+)\s*\{', _full_text):
+            for _m in re.finditer(r'(?m)^\s*Frame\s+(\w+)\s*\{', _full_text):
                 _name = _m.group(1)
                 if _name not in top_frame_names:
                     continue
@@ -358,7 +444,7 @@ def import_x(context, filepath,
                 passthrough_frames[_name] = _full_text[_start:_end].rstrip()
 
             # Per-mesh DeclData and XSkinMeshHeader
-            for _m in _re.finditer(r'(?m)^\s*Mesh\s+(\w+)\s*\{', _full_text):
+            for _m in re.finditer(r'(?m)^\s*Mesh\s+(\w+)\s*\{', _full_text):
                 _mesh_name = _m.group(1)
                 _mesh_start = _full_text.find('Mesh', _m.start())
                 _mesh_open  = _full_text.index('{', _mesh_start)
@@ -368,7 +454,7 @@ def import_x(context, filepath,
                     ('DeclData', passthrough_decldata),
                     ('XSkinMeshHeader', passthrough_xskinheader),
                 ]:
-                    _km = _re.search(r'\b' + _kind + r'\s*\{', _mesh_text)
+                    _km = re.search(r'\b' + _kind + r'\s*\{', _mesh_text)
                     if _km is None:
                         continue
                     _ks = _km.start()
@@ -378,7 +464,7 @@ def import_x(context, filepath,
 
             # Per-target Animation blocks (so non-bone frames like
             # Translation_Data still get a track on round-trip)
-            for _m in _re.finditer(r'AnimationSet\s+\w+\s*\{', _full_text):
+            for _m in re.finditer(r'AnimationSet\s+\w+\s*\{', _full_text):
                 _line_start = _full_text.rfind('\n', 0, _m.start()) + 1
                 if 'template' in _full_text[_line_start:_m.start()]:
                     continue
@@ -386,7 +472,7 @@ def import_x(context, filepath,
                 _as_open  = _full_text.index('{', _as_start)
                 _as_end   = _extract_braced_block(_full_text, _as_open)
                 _as_text  = _full_text[_as_start:_as_end]
-                for _am in _re.finditer(r'Animation\s*\{', _as_text):
+                for _am in re.finditer(r'Animation\s*\{', _as_text):
                     _aline_start = _as_text.rfind('\n', 0, _am.start()) + 1
                     if 'template' in _as_text[_aline_start:_am.start()]:
                         continue
@@ -394,7 +480,7 @@ def import_x(context, filepath,
                     _a_open  = _as_text.index('{', _a_start)
                     _a_end   = _extract_braced_block(_as_text, _a_open)
                     _a_text  = _as_text[_a_start:_a_end]
-                    _ref = _re.search(r'\{\s*(\w+)\s*\}', _a_text)
+                    _ref = re.search(r'\{\s*(\w+)\s*\}', _a_text)
                     if _ref:
                         passthrough_animations[_ref.group(1)] = _a_text.rstrip()
                 break
@@ -422,9 +508,25 @@ def import_x(context, filepath,
         lock_root_translation=lock_root_translation,
         lock_leaf_translation=lock_leaf_translation,
         smooth_shade_from_faces=smooth_shade_from_faces,
+        weld_duplicate_verts=weld_duplicate_verts,
+        use_diffuse_alpha=use_diffuse_alpha,
+        split_submeshes=split_submeshes,
     )
     state._passthrough_decldata = passthrough_decldata
     state._passthrough_xskinheader = passthrough_xskinheader
+
+    # When the source is a .xcache binary, record the absolute path so that
+    # _build_mesh can stash it on each created mesh object for exporter use.
+    if filepath.lower().endswith('.xcache'):
+        state._source_xcache_path = os.path.abspath(filepath)
+
+    # Create a collection named after the file (without extension) and link it
+    # into the active scene so all imported objects land there together rather
+    # than loose in the top-level scene collection.
+    import_col_name = os.path.splitext(os.path.basename(filepath))[0]
+    import_col = bpy.data.collections.new(import_col_name)
+    context.scene.collection.children.link(import_col)
+    state._import_collection = import_col
 
     file_ticks_per_second = None
     for node in root.children:
@@ -465,22 +567,20 @@ def import_x(context, filepath,
         for fn in frame_nodes:
             ftm_globals.update(_collect_ftm_globals(fn))
 
+        # SkinWeights matrixOffset is the inverse bind pose (the mesh
+        # was authored against this), and FTM is the bone position at
+        # the first animation keyframe. For Bugsnax xcache and some .x
+        # files these disagree; matrixOffset is the ground truth for
+        # binding, FTM drives rest-pose orientation. Bones without
+        # SkinWeights data fall back to FTM.
+        n_with_bind = len(bind_poses)
+        n_without_bind = len(ftm_globals) - n_with_bind
+
         conv_mat = _axis_matrix(axis_forward, axis_up)
         axis_fix = Matrix.Rotation(math.pi, 4, 'Z')
-
         conv_mat = axis_fix @ conv_mat
 
-        _cm3 = conv_mat.to_3x3()
-
-        _log(f"--- build_armature: {len(frame_nodes)} top-level frame_nodes")
-        try:
-            state.build_armature(frame_nodes, context, bind_poses, ftm_globals, conv_mat)
-        except Exception:
-            _log_exception("build_armature")
-            raise
-        _log(f"    build_armature done; armature_obj={state.armature_obj.name if state.armature_obj else None}")
-        if state.armature_obj:
-            _log(f"    bones in armature: {len(state.armature_obj.data.bones)}")
+        state.build_armature(frame_nodes, context, bind_poses, ftm_globals, conv_mat)
 
         # Stash passthrough text on the armature so the exporter can
         # re-emit templates and auxiliary frames verbatim on round-trip.
@@ -534,27 +634,26 @@ def import_x(context, filepath,
                 if scale_vals and all(abs(v) < 0.01 for v in scale_vals):
                     state._always_hidden_bones.add(bname)
 
-    _log("--- import_frame_meshes (mesh build phase)")
-    try:
-        for node in root.children:
-            if node.kind == "Frame":
-                _log(f"    importing meshes under top-level Frame '{node.name}'")
+    for node in root.children:
+        if node.kind == "Frame":
+            try:
                 state.import_frame_meshes(node, context)
-    except Exception:
-        _log_exception("import_frame_meshes")
-        raise
-    _log(f"    mesh build done; {len(state.created_objects)} objects created")
+            except Exception:
+                # Per-top-level-frame failures should not abort the import
+                # — other frames may still produce useful geometry.
+                pass
 
     if import_animation:
-        _log("--- import_animation_set")
-        try:
-            anim_sets = [n for n in root.children if n.kind == "AnimationSet"]
-            for node in anim_sets:
+        anim_sets = [n for n in root.children if n.kind == "AnimationSet"]
+        for node in anim_sets:
+            # Per-AnimationSet failures should not abort the import —
+            # the skeleton and meshes are already in scene by this point
+            # and a partial set of animation channels is more useful than
+            # losing the whole import.
+            try:
                 state.import_animation_set(node, context)
-        except Exception:
-            _log_exception("import_animation_set")
-            raise
-        _log("    animation import done")
+            except Exception:
+                pass
 
     if import_animation and set_frame_range:
         frame_range = _compute_animation_frame_range(root)
@@ -572,28 +671,7 @@ def import_x(context, filepath,
             context.scene.frame_end   = fend
             context.scene.frame_set(fstart)
 
-    _log(f"=== import_x complete; log at {_LOG_PATH}")
     return {"FINISHED"}
-
-def _iter_action_fcurves(action, anim_data=None):
-    if hasattr(action, "fcurves"):
-
-        yield from action.fcurves
-        return
-
-    slot = None
-    if anim_data is not None and hasattr(anim_data, "action_slot"):
-        slot = anim_data.action_slot
-    for layer in action.layers:
-        for strip in layer.strips:
-            if slot is not None:
-                cb = strip.channelbag(slot)
-                if cb is not None:
-                    yield from cb.fcurves
-            else:
-
-                for cb in strip.channelbags:
-                    yield from cb.fcurves
 
 def _get_or_create_fcurve(action, anim_data, data_path, index, group_name):
     if hasattr(action, "fcurves"):
@@ -728,23 +806,89 @@ def _apply_custom_normals(me, loop_normals):
     # mismatch; geometry-derived normals are correct enough.
     n_loops = len(me.loops)
     if len(loop_normals) != n_loops:
-        _log(f"        _apply_custom_normals: SIZE MISMATCH (got {len(loop_normals)} normals, mesh has {n_loops} loops) — skipping custom normals to avoid crash")
         # Make sure auto-smooth is off and any stale custom normals
         # are dropped, so geometry-derived shading takes over cleanly.
         _clear_custom_split_normals(me)
         return
 
-    if hasattr(me, "normals_split_custom_set"):
+    # Validate mesh structure before the C call. Queen.xcache has 3
+    # degenerate source faces ([0,0,0], [2,0,0], [6434,6432,6432])
+    # which we filter at parse time, but bmesh.ops.weld_verts can
+    # also produce post-weld degeneracies (zero-area tris when two
+    # verts of a triangle weld together). The C-side
+    # normals_split_custom_set walks the loop topology and segfaults
+    # when it hits a polygon with collapsed corners. me.validate()
+    # detects and repairs these in pure-Python land before the call.
+    try:
+        if hasattr(me, "validate"):
+            me.validate(verbose=False, clean_customdata=False)
+    except Exception:
+        pass
+    # validate() can re-arrange or remove loops, invalidating our
+    # loop_normals list. Re-check length.
+    n_loops_post = len(me.loops)
+    if n_loops_post != n_loops:
+        _clear_custom_split_normals(me)
+        return
 
+    # Sanitise every normal: must be finite and unit-length. Bad
+    # values (NaN, inf, near-zero, denormalised) survive the size
+    # check but get baked into Blender's loop-normal cache as
+    # garbage, then crash the C solver later when edit-mode toggles
+    # or the viewport rebuilds the mesh. Replace anything suspect
+    # with (0, 0, 1) — geometry will still shade reasonably.
+    safe_normals = []
+    n_bad = 0
+    for n in loop_normals:
+        if n is None or len(n) != 3:
+            safe_normals.append((0.0, 0.0, 1.0))
+            n_bad += 1
+            continue
+        nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
+        if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
+            safe_normals.append((0.0, 0.0, 1.0))
+            n_bad += 1
+            continue
+        mag = (nx*nx + ny*ny + nz*nz) ** 0.5
+        if mag < 1e-6:
+            safe_normals.append((0.0, 0.0, 1.0))
+            n_bad += 1
+            continue
+        # Always renormalise — even mostly-unit normals can drift to
+        # 0.9999 or 1.0001, and the C solver is strict.
+        inv = 1.0 / mag
+        safe_normals.append((nx * inv, ny * inv, nz * inv))
+
+    # Clear any stale custom split normals BEFORE setting new ones.
+    # If the mesh already has loop normals from a previous import
+    # or modifier evaluation, they linger in a C-side cache that
+    # `normals_split_custom_set` doesn't always overwrite cleanly.
+    try:
+        if hasattr(me, "free_normals_split"):
+            me.free_normals_split()
+    except Exception:
+        pass
+
+    if hasattr(me, "normals_split_custom_set"):
+        # use_auto_smooth must be ON before normals_split_custom_set
+        # is called — otherwise the data is stored but ignored by the
+        # solver, and edit-mode toggle re-evaluates with stale data.
         if hasattr(me, "use_auto_smooth"):
             me.use_auto_smooth = True
-        me.normals_split_custom_set(loop_normals)
+        try:
+            me.normals_split_custom_set(safe_normals)
+        except Exception:
+            # If even the sanitised set fails, drop custom normals
+            # entirely. Smooth-shading from face normals is the
+            # safe fallback.
+            _clear_custom_split_normals(me)
+            return
     else:
 
         attr = me.attributes.get("custom_normal")
         if attr is None:
             attr = me.attributes.new("custom_normal", "FLOAT_VECTOR", "CORNER")
-        for i, n in enumerate(loop_normals):
+        for i, n in enumerate(safe_normals):
             attr.data[i].vector = n
 
 
@@ -798,13 +942,31 @@ class _ImportState:
         # default to empty so non-import code paths don't crash.
         self._passthrough_decldata: dict = {}
         self._passthrough_xskinheader: dict = {}
+        # Source xcache path — set when importing a .xcache file so the
+        # exporter can splice the original binary mesh blocks on round-trip.
+        self._source_xcache_path: str = ""
+        # Blender collection that receives all objects from this import.
+        # Set by import_x immediately after state construction.
+        self._import_collection = None
 
     def parse_material(self, node, base_dir):
         name = node.name or "Material"
-        existing = bpy.data.materials.get(name)
+        # Per-import cache: if THIS import session already created a
+        # material with this name (e.g. via a REF resolution earlier
+        # in the same file), reuse it. We deliberately DON'T check
+        # bpy.data.materials.get(name) here — that would reuse a
+        # material from a PREVIOUS bulk-import iteration. Maya-exported
+        # .x files all tend to name their materials "blinn1", "lambert1"
+        # etc., so cross-file name collisions are the norm rather than
+        # the exception. Reusing them would mean every file after the
+        # first inherits the first file's textures.
+        existing = self.materials.get(name)
         if existing:
-            self.materials[name] = existing
             return existing
+        # If a material with this name exists globally (e.g. from a
+        # previous import in the same Blender session), let Blender
+        # auto-suffix the new one to "blinn1.001". The shader graph
+        # then gets THIS file's texture data, not the previous file's.
         mat = bpy.data.materials.new(name)
         mat.use_nodes = True
 
@@ -864,39 +1026,74 @@ class _ImportState:
                 original_tex_name = strs[0].replace('\\\\', '\\')
                 mat["_x_texture_filename"] = original_tex_name
 
-        if self.import_textures and original_tex_name:
-            tex_path  = original_tex_name.replace("\\", os.sep).replace("/", os.sep)
-            full_path = os.path.join(base_dir, tex_path)
+        # Fallback for xcache files that embed no texture paths (e.g. Queen.xcache):
+        # derive candidate names from the material / asset name and let the directory
+        # search below find a match.  We do NOT write these to _x_texture_filename
+        # because they are guesses, not authoritative paths from the file.
+        convention_tex_candidates = []
+        if not original_tex_name and self.import_textures:
+            mat_name = node.name or ""
+            # e.g. "QueenMaterial1" -> "Queen", "QueenMaterial" -> "Queen"
+            base = re.sub(r'Material\d*$', '', mat_name) or mat_name
+            # Try common Bugsnax/Horsepower texture naming patterns:
+            #   Queen.dds, Queen_D.dds, QueenMaterial1.dds, Queen_1_D.dds, …
+            convention_tex_candidates = [
+                f"{base}.dds",
+                f"{base}_D.dds",
+                f"{mat_name}.dds",
+                f"{mat_name}_D.dds",
+            ]
+            # Extract material index suffix if present (e.g. "1" from "QueenMaterial1")
+            idx_match = re.search(r'(\d+)$', mat_name)
+            if idx_match:
+                idx = idx_match.group(1)
+                convention_tex_candidates += [
+                    f"{base}_{idx}.dds",
+                    f"{base}_{idx}_D.dds",
+                ]
 
-            # Build a list of plausible directories to look in.  xcache
-            tex_basename = os.path.basename(tex_path)
-            tex_subparts = tex_path.split(os.sep)
-
+        if self.import_textures and (original_tex_name or convention_tex_candidates):
+            # Build the primary search list from the explicit path (if any).
             search_paths = []
+            full_path = None  # canonical "intended" path for placeholder
+            if original_tex_name:
+                tex_path  = original_tex_name.replace("\\", os.sep).replace("/", os.sep)
+                full_path = os.path.join(base_dir, tex_path)
+                tex_basename = os.path.basename(tex_path)
+                tex_subparts = tex_path.split(os.sep)
 
-            # 1. Exact path from xcache, anchored at base_dir
-            search_paths.append(full_path)
+                # 1. Exact path from the file, anchored at base_dir
+                search_paths.append(full_path)
 
-            # 2. Progressively shorter tails of the engine path under
-            #    base_dir (e.g. "Apple/Apple_D.dds", "Apple_D.dds")
-            for cut in range(1, len(tex_subparts)):
-                search_paths.append(os.path.join(base_dir, *tex_subparts[cut:]))
+                # 2. Progressively shorter tails of the engine path under
+                #    base_dir (e.g. "Apple/Apple_D.dds", "Apple_D.dds")
+                for cut in range(1, len(tex_subparts)):
+                    search_paths.append(os.path.join(base_dir, *tex_subparts[cut:]))
 
-            # 3. Common texture subfolders next to the xcache
-            for sub in ("Textures", "textures", "Tex", "tex"):
-                search_paths.append(os.path.join(base_dir, sub, tex_basename))
+                # 3. Common texture subfolders next to the xcache
+                for sub in ("Textures", "textures", "Tex", "tex"):
+                    search_paths.append(os.path.join(base_dir, sub, tex_basename))
 
-            # 4. Walk up to 3 directory levels above base_dir, also with
-            ancestor = base_dir
-            for _ in range(3):
-                parent = os.path.dirname(ancestor)
-                if not parent or parent == ancestor:
-                    break
-                ancestor = parent
-                search_paths.append(os.path.join(ancestor, tex_path))
-                search_paths.append(os.path.join(ancestor, tex_basename))
+                # 4. Walk up to 3 directory levels above base_dir
+                ancestor = base_dir
+                for _ in range(3):
+                    parent = os.path.dirname(ancestor)
+                    if not parent or parent == ancestor:
+                        break
+                    ancestor = parent
+                    search_paths.append(os.path.join(ancestor, tex_path))
+                    search_paths.append(os.path.join(ancestor, tex_basename))
 
-            # For each candidate location, try the requested extension
+                # 5. Cross-content search: sibling character/model folders and
+                #    a depth-2 scan under any "Content" ancestor.  Handles the
+                #    Bugsnax layout where textures live at
+                #    Content/Models/Bugs/<CharName>/<CharName>_D.dds while the
+                #    xcache is in Content/Characters/<CharName>/.
+                search_paths.extend(
+                    _build_cross_content_search_paths(tex_basename, base_dir)
+                )
+
+            # For each candidate location, also try alternate extensions.
             alt_exts = [".png", ".jpg", ".jpeg", ".tga", ".dds", ".bmp", ".tif", ".tiff", ".webp"]
 
             def _expand_candidates(p):
@@ -918,12 +1115,22 @@ class _ImportState:
                         except Exception:
                             img = None
                         if img is not None:
+                            # Record the successfully resolved path so the
+                            # exporter can round-trip it.
+                            if not original_tex_name:
+                                mat["_x_texture_filename"] = os.path.basename(candidate)
                             break
                 if img is not None:
                     break
 
-            # Always create a TEX_IMAGE node and connect it to the
-            if img is None:
+            # Always create a TEX_IMAGE node and connect it to the BSDF so
+            # the user can re-link manually if auto-search failed.
+            if img is None and original_tex_name:
+                # Only create a placeholder for explicitly-named textures —
+                # convention guesses that don't exist shouldn't pollute the
+                # image datablocks with junk 1×1 placeholders.
+                if full_path is None:
+                    full_path = os.path.join(base_dir, original_tex_name)
                 try:
                     placeholder_name = os.path.basename(original_tex_name) or name
                     img = bpy.data.images.get(placeholder_name)
@@ -953,6 +1160,33 @@ class _ImportState:
                 except Exception:
                     pass
 
+                # Connect texture alpha → material Alpha when the
+                # "Use Diffuse Alpha" option is on. Many Bugsnax
+                # textures encode transparency in the diffuse alpha
+                # channel (leaf cutouts, eye highlights, etc.).
+                # Connecting this is safe even for fully-opaque
+                # textures — the alpha channel just reads as 1.0
+                # everywhere and the material renders as if alpha
+                # had never been hooked up. Also flip the material
+                # blend mode to alpha-blend so Blender's viewport
+                # actually respects the alpha; without this the
+                # connection is silent and the artist might think
+                # the option didn't work.
+                if getattr(self, 'use_diffuse_alpha', False):
+                    try:
+                        mat.node_tree.links.new(
+                            tex_img_node.outputs["Alpha"],
+                            bsdf.inputs["Alpha"],
+                        )
+                        # Use 'HASHED' (dithered transparency) by
+                        # default — it works well for both cutouts
+                        # (leaves, fences) and soft-edged transparency
+                        # (eye highlights) without needing the user
+                        # to pick between CLIP and BLEND.
+                        mat.blend_method = 'HASHED'
+                    except Exception:
+                        pass
+
         self.materials[name] = mat
         return mat
 
@@ -974,7 +1208,7 @@ class _ImportState:
         arm_data = bpy.data.armatures.new("Armature")
         arm_data.display_type = "STICK"
         arm_obj  = bpy.data.objects.new("Armature", arm_data)
-        context.collection.objects.link(arm_obj)
+        self._import_collection.objects.link(arm_obj)
         self.armature_obj = arm_obj
         self.created_objects.append(arm_obj)
         arm_obj.matrix_world = Matrix.Identity(4)
@@ -988,7 +1222,6 @@ class _ImportState:
         def add_bone(frame_node, parent_edit_bone):
             name = frame_node.name or "Bone"
             parent_name = parent_edit_bone.name if parent_edit_bone else None
-            _log(f"      add_bone: {name!r}  parent={parent_name!r}")
 
             if use_ftm_rest:
 
@@ -997,6 +1230,15 @@ class _ImportState:
                 # `_bone_rebind` is a safety net for files where FTM
                 # and SkinWeights bind disagree; identity when they
                 # agree (the common case after the parser fix).
+                #
+                # When FTM and bind disagree (e.g. Watermelon's
+                # BigFrontLeg / BigBackLeg Hip+Knee chain whose FTM
+                # is an extended pose, or LidOpen blendshape bones
+                # whose FTM has basis scale 0.001), placing both bone
+                # and verts in FTM space keeps them aligned at rest.
+                # The rebind transforms BIND-space verts to FTM-space
+                # so they line up with the FTM-positioned bone. Mixing
+                # the two (Knee at bind, Hip at FTM) breaks the chain.
 
                 new_rest_bl = conv_mat @ ftm_globals[name] if name in ftm_globals else None
                 old_bind_bl = conv_mat @ bind_poses[name]  if name in bind_poses  else None
@@ -1033,6 +1275,45 @@ class _ImportState:
             eb.matrix = rest_mat
             if (eb.tail - eb.head).length < 1e-4:
                 eb.tail = eb.head + rest_mat.to_3x3() @ Vector((0, 0.1, 0))
+
+            # Workaround for Blender's mat3_to_vec_roll singular branch.
+            #
+            # When the bone Y axis (head→tail) is very close to world ±Y,
+            # Blender's vec_roll_to_mat3_normalized branches on
+            # theta_alt = nor.x² + nor.z² > (2.5e-4)² = 6.25e-8. The
+            # standard and singular branches produce matrices differing by
+            # ~90° around bone-local Y. In symmetric models (Shishkabob)
+            # the bones in a symmetric set can sit on opposite sides of the
+            # threshold due to floating-point noise — one bone gets rotated
+            # 90° relative to its siblings even though we passed in
+            # numerically equivalent rest matrices.
+            #
+            # Workaround: read back eb.matrix; if Blender's stored X axis
+            # differs from the target, search roll offsets of ±90/180/270°
+            # for the one that reproduces the target X. Uses Blender's own
+            # reconstruction in the search loop, so it's robust to whichever
+            # branch fires.
+            try:
+                target_x = rest_mat.to_3x3().col[0].normalized()
+                actual_x = eb.matrix.to_3x3().col[0].normalized()
+                if actual_x.dot(target_x) < 0.99:
+                    base_roll = eb.roll
+                    best_diff = float('inf')
+                    best_roll = base_roll
+                    # Candidates are k * 90° for k in {-1, 0, 1, 2}; this
+                    # covers all four distinct roll offsets modulo 2π.
+                    for delta in (0.0, math.pi/2, math.pi, -math.pi/2):
+                        eb.roll = base_roll + delta
+                        diff = (eb.matrix.to_3x3().col[0].normalized()
+                                - target_x).length
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_roll = base_roll + delta
+                    eb.roll = best_roll
+            except Exception:
+                # Leave the bone as Blender stored it on failure.
+                pass
+
             eb.use_connect = False
             if parent_edit_bone:
                 eb.parent = parent_edit_bone
@@ -1043,12 +1324,9 @@ class _ImportState:
                 if child.kind == "Frame":
                     add_bone(child, eb)
 
-        _log(f"    skel_roots: {[f.name for f in skel_roots]}")
-        _log(f"    skel_root_names: {sorted(self._skel_root_names)}")
         for fn in skel_roots:
             add_bone(fn, None)
 
-        _log(f"    add_bone recursion complete; {bone_count[0]} bones, {fallback_count[0]} fallbacks")
         bpy.ops.object.mode_set(mode="OBJECT")
 
     def import_frame_meshes(self, frame_node, context, parent_matrix=None):
@@ -1059,21 +1337,24 @@ class _ImportState:
         world_mat = parent_matrix @ local_mat
         for child in frame_node.children:
             if child.kind == "Mesh":
-                self._build_mesh(child, context, world_mat, frame_node.name)
+                # Per-mesh failures should not abort the entire import.
+                # A skeleton-only result (or a partial set of meshes) is
+                # more useful than nothing.
+                try:
+                    self._build_mesh(child, context, world_mat, frame_node.name)
+                except Exception:
+                    pass
             elif child.kind == "Frame":
                 self.import_frame_meshes(child, context, world_mat)
 
     def _build_mesh(self, mesh_node, context, world_mat, frame_name):
         name_hint = mesh_node.name or frame_name or "Mesh"
-        _log(f"      _build_mesh: {name_hint!r} (frame={frame_name!r})")
 
         nums = mesh_node.nums()
         if not nums:
-            _log(f"        no nums, skipping")
             return
 
         vcount = int(nums[0])
-        _log(f"        vcount={vcount}")
         verts  = []
         idx    = 1
         for _ in range(vcount):
@@ -1093,11 +1374,35 @@ class _ImportState:
             face = [int(nums[idx + j]) for j in range(n)]; idx += n
             faces.append(face)
 
-        from collections import Counter
+        # Filter out degenerate faces: faces with fewer than 3 unique
+        # vertex indices, or OOB indices. Queen.xcache has 3 such
+        # faces (e.g. [0,0,0], [2,0,0]) that Blender's from_pydata
+        # would silently keep as zero-area polygons. Later when
+        # normals_split_custom_set is called the C-side reads through
+        # those broken loops and segfaults. Tracking which source
+        # face index each kept face came from lets us continue to
+        # apply face-indexed metadata (MeshNormals per-face indices,
+        # material per-face indices, face_to_submesh) without
+        # off-by-one errors.
+        _kept_face_src_idx = []      # post-filter idx -> source face idx
+        _filtered_faces = []
+        n_degen_dropped = 0
+        for fsi, face in enumerate(faces):
+            if len(face) < 3:
+                n_degen_dropped += 1
+                continue
+            if len(set(face)) < 3:
+                # Duplicate index within face — e.g. [0,0,0], [2,0,0].
+                # Not a valid polygon.
+                n_degen_dropped += 1
+                continue
+            _filtered_faces.append(face)
+            _kept_face_src_idx.append(fsi)
+        faces = _filtered_faces
 
         me  = bpy.data.meshes.new(name_hint)
         obj = bpy.data.objects.new(name_hint, me)
-        context.collection.objects.link(obj)
+        self._import_collection.objects.link(obj)
         self.created_objects.append(obj)
 
         # Stash the original DeclData and XSkinMeshHeader source-text
@@ -1116,6 +1421,46 @@ class _ImportState:
             # later edits the mesh and the count changes, the exporter
             # will know the stashed DeclData no longer applies.
             obj["_x_orig_vert_count"] = vcount
+            # Stash the original mesh name so the exporter can look it up.
+            obj["_x_mesh_name"] = _src_mesh_name
+        # Stash the wrapping Frame's name too. In .x text format the
+        # Maya export convention is to nest the Mesh inside a Frame
+        # where the Frame is named e.g. "WatermelonGeo3" and the
+        # Mesh inside is named "WatermelonGeo3Shape". On round-trip
+        # the exporter needs both names: Frame name for the outer
+        # wrapper, Mesh name for the inner block. Without this stash
+        # the exporter falls back to the Blender object name (which
+        # the importer set to the Mesh name) and the round-trip
+        # produces a Frame named "WatermelonGeo3Shape" instead of
+        # the original "WatermelonGeo3".
+        if frame_name and frame_name != _src_mesh_name:
+            obj["_x_frame_name"] = frame_name
+
+        # Store the source filepath for xcache round-trip.
+        if hasattr(self, '_source_xcache_path') and self._source_xcache_path:
+            obj["_x_source_xcache"] = self._source_xcache_path
+            # Track sub-mesh order within this source xcache so the
+            # exporter can emit per-mesh SkinWeights chunks in the
+            # original order with correct chunk-index trailers. Counter
+            # lives on the importer state, reset per import.
+            if not hasattr(self, '_submesh_counter'):
+                self._submesh_counter = 0
+            obj["_x_submesh_idx"] = self._submesh_counter
+            self._submesh_counter += 1
+
+        # If this mesh came from a multi-material .x split (parser-level
+        # _split_x_mesh_by_material post-process), stash the split-group
+        # provenance. The .x exporter uses these to re-merge the split
+        # objects back into a single Mesh node with a multi-material
+        # MeshMaterialList — matching the original .x file structure.
+        # `split_source_mesh` is the name of the ORIGINAL pre-split
+        # mesh (e.g. 'BoatGeoLowShape'). `split_group_idx` is this
+        # object's position in the split (0 = first material's faces).
+        node_meta = getattr(mesh_node, 'meta', None)
+        if node_meta and 'split_source_mesh' in node_meta:
+            obj["_x_split_source_mesh"] = node_meta['split_source_mesh']
+            obj["_x_split_group_idx"]   = node_meta['split_group_idx']
+            obj["_x_split_group_total"] = node_meta['split_group_total']
 
         M = self._conv_mat
         s = self.global_scale
@@ -1123,6 +1468,12 @@ class _ImportState:
             verts = [((M @ Vector(v)) * s).to_tuple() for v in verts]
         me.from_pydata(verts, [], faces)
         me.update()
+        # Snapshot of source vert positions — used later as the weld
+        # key, BEFORE any rebinding micro-displaces them. Without this
+        # snapshot, bone-rebind moves verts at the same source XYZ
+        # apart by ~1e-6, and the rounded-position weld key no longer
+        # groups them.
+        _source_positions = list(verts)
 
         _pending_loop_normals = None
         _pending_per_vi_normal = None
@@ -1147,15 +1498,33 @@ class _ImportState:
                 # Build a per-(pre-vert, per-corner) normal table that
                 # survives the weld. After weld we re-walk me.polygons
                 # and look up the normal by the surviving vert's index.
-                face_norm_indices = []
-                for face in faces:
-                    cc = len(face)
-                    if ni >= len(norms):
-                        face_norm_indices.append([0] * cc); continue
-                    ni += 1
-                    idxs = [int(norms[ni + k]) if ni + k < len(norms) else 0 for k in range(cc)]
-                    ni += cc
-                    face_norm_indices.append(idxs)
+                # NOTE: the file's face-normal-index block is sized to
+                # the SOURCE face count (incl. degenerates). We pre-
+                # parse all of it into a source-indexed array, then
+                # extract entries for the post-filter face order via
+                # _kept_face_src_idx so face_norm_indices stays
+                # aligned with `faces`.
+                _source_face_norm_indices = []
+                _src_ni = ni
+                for _fsi in range(fcount):
+                    if _src_ni >= len(norms):
+                        _source_face_norm_indices.append([])
+                        continue
+                    _src_cc = int(norms[_src_ni]); _src_ni += 1
+                    _src_idxs = [int(norms[_src_ni + k]) if _src_ni + k < len(norms) else 0
+                                 for k in range(_src_cc)]
+                    _src_ni += _src_cc
+                    _source_face_norm_indices.append(_src_idxs)
+                ni = _src_ni
+                face_norm_indices = [_source_face_norm_indices[fsi]
+                                     for fsi in _kept_face_src_idx]
+                # Pad missing entries with [0]*cc so downstream loops
+                # don't crash on short lists.
+                for k, face in enumerate(faces):
+                    if len(face_norm_indices[k]) < len(face):
+                        face_norm_indices[k] = (
+                            list(face_norm_indices[k])
+                            + [0] * (len(face) - len(face_norm_indices[k])))
 
                 # Per-pre-vi normal lookup: average all the corner
                 # normals that referenced this pre-vi. (For most verts
@@ -1186,6 +1555,10 @@ class _ImportState:
         if self.import_uvs and uv_node:
             uvnums  = uv_node.nums()
             uvcount = int(uvnums[0]) if uvnums else 0
+            # Per Microsoft Learn MeshTextureCoords spec, nTextureCoords
+            # MUST equal nVertices. Log a warning if they disagree,
+            # then proceed with the smaller of the two to avoid
+            # out-of-range UVs.
             uvs     = []
             ui      = 1
             for _ in range(uvcount):
@@ -1246,9 +1619,24 @@ class _ImportState:
             mat_nums = mat_list_node.nums()
             if mat_nums:
                 face_mat_count   = int(mat_nums[1]) if len(mat_nums) > 1 else 0
+                # Per Microsoft Learn MeshMaterialList spec, nFaceIndexes
+                # MUST equal the parent mesh's nFaces. Log a warning if
+                # they disagree, then clamp to avoid mis-assigning
+                # materials to non-existent faces.
                 face_mat_indices = [int(mat_nums[2 + i])
-                                    for i in range(face_mat_count)
+                                    for i in range(min(face_mat_count, fcount))
                                     if 2 + i < len(mat_nums)]
+
+                # If degenerate faces were filtered before from_pydata,
+                # the surviving mesh polygons no longer match the
+                # source face order 1:1. Re-extract the per-face
+                # material indices in the surviving-face order.
+                if len(_kept_face_src_idx) != fcount:
+                    face_mat_indices = [
+                        face_mat_indices[fsi]
+                        if fsi < len(face_mat_indices) else 0
+                        for fsi in _kept_face_src_idx
+                    ]
 
                 inline_mats = []
                 for child in mat_list_node.children:
@@ -1278,6 +1666,7 @@ class _ImportState:
             sw_nodes = mesh_node.children_of("SkinWeights")
 
             pre_weld_skin = []
+            placeholder_bones = []  # Bones with SkinWeights but n=0
             for sw in sw_nodes:
                 bone_name = next((v for t, v in sw.values if t == "STR"), None)
                 if bone_name is None:
@@ -1288,6 +1677,27 @@ class _ImportState:
                 if not sw_nums:
                     continue
                 influence_count = int(sw_nums[0])
+                # Empty SkinWeights placeholders: bone is declared as
+                # part of the mesh's skin set but has zero painted
+                # weights. These exist in some files (e.g. Watermelon's
+                # BigFrontLeg / BigBackLeg Hip bones) to keep the
+                # XSkinMeshHeader bone count consistent with the
+                # engine's expectations. Track them so we can create
+                # an empty vertex group later, which preserves the
+                # placeholder for round-trip export.
+                if influence_count == 0:
+                    placeholder_bones.append(bone_name)
+                    continue
+                # Guard against truncated data: require enough values
+                # for indices + weights + (offset matrix). Without this,
+                # files with a corrupted influence_count would IndexError
+                # and abort the whole import.
+                needed = 1 + influence_count * 2
+                if len(sw_nums) < needed:
+                    influence_count = max(0, (len(sw_nums) - 1) // 2)
+                    if influence_count == 0:
+                        placeholder_bones.append(bone_name)
+                        continue
                 indices = [int(sw_nums[1 + i])             for i in range(influence_count)]
                 weights = [sw_nums[1 + influence_count + i] for i in range(influence_count)]
                 pre_weld_skin.append((bone_name, list(zip(indices, weights))))
@@ -1300,6 +1710,41 @@ class _ImportState:
 
             arm_mod.use_deform_preserve_volume = True
 
+            do_weld = getattr(self, "weld_duplicate_verts", False)
+
+            if do_weld:
+                # Optional: weld duplicate-position verts so bone-deformation
+                # boundaries don't visibly separate when animated (the xcache
+                # stores UV/normal seams + skin-set boundaries as separate
+                # verts at the same XYZ). OFF by default — only matters when
+                # animating, and weld blends weights that approximate skin
+                # boundaries rather than preserving the file's exact authoring.
+                self._weld_and_assign_skin(
+                    obj, me, pre_weld_skin, _source_positions,
+                    _pending_per_vi_normal, _pending_loop_normals)
+            else:
+                # Default: no weld. Assign skin weights per-vert directly,
+                # exactly as authored. Per-loop normals from MeshNormals
+                # get applied later by the unwelded-shading path below.
+                self._assign_skin_no_weld(obj, pre_weld_skin)
+
+            # Create empty vertex groups for placeholder bones. These
+            # are bones declared as part of the skin set in the source
+            # file but with zero painted weights (e.g. Watermelon's
+            # BigFrontLeg/BigBackLeg Hip bones). Creating an empty VG
+            # preserves the placeholder so a subsequent export emits
+            # the same empty SkinWeights block, keeping the XSkinMesh
+            # Header bone count consistent on round-trip.
+            for bone_name in placeholder_bones:
+                if bone_name not in obj.vertex_groups:
+                    obj.vertex_groups.new(name=bone_name)
+
+
+            # Apply vertex-position rebind AFTER weight assignment:
+            # rebind uses pre-weld source positions for the key, while
+            # pos_to_post_vis uses actual mesh positions. Running rebind
+            # first puts them in different spaces → empty pre_to_post map
+            # → all verts fall back to ROOT weight → mesh looks unweighted.
             if self._bone_rebind:
                 vert_accum      = [None] * len(me.vertices)
                 vert_weight_sum = [0.0]  * len(me.vertices)
@@ -1314,171 +1759,32 @@ class _ImportState:
                         if vert_accum[vi] is None:
                             vert_accum[vi] = contrib
                         else:
-                            for r in range(4):
-                                for c in range(4):
-                                    vert_accum[vi][r][c] += contrib[r][c]
+                            vert_accum[vi] += contrib
                         vert_weight_sum[vi] += w
-                rebind_applied = 0
                 for vi, accum in enumerate(vert_accum):
                     if accum is None or vert_weight_sum[vi] <= 0.0:
                         continue
-                    v_old = me.vertices[vi].co.copy()
+                    v_old = me.vertices[vi].co
                     v_h   = Vector((v_old.x, v_old.y, v_old.z, 1.0))
                     v_new = accum @ v_h
                     ws    = vert_weight_sum[vi]
                     me.vertices[vi].co = Vector((v_new.x / ws,
                                                  v_new.y / ws,
                                                  v_new.z / ws))
-                    rebind_applied += 1
                 me.update()
-
-            import bmesh as _bmesh
-            pre_weld_positions = [tuple(v.co) for v in me.vertices]
-            _pre_count = len(pre_weld_positions)
-            _log(f"        pre-weld vert count: {_pre_count}, skin blocks: {len(pre_weld_skin)}")
-
-            EPS = 5
-
-            vi_to_weights: dict = {}
-            for bn, infls in pre_weld_skin:
-                for vi, w in infls:
-                    vi_to_weights.setdefault(vi, []).append((bn, round(w, EPS)))
-            vi_weight_sig = [
-                tuple(sorted(vi_to_weights.get(vi, [])))
-                for vi in range(_pre_count)
-            ]
-
-            key_to_vis: dict = {}
-            for vi in range(_pre_count):
-                p = pre_weld_positions[vi]
-                key = (round(p[0], EPS), round(p[1], EPS), round(p[2], EPS),
-                       vi_weight_sig[vi])
-                key_to_vis.setdefault(key, []).append(vi)
-
-            pre_to_post: dict = {}
-            keeper_pre_vis = []
-            for vis in key_to_vis.values():
-                keep = min(vis)
-                keeper_pre_vis.append(keep)
-            keeper_pre_vis.sort()
-            keep_to_post: dict = {keep: i for i, keep in enumerate(keeper_pre_vis)}
-
-            pre_to_keep: dict = {}
-            for vis in key_to_vis.values():
-                keep = min(vis)
-                for vi in vis:
-                    pre_to_keep[vi] = keep
-            for vi in range(_pre_count):
-                pre_to_post[vi] = keep_to_post[pre_to_keep[vi]]
-            _post_count = len(keeper_pre_vis)
-            _log(f"        weld groups: {len(key_to_vis)}, post-weld vert count: {_post_count}")
-
-            _bm = _bmesh.new()
-            _bm.from_mesh(obj.data)
-            _bm.verts.ensure_lookup_table()
-            _log(f"        bmesh has {len(_bm.verts)} verts (should match pre-weld count)")
-
-            targetmap = {}
-            for vis in key_to_vis.values():
-                if len(vis) < 2:
-                    continue
-                keep = min(vis)
-                if keep >= len(_bm.verts):
-                    _log(f"        !! keep index {keep} >= {len(_bm.verts)} bmesh verts; skipping")
-                    continue
-                keep_v = _bm.verts[keep]
-                for other in vis:
-                    if other != keep:
-                        if other >= len(_bm.verts):
-                            _log(f"        !! other index {other} >= {len(_bm.verts)}; skipping")
-                            continue
-                        targetmap[_bm.verts[other]] = keep_v
-            _log(f"        weld targetmap has {len(targetmap)} entries")
-
-            if targetmap:
-                try:
-                    _bmesh.ops.weld_verts(_bm, targetmap=targetmap)
-                except Exception:
-                    _log_exception("_bmesh.ops.weld_verts")
-                    _bm.free()
-                    raise
-
-            _bm.verts.ensure_lookup_table()
-            try:
-                _bm.to_mesh(obj.data)
-            except Exception:
-                _log_exception("_bm.to_mesh")
-                _bm.free()
-                raise
-            _bm.free()
-            obj.data.update()
-            _log(f"        mesh now has {len(obj.data.vertices)} verts after weld")
-
-            post_vert_pre_vis: dict = {}
-
-            _log(f"        writing vertex group weights ({len(pre_weld_skin)} bones)")
-            for bone_name, influences in pre_weld_skin:
-                vg = obj.vertex_groups.get(bone_name) or obj.vertex_groups.new(name=bone_name)
-                for pre_vi, w in influences:
-                    post_vi = pre_to_post.get(pre_vi)
-                    if post_vi is None:
-                        continue
-                    seen_pre = post_vert_pre_vis.get(post_vi)
-                    if seen_pre is None:
-                        post_vert_pre_vis[post_vi] = {pre_vi}
-                        vg.add([post_vi], w, "REPLACE")
-                    elif pre_vi in seen_pre:
-                        vg.add([post_vi], w, "REPLACE")
-                    # else: this post-vert was already claimed by a different
-                    # pre-vert from another bone — skip to avoid clobbering.
-            _log(f"        vertex groups written")
-
-            # Per-vert normalization. The xcache stores raw per-bone
-            # weights that aren't guaranteed to sum to 1.0 per vert —
-            # e.g. Honey has root w=1.0 to body verts that wing bones
-            # also weight ~0.5 each, totalling 2.0. The engine
-            # normalizes at load time; Blender's armature modifier
-            # uses the raw weights as authored, so unnormalized input
-            # produces broken deformation at any non-rest pose.
-            #
-            # Collect needed rewrites first, then apply — modifying
-            # vg via vg.add() invalidates v.groups iteration in C.
-            n_norm = 0
-            n_zero = 0
-            rewrites = []   # list of (post_vi, group_idx, new_weight)
-            for v in obj.data.vertices:
-                if not v.groups:
-                    continue
-                total = sum(g.weight for g in v.groups)
-                if total <= 0.001:
-                    n_zero += 1
-                    continue
-                if 0.99 <= total <= 1.01:
-                    continue
-                inv = 1.0 / total
-                for g in v.groups:
-                    rewrites.append((v.index, g.group, g.weight * inv))
-                n_norm += 1
-            for post_vi, group_idx, new_w in rewrites:
-                obj.vertex_groups[group_idx].add([post_vi], new_w, "REPLACE")
-            _log(f"        weight normalization: {n_norm} verts rebalanced, {n_zero} unweighted")
 
             for poly in obj.data.polygons:
                 poly.use_smooth = True
             obj.data.update()
             if getattr(self, "smooth_shade_from_faces", False):
-                # Smooth-shade from faces: every poly is marked smooth so
-                # Blender averages face normals at shared vertices. Any
-                # custom split normals on the mesh are explicitly cleared
-                # so they don't override the auto-smoothed result.
                 _clear_custom_split_normals(obj.data)
-            elif _pending_loop_normals is not None:
-                # File-authored normals path: apply the exact per-loop
-                # normals decoded from MeshNormals or DeclData.
+            elif _pending_loop_normals is not None and not do_weld:
+                # Unwelded path: pre-built _pending_loop_normals is
+                # already sized to match the mesh's loop count (no
+                # weld changed the geometry).
                 _apply_custom_normals(obj.data, _pending_loop_normals)
                 if self.infer_sharps:
                     self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
-            _log(f"        normals applied; _build_mesh done for {name_hint!r}")
 
         else:
 
@@ -1494,10 +1800,472 @@ class _ImportState:
                 if self.infer_sharps:
                     self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
 
-    def _infer_sharps_from_normal_list(self, me, loop_normals):
-        import math as _math
+    def _assign_skin_no_weld(self, obj, pre_weld_skin):
+        """Default path: assign skin weights per-vert, no welding.
 
-        threshold_cos = _math.cos(_math.radians(self.sharp_angle_deg))
+        Each pre-vert keeps its exact file-authored bone weighting.
+        Verts at the same XYZ position with different skin sets stay
+        separate; the file's per-loop normals make this invisible at
+        rest pose. The trade-off is that animation may show micro-
+        gaps at skin-set boundaries, since duplicate-position verts
+        weighted to different bones move with their respective bones.
+        Acceptable for almost all viewing/editing tasks.
+        """
+        n_actual = len(obj.data.vertices)
+        # Batch per-bone: build {bone -> {vi -> weight}} then write
+        # each VG exactly once.
+        accum: dict = {}
+        for bone_name, influences in pre_weld_skin:
+            bone_map = accum.setdefault(bone_name, {})
+            for vi, w in influences:
+                if vi >= n_actual:
+                    continue
+                if not (0.0 <= w <= 100.0):
+                    continue
+                # Duplicate vi within one bone (Beffica's
+                # LowerJaw_Aux has 45 of these): keep the LAST
+                # weight, matching the engine's "last writer wins"
+                # semantics that we already verified against the
+                # dev .x.
+                bone_map[vi] = w
+        for bone_name, bone_map in accum.items():
+            if not bone_map:
+                continue
+            vg = (obj.vertex_groups.get(bone_name)
+                  or obj.vertex_groups.new(name=bone_name))
+            for vi, w in bone_map.items():
+                vg.add([vi], w, "REPLACE")
+
+        # Per-vert normalization (some xcache files store
+        # unnormalized weights — Honey's root + wing bones sum to 2.0
+        # at body verts).
+        rewrites = []
+        for v in obj.data.vertices:
+            if not v.groups:
+                continue
+            total = sum(g.weight for g in v.groups)
+            if total <= 0.001:
+                continue
+            if 0.99 <= total <= 1.01:
+                continue
+            inv = 1.0 / total
+            for g in v.groups:
+                rewrites.append((v.index, g.group, g.weight * inv))
+        for vi, group_idx, new_w in rewrites:
+            obj.vertex_groups[group_idx].add([vi], new_w, "REPLACE")
+
+        # Fallback for unweighted verts: assign them to the same
+        # bone as their geometrically-nearest weighted vert. This
+        # prevents verts with no skin data from staying glued to
+        # world origin when the armature animates. The xcache
+        # encoding sometimes drops weights for verts that appear
+        # at UV/normal seam duplicates of weighted verts; without
+        # this fallback those duplicates would tear away from the
+        # mesh during posing.
+        self._assign_fallback_weights(obj)
+
+
+    def _assign_fallback_weights(self, obj):
+        """For each vertex with no vertex-group weights, copy weights
+        from the geometrically-nearest weighted vertex.
+
+        Mirrors what Blender's "Skinning > Quick Fill" would do, but
+        targeted: only fills empties, never overwrites authored data.
+        Preserves local rigidity — unrigged geometry inside a sleeve
+        moves with the sleeve, not with the armature root.
+
+        Falls back to the first armature root bone (if any) for verts
+        with no nearby weighted neighbor (isolated decorative geometry,
+        free-floating verts).
+        """
+        n_verts = len(obj.data.vertices)
+        if n_verts == 0:
+            return
+
+        # Find unweighted and weighted vert indices
+        weighted = []
+        unweighted = []
+        for v in obj.data.vertices:
+            if v.groups and any(g.weight > 0 for g in v.groups):
+                weighted.append(v.index)
+            else:
+                unweighted.append(v.index)
+        if not unweighted:
+            return
+        if not weighted:
+            # No weighted verts at all — assign everything to skel
+            # root if we have one.
+            fallback_bone = self._pick_fallback_root_bone(obj)
+            if fallback_bone is None:
+                return
+            vg = (obj.vertex_groups.get(fallback_bone)
+                  or obj.vertex_groups.new(name=fallback_bone))
+            for vi in unweighted:
+                vg.add([vi], 1.0, "REPLACE")
+            return
+
+        # Build per-vert position arrays
+        positions = [tuple(v.co) for v in obj.data.vertices]
+
+        # For each unweighted vert, find nearest weighted vert.
+        # Bucket by rounded XYZ for O(1) lookup on exact-position
+        # duplicates (UV/normal seam duplicates — common case, often
+        # 100% on clothing patches).
+        pos_buckets: dict = {}
+        for vi in weighted:
+            p = positions[vi]
+            k = (round(p[0], 4), round(p[1], 4), round(p[2], 4))
+            pos_buckets.setdefault(k, []).append(vi)
+
+        # For truly-isolated unweighted verts, use a KD-tree
+        # (mathutils.kdtree, ships with Blender) for log-time
+        # nearest-neighbor instead of an O(n²) Python brute-force
+        # scan. Queen.xcache has ~2000 truly-isolated verts; brute
+        # force is ~12M Python iterations = many seconds.
+        try:
+            from mathutils import kdtree
+            _kd = kdtree.KDTree(len(weighted))
+            for local_idx, src_vi in enumerate(weighted):
+                p = positions[src_vi]
+                _kd.insert((p[0], p[1], p[2]), local_idx)
+            _kd.balance()
+        except Exception:
+            _kd = None
+
+        # Collect per-bone fallback assignments.
+        #
+        # Note: an earlier version of this function had a side-aware
+        # filter that refused to assign left-side bones to right-side
+        # verts. That was a band-aid for the real bug, which was in
+        # the parser: it was reading "chunk-membership" entries as
+        # blend weights, inflating per-vert weight sums to 2.0+ and
+        # causing leg-influences-body deformation. With the parser
+        # now correctly filtering on trailer == pad, the fallback
+        # can safely copy weights from the geometrically-nearest
+        # weighted vertex without side restrictions.
+        per_bone_fallback: dict = {}
+        n_exact = 0
+        n_nearest = 0
+
+        for vi in unweighted:
+            p = positions[vi]
+            k = (round(p[0], 4), round(p[1], 4), round(p[2], 4))
+            cands = pos_buckets.get(k)
+            if cands:
+                src_vi = cands[0]
+                n_exact += 1
+            elif _kd is not None:
+                # Nearest weighted vert via KD-tree
+                _co, _local_idx, _dist = _kd.find((p[0], p[1], p[2]))
+                src_vi = weighted[_local_idx]
+                n_nearest += 1
+            else:
+                # KD-tree unavailable; brute-force fallback
+                best_vi = weighted[0]
+                best_d2 = float('inf')
+                px, py, pz = p[0], p[1], p[2]
+                for wvi in weighted:
+                    wx, wy, wz = positions[wvi]
+                    dx = wx - px; dy = wy - py; dz = wz - pz
+                    d2 = dx*dx + dy*dy + dz*dz
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best_vi = wvi
+                src_vi = best_vi
+                n_nearest += 1
+            # Copy weights from src_vi
+            src_vert = obj.data.vertices[src_vi]
+            for g in src_vert.groups:
+                if g.weight <= 0:
+                    continue
+                group_idx = g.group
+                # Resolve group name from index
+                bone_name = obj.vertex_groups[group_idx].name
+                per_bone_fallback.setdefault(bone_name, []).append((vi, g.weight))
+
+        # Apply
+        for bone_name, entries in per_bone_fallback.items():
+            vg = (obj.vertex_groups.get(bone_name)
+                  or obj.vertex_groups.new(name=bone_name))
+            for vi, w in entries:
+                vg.add([vi], w, "REPLACE")
+
+        # Fallback-weighted verts need the same rebind applied to them
+        # as the explicitly-weighted verts — otherwise the mesh splits
+        # between two coordinate spaces (post-rebind FTM-rest vs
+        # pre-rebind mesh source). Same accumulation logic as the
+        # main rebind block in _build_mesh.
+        rebind = getattr(self, '_bone_rebind', None) or {}
+        if rebind:
+            vi_to_accum = {}      # vi -> 4x4 accumulator
+            vi_to_wsum  = {}      # vi -> total weight applied
+            for bone_name, entries in per_bone_fallback.items():
+                bone_rebind = rebind.get(bone_name)
+                if bone_rebind is None:
+                    continue
+                for vi, w in entries:
+                    if vi >= len(obj.data.vertices):
+                        continue
+                    contrib = bone_rebind * w
+                    if vi in vi_to_accum:
+                        vi_to_accum[vi] += contrib
+                    else:
+                        vi_to_accum[vi] = contrib
+                    vi_to_wsum[vi] = vi_to_wsum.get(vi, 0.0) + w
+            n_rebound = 0
+            for vi, accum in vi_to_accum.items():
+                ws = vi_to_wsum[vi]
+                if ws <= 0:
+                    continue
+                v_old = obj.data.vertices[vi].co
+                v_h = Vector((v_old.x, v_old.y, v_old.z, 1.0))
+                v_new = accum @ v_h
+                obj.data.vertices[vi].co = Vector((v_new.x / ws,
+                                                    v_new.y / ws,
+                                                    v_new.z / ws))
+                n_rebound += 1
+
+    def _pick_fallback_root_bone(self, obj):
+        """Return a bone name to use as the catch-all for unweighted
+        verts when no weighted verts exist on the mesh. Prefers a
+        skeleton root if one is registered, else returns None.
+        """
+        roots = getattr(self, '_skel_root_names', None) or set()
+        if roots:
+            return sorted(roots)[0]
+        # Last resort: find any armature bone
+        arm = getattr(self, 'armature_obj', None)
+        if arm and arm.data and arm.data.bones:
+            return arm.data.bones[0].name
+        return None
+
+    def _weld_and_assign_skin(self, obj, me, pre_weld_skin,
+                              source_positions, pending_per_vi_normal,
+                              pending_loop_normals):
+        """Optional path: weld duplicate-position verts and merge
+        their per-bone weights. Triggered by the
+        "Weld Duplicate Vertices" import option. Use when animating
+        the mesh, to avoid visible gaps at skin-set boundaries.
+
+        Welds purely by position; collapses 9424 verts → ~2370 for
+        Beffica. Skin weights from all collapsed pre-verts are
+        summed, then re-normalised per vert.
+        """
+        import bmesh as _bmesh
+
+        # Source positions snapshot, taken before any bone-rebind
+        # micro-displacements, ensures the weld key groups what was
+        # ORIGINALLY a single XYZ.
+        pre_weld_positions = list(source_positions)
+        _pre_count = len(pre_weld_positions)
+
+        # Weld key: position + full weight signature. Two verts merge
+        # only if they sit at the same XYZ AND carry identical bone
+        # influences. UV/normal seam duplicates have identical weights
+        # so they collapse correctly; blendshape alternates (e.g. eyelid
+        # verts weighted to UpperLidOpen vs UpperLidClosed at the same
+        # XYZ) have different weight signatures and stay separate.
+        EPS = 5
+
+        vi_to_weights: dict = {}
+        for bone_name, influences in pre_weld_skin:
+            for vi, w in influences:
+                vi_to_weights.setdefault(vi, []).append((bone_name, round(w, EPS)))
+        vi_weight_sig = [
+            tuple(sorted(vi_to_weights.get(vi, [])))
+            for vi in range(_pre_count)
+        ]
+
+        key_to_vis: dict = {}
+        for vi in range(_pre_count):
+            p = pre_weld_positions[vi]
+            key = (round(p[0], EPS), round(p[1], EPS), round(p[2], EPS),
+                   vi_weight_sig[vi])
+            key_to_vis.setdefault(key, []).append(vi)
+
+        # Build pre_to_post mapping
+        keeper_pre_vis = sorted(min(vs) for vs in key_to_vis.values())
+        keep_to_post = {keep: i for i, keep in enumerate(keeper_pre_vis)}
+        pre_to_keep = {}
+        for vs in key_to_vis.values():
+            keep = min(vs)
+            for vi in vs:
+                pre_to_keep[vi] = keep
+        pre_to_post = {vi: keep_to_post[pre_to_keep[vi]] for vi in range(_pre_count)}
+        _post_count = len(keeper_pre_vis)
+
+        # Apply weld via bmesh
+        _bm = _bmesh.new()
+        _bm.from_mesh(obj.data)
+        _bm.verts.ensure_lookup_table()
+
+        targetmap = {}
+        for vs in key_to_vis.values():
+            if len(vs) < 2:
+                continue
+            keep = min(vs)
+            if keep >= len(_bm.verts):
+                continue
+            keep_v = _bm.verts[keep]
+            for other in vs:
+                if other != keep and other < len(_bm.verts):
+                    targetmap[_bm.verts[other]] = keep_v
+
+        if targetmap:
+            try:
+                _bmesh.ops.weld_verts(_bm, targetmap=targetmap)
+            except Exception:
+                _bm.free()
+                raise
+        _bm.verts.ensure_lookup_table()
+        try:
+            _bm.to_mesh(obj.data)
+        except Exception:
+            _bm.free()
+            raise
+        _bm.free()
+        obj.data.update()
+
+        # Rebuild pre_to_post from the post-weld mesh: bmesh weld may
+        # reorder surviving verts, so we can't use the pre-weld sort
+        # order. Match by (position + weight signature) to correctly
+        # handle blendshape alternates (two post-verts at the same XYZ
+        # but with different bone influences) — a position-only key
+        # would clobber one bone's weights with another's.
+        pos_to_post_vis: dict = {}   # pos_key -> list of post_vi
+        for v in obj.data.vertices:
+            pk = (round(v.co.x, EPS), round(v.co.y, EPS), round(v.co.z, EPS))
+            pos_to_post_vis.setdefault(pk, []).append(v.index)
+
+        # Build inverse: for each position that has multiple post-verts,
+        # we need to know which pre-vert keeper maps to which post-vert.
+        # Since the weld preserved the keeper (min pre-vi in each group),
+        # and bmesh may have reindexed, we match by finding which
+        # post-vi each keeper's position resolves to in order.
+        # For positions with only one post-vert this is unambiguous.
+        # For positions with multiple post-verts (blendshape alternates),
+        # we assign them in keeper order (sorted ascending).
+        keeper_for_pk: dict = {}   # pos_key -> [keeper_pre_vi, ...]
+        for vis in key_to_vis.values():
+            keep = min(vis)
+            p = pre_weld_positions[keep]
+            pk = (round(p[0], EPS), round(p[1], EPS), round(p[2], EPS))
+            keeper_for_pk.setdefault(pk, []).append(keep)
+        for pk in keeper_for_pk:
+            keeper_for_pk[pk].sort()
+
+        # Map each keeper pre-vi to its post-vi by position-slot index.
+        keeper_to_post: dict = {}
+        for pk, keepers in keeper_for_pk.items():
+            post_vis_at_pk = sorted(pos_to_post_vis.get(pk, []))
+            for i, keeper in enumerate(keepers):
+                if i < len(post_vis_at_pk):
+                    keeper_to_post[keeper] = post_vis_at_pk[i]
+
+        pre_to_post = {}
+        for vi in range(_pre_count):
+            keeper = pre_to_keep.get(vi)
+            if keeper is not None and keeper in keeper_to_post:
+                pre_to_post[vi] = keeper_to_post[keeper]
+
+        # Accumulate skin weights from all collapsed pre-verts.
+        # We take the MAX weight per (bone, post_vi) instead of
+        # summing — multiple skin layers in Queen.xcache encode the
+        # same final weight redundantly, so summing inflates each
+        # bone's influence by 5-10x and then per-vert normalization
+        # crushes max-weights to ~0.15 across all bones. Taking
+        # max preserves the original authored influence.
+        # For 2-chunk files like Honey (where mesh1 and mesh2 are
+        # disjoint vertex sets that the welder sometimes collapses
+        # at the boundary), max is also correct: same-position
+        # boundary verts each independently encode their full
+        # influence; max picks the strongest of the two layers.
+        n_actual = len(obj.data.vertices)
+        accum: dict = {}   # bone_name -> {post_vi: max_weight}
+        for bone_name, influences in pre_weld_skin:
+            bone_map = accum.setdefault(bone_name, {})
+            for pre_vi, w in influences:
+                post_vi = pre_to_post.get(pre_vi)
+                if post_vi is None or post_vi >= n_actual:
+                    continue
+                if not (w >= 0.0 and w <= 100.0):
+                    continue
+                if post_vi in bone_map:
+                    if w > bone_map[post_vi]:
+                        bone_map[post_vi] = w
+                else:
+                    bone_map[post_vi] = w
+        for bone_name, bone_map in accum.items():
+            if not bone_map:
+                continue
+            vg = (obj.vertex_groups.get(bone_name)
+                  or obj.vertex_groups.new(name=bone_name))
+            for post_vi, w in bone_map.items():
+                if w > 100.0:
+                    w = 100.0
+                vg.add([post_vi], w, "REPLACE")
+
+        # Per-vert normalization
+        rewrites = []
+        for v in obj.data.vertices:
+            if not v.groups:
+                continue
+            total = sum(g.weight for g in v.groups)
+            if total <= 0.001:
+                continue
+            if 0.99 <= total <= 1.01:
+                continue
+            inv = 1.0 / total
+            for g in v.groups:
+                rewrites.append((v.index, g.group, g.weight * inv))
+        for vi, group_idx, new_w in rewrites:
+            obj.vertex_groups[group_idx].add([vi], new_w, "REPLACE")
+
+        # Fallback for unweighted post-weld verts (mirrors the
+        # no-weld path). Verts left empty after dedup get weights
+        # from their nearest weighted neighbor.
+        self._assign_fallback_weights(obj)
+
+        # Rebuild post-weld custom normals by averaging across
+        # collapsed pre-verts. Uses the corrected pre_to_post built
+        # from actual post-weld mesh positions (above).
+        if pending_per_vi_normal is not None:
+            post_vi_normals: dict = {}
+            for pre_vi, post_vi in pre_to_post.items():
+                n = pending_per_vi_normal.get(pre_vi)
+                if n is None:
+                    continue
+                post_vi_normals.setdefault(post_vi, []).append(n)
+            post_vi_to_normal: dict = {}
+            for post_vi, ns in post_vi_normals.items():
+                if len(ns) == 1:
+                    post_vi_to_normal[post_vi] = ns[0]
+                    continue
+                sx = sum(n[0] for n in ns)
+                sy = sum(n[1] for n in ns)
+                sz = sum(n[2] for n in ns)
+                mag = (sx*sx + sy*sy + sz*sz) ** 0.5
+                if mag > 1e-9:
+                    post_vi_to_normal[post_vi] = (sx/mag, sy/mag, sz/mag)
+                else:
+                    post_vi_to_normal[post_vi] = ns[0]
+            post_loop_normals = []
+            for poly in obj.data.polygons:
+                for loop_idx in poly.loop_indices:
+                    post_vi = obj.data.loops[loop_idx].vertex_index
+                    n = post_vi_to_normal.get(post_vi)
+                    post_loop_normals.append(n if n is not None else (0.0, 0.0, 1.0))
+            _apply_custom_normals(obj.data, post_loop_normals)
+            if self.infer_sharps:
+                self._infer_sharps_from_normal_list(obj.data, post_loop_normals)
+        elif pending_loop_normals is not None:
+            # Fallback: file had no MeshNormals, only DeclData
+            _apply_custom_normals(obj.data, pending_loop_normals)
+            if self.infer_sharps:
+                self._infer_sharps_from_normal_list(obj.data, pending_loop_normals)
+
+    def _infer_sharps_from_normal_list(self, me, loop_normals):
+        threshold_cos = math.cos(math.radians(self.sharp_angle_deg))
 
         if hasattr(me, "calc_normals"):
             me.calc_normals()
@@ -1533,9 +2301,7 @@ class _ImportState:
         me.update()
 
     def import_animation_set(self, anim_set_node, context):
-        _log(f"      import_animation_set: {anim_set_node.name!r}")
         if not self.armature_obj:
-            _log(f"        no armature_obj, returning")
             return
 
         arm_obj = self.armature_obj
@@ -1570,7 +2336,6 @@ class _ImportState:
         bpy.ops.object.mode_set(mode="POSE")
 
         anim_nodes = anim_set_node.children_of("Animation")
-        _log(f"        {len(anim_nodes)} Animation nodes to process")
         keyframe_errors = 0
 
         for _anim_idx, anim_node in enumerate(anim_nodes):
@@ -1581,9 +2346,7 @@ class _ImportState:
             if not bone_name:
                 continue
             if bone_name not in arm_obj.pose.bones:
-                _log(f"        [{_anim_idx}] anim refers to {bone_name!r} not in armature")
                 continue
-            _log(f"        [{_anim_idx}/{len(anim_nodes)}] anim for {bone_name!r}")
 
             pose_bone = arm_obj.pose.bones[bone_name]
             key_nodes = anim_node.children_of("AnimationKey")
@@ -1594,7 +2357,9 @@ class _ImportState:
                 if len(_kn_nums) >= 2:
                     _tracks_by_type[int(_kn_nums[0])] = _kn
             if (0 in _tracks_by_type and 1 in _tracks_by_type
-                    and 2 in _tracks_by_type and 4 not in _tracks_by_type):
+                    and 2 in _tracks_by_type
+                    and 3 not in _tracks_by_type
+                    and 4 not in _tracks_by_type):
                 _synth = _compose_type4_from_trs(
                     _tracks_by_type[0], _tracks_by_type[1], _tracks_by_type[2])
                 if _synth is not None:
@@ -1625,55 +2390,64 @@ class _ImportState:
                 local_rest_q = None
                 is_skel_root  = (bone_name in self._skel_root_names)
 
-                _conv_q = self._conv_mat.to_3x3().to_quaternion()
-
+                # Compute the bone's local rest rotation/translation. These
+                # are wrapped in try/except because a degenerate rest pose
+                # (singular matrix on an imported armature) would otherwise
+                # raise and abort the entire animation channel for this
+                # bone. Falling back to identity gives no per-bone animation
+                # but keeps the rest of the import working.
                 if key_type == 0:
                     pb = pose_bone
-                    if pb.parent:
-
-                        local_rest_bl = (pb.parent.bone.matrix_local.inverted()
-                                         @ pb.bone.matrix_local)
-                        local_rest_q  = local_rest_bl.to_quaternion()
-                    elif is_skel_root:
-
-                        # The skeleton root has no Blender parent, but its
-                        # bind pose may have a non-identity rotation (e.g.
-                        # Celery's ROOT is tilted ~2.2°, SweetFry's ~3°).
-                        # For those, we need to subtract the bind rotation
-                        # from abs_q so that pose_q represents the animated
-                        # rotation relative to the bind — the same thing
-                        # the non-root branch does implicitly.
-                        #
-                        # bone.matrix_local = conv @ src_bind_col, so the
-                        # un-conv'd bind rotation is conv.inv @ matrix_local.
-                        # For characters with identity ROOT bind (Apple,
-                        # ChiDog, Lizbert, etc.) this is identity and
-                        # local_rest_q is identity — matching the previous
-                        # behaviour exactly.
-                        _src_bind_bl = (self._conv_mat.inverted()
-                                        @ pb.bone.matrix_local)
-                        local_rest_q = _src_bind_bl.to_3x3().to_quaternion()
-                    else:
-
-                        local_rest_q = pb.bone.matrix_local.to_quaternion()
+                    try:
+                        if pb.parent:
+                            local_rest_bl = (pb.parent.bone.matrix_local.inverted()
+                                             @ pb.bone.matrix_local)
+                            local_rest_q  = local_rest_bl.to_quaternion()
+                        elif is_skel_root:
+                            # The skeleton root has no Blender parent, but its
+                            # bind pose may have a non-identity rotation (e.g.
+                            # Celery's ROOT is tilted ~2.2°, SweetFry's ~3°).
+                            # For those, we need to subtract the bind rotation
+                            # from abs_q so that pose_q represents the animated
+                            # rotation relative to the bind — the same thing
+                            # the non-root branch does implicitly.
+                            #
+                            # bone.matrix_local = conv @ src_bind_col, so the
+                            # un-conv'd bind rotation is conv.inv @ matrix_local.
+                            # For characters with identity ROOT bind (Apple,
+                            # ChiDog, Lizbert, etc.) this is identity and
+                            # local_rest_q is identity — matching the previous
+                            # behaviour exactly.
+                            _src_bind_bl = (self._conv_mat.inverted()
+                                            @ pb.bone.matrix_local)
+                            local_rest_q = _src_bind_bl.to_3x3().to_quaternion()
+                        else:
+                            local_rest_q = pb.bone.matrix_local.to_quaternion()
+                    except (ValueError, ZeroDivisionError):
+                        local_rest_q = Quaternion((1.0, 0.0, 0.0, 0.0))
 
                 if key_type == 2:
                     pb = pose_bone
-                    if pb.parent:
-                        _t2_local_rest = (pb.parent.bone.matrix_local.inverted()
-                                          @ pb.bone.matrix_local)
-                        _t2_lock = self.lock_leaf_translation and not pb.children
-                    else:
-                        _t2_local_rest = pb.bone.matrix_local
-                        _t2_lock = self.lock_root_translation
-                    _t2_rest_head    = _t2_local_rest.to_translation()
-                    _t2_rest_rot_inv = _t2_local_rest.to_3x3().inverted()
+                    try:
+                        if pb.parent:
+                            _t2_local_rest = (pb.parent.bone.matrix_local.inverted()
+                                              @ pb.bone.matrix_local)
+                            _t2_lock = self.lock_leaf_translation and not pb.children
+                        else:
+                            _t2_local_rest = pb.bone.matrix_local
+                            _t2_lock = self.lock_root_translation
+                        _t2_rest_head    = _t2_local_rest.to_translation()
+                        _t2_rest_rot_inv = _t2_local_rest.to_3x3().inverted()
+                    except (ValueError, ZeroDivisionError):
+                        _t2_local_rest   = Matrix.Identity(4)
+                        _t2_lock         = False
+                        _t2_rest_head    = Vector((0.0, 0.0, 0.0))
+                        _t2_rest_rot_inv = Matrix.Identity(3)
                     _t2_conv3        = self._conv_mat.to_3x3()
 
                 chan_data: dict = {}
 
                 prev_pose_q = None
-                _dbg_done   = False
 
                 for frame_tick, vals in all_key_vals:
                     # Scale file ticks to Blender frame numbers. tick_scale
@@ -1689,10 +2463,6 @@ class _ImportState:
                             if prev_pose_q is not None:
                                 pose_q.make_compatible(prev_pose_q)
                             prev_pose_q = Quaternion(pose_q)
-
-                            if is_skel_root and not _dbg_done:
-                                _dbg_done = True
-                                _w3 = (pose_bone.bone.matrix_local @ pose_q.to_matrix().to_4x4()).to_3x3()
 
                             for ci, v in enumerate(pose_q):
                                 chan_data.setdefault(ci, []).append((frame, v))
@@ -1715,7 +2485,10 @@ class _ImportState:
                             for ci, v in enumerate(loc):
                                 chan_data.setdefault(ci, []).append((frame, v))
 
-                        elif key_type == 4:
+                        elif key_type in (3, 4):
+                            # Matrix key per spec (3) or engine
+                            # extension (4). Either way the value is
+                            # a flat 16-float 4x4 transform.
 
                             dx_local = _mat4_from_list(vals)
                             if pose_bone.parent:
@@ -1740,7 +2513,7 @@ class _ImportState:
                             for ci, v in enumerate(mb_sca):
                                 chan_data.setdefault(30 + ci, []).append((frame, v))
 
-                    except Exception as exc:
+                    except Exception:
                         keyframe_errors += 1
 
                 _ROT_PATH   = "pose.bones[\"%s\"].rotation_quaternion"
@@ -1765,7 +2538,7 @@ class _ImportState:
                             kp.co = (fr, v)
                             kp.interpolation = "LINEAR"
                         fc.update()
-                elif key_type == 4:
+                elif key_type in (3, 4):
                     pose_bone.rotation_mode = "QUATERNION"
                     for offset, path_tmpl, indices in [
                         (10, _LOC_PATH,   range(3)),

@@ -31,7 +31,7 @@ import struct
 import zlib
 import bmesh
 from typing import List, Optional, Tuple
-from mathutils import Matrix, Vector, Quaternion
+from mathutils import Matrix, Vector
 from .parser import XNode, _is_mesh_bone_name
 
 _BT_NAME      = 0x0001
@@ -397,6 +397,7 @@ def export_x(context, filepath,
              export_armature=True,
              export_weights=True,
              export_animation=True,
+             unweld_on_export=True,
              anim_fps=30.0,
              anim_frame_start=1,
              anim_frame_end=250,
@@ -590,24 +591,90 @@ def export_x(context, filepath,
         w(_passthrough_aux_frames)
         w("\n\n")
 
-    armature_set = set(armature_objs)
     all_warnings = []
+
+    # Group mesh objects by _x_split_source_mesh — objects that were
+    # split from a single multi-material .x Mesh on import need to be
+    # re-merged into ONE Mesh node with a multi-material MeshMaterialList
+    # so the round-trip preserves the original .x structure. Groups are
+    # only formed for ≥2 objects sharing the same _x_split_source_mesh
+    # value; everything else (single objects, ungrouped meshes) writes
+    # exactly as before.
+    split_groups: dict = {}        # source_name → list of objects
+    standalone_objs: list = []
     for obj in mesh_objs:
-        all_warnings.extend(_write_mesh_frame(obj, out, 0,
-                          depsgraph, use_mesh_modifiers,
-                          export_normals, export_uvs,
-                          export_materials, export_weights,
-                          arm_obj, bl_to_dx_3, inv_scale,
-                          triangulate, written_mats))
+        src = obj.get('_x_split_source_mesh')
+        if src:
+            split_groups.setdefault(str(src), []).append(obj)
+        else:
+            standalone_objs.append(obj)
+
+    # Build the final emission list: standalone objects in their
+    # original order, plus one merged temp object per split group.
+    # Temporary objects are tracked so we can clean them up after.
+    temp_objects_to_cleanup: list = []
+    write_order: list = []
+
+    seen_split_sources: set = set()
+    for obj in mesh_objs:
+        src = obj.get('_x_split_source_mesh')
+        if src:
+            if src in seen_split_sources:
+                continue
+            seen_split_sources.add(src)
+            group = split_groups[src]
+            if len(group) == 1:
+                # Group of one — no merge needed, write as-is.
+                write_order.append(group[0])
+            else:
+                # Merge the group into a temp object. Sort group by
+                # _x_split_group_idx so material slots come out in
+                # the original order.
+                group_sorted = sorted(
+                    group,
+                    key=lambda o: int(o.get('_x_split_group_idx', 0))
+                )
+                try:
+                    temp = _merge_split_group_for_export(group_sorted, src)
+                    write_order.append(temp)
+                    temp_objects_to_cleanup.append(temp)
+                except Exception as e:
+                    # Merge failed — fall back to writing each piece
+                    # as its own Mesh (the v1.7.27 behaviour). Better
+                    # than aborting the export.
+                    all_warnings.append(
+                        f"Failed to re-merge multi-material .x group "
+                        f"'{src}': {e}. Writing as {len(group)} separate "
+                        f"Mesh nodes instead."
+                    )
+                    write_order.extend(group_sorted)
+        else:
+            write_order.append(obj)
+
+    try:
+        for obj in write_order:
+            all_warnings.extend(_write_mesh_frame(obj, out, 0,
+                              depsgraph, use_mesh_modifiers,
+                              export_normals, export_uvs,
+                              export_materials, export_weights,
+                              arm_obj, bl_to_dx_3, inv_scale,
+                              triangulate, written_mats,
+                              unweld_on_export=unweld_on_export))
+    finally:
+        # Clean up temporary merged objects regardless of success/failure
+        for temp in temp_objects_to_cleanup:
+            try:
+                tmp_data = temp.data
+                bpy.data.objects.remove(temp, do_unlink=True)
+                if tmp_data and tmp_data.users == 0:
+                    bpy.data.meshes.remove(tmp_data)
+            except Exception:
+                pass
 
     if export_animation and arm_obj:
         orig_frame = scene.frame_current
 
         baked = {b.name: {"rot": {}, "scale": {}, "pos": {}} for b in arm_obj.pose.bones}
-
-        conv_3 = Matrix.Identity(3)
-        conv_inv_3 = bl_to_dx_3
-        conv_3 = conv_inv_3.transposed()
 
         # Collect per-bone keyframe times directly from the F-curves so
         # that a sparse imported animation stays sparse on export — the
@@ -708,21 +775,12 @@ def export_x(context, filepath,
                     dx_s   = dx_local.to_scale()
                     q      = dx_rot.to_quaternion()
                 else:
-                    # ROOT bone: write the bone's ABSOLUTE rotation in
-                    # un-conv'd file space, not just the pose offset.
-                    #
-                    # The importer reconstructs the skel-root's pose from
-                    # the file via:
-                    #     local_rest_q = (conv.inv @ matrix_local).to_quaternion()
-                    #     pose_q       = local_rest_q.inv @ abs_q
-                    # so for a roundtrip identity-pose, abs_q must equal
-                    # local_rest_q. More generally the exporter must write
-                    # abs_q = local_rest_q @ matrix_basis_q, which is just
-                    # the rotation of (conv.inv @ pb.matrix) — pb.matrix
-                    # already includes the pose offset for the root since
-                    # it has no parent contribution.
-                    #
-                    # Position and scale still come from the world matrix.
+                    # ROOT: write absolute rotation in un-conv'd file space,
+                    # not just the pose offset. The importer reconstructs
+                    # via local_rest_q = (conv.inv @ matrix_local).to_quat()
+                    # and pose_q = local_rest_q.inv @ abs_q, so we must
+                    # write abs_q = rotation of (conv.inv @ pb.matrix).
+                    # Translation/scale come from the world matrix.
                     dx_world = _bl_bone_to_dx_world(world_bl, bl_to_dx_3, inv_scale)
                     dx_t = dx_world.to_translation()
                     dx_s = dx_world.to_scale()
@@ -840,7 +898,9 @@ def export_x(context, filepath,
 
 
 def _mszip_wrap_x(payload: bytes, base_format: str = "bin") -> bytes:
-    """Wrap a raw .x payload (text or binary token stream, WITHOUT the"""
+    """Wrap a raw .x payload in the MSZIP-compressed container format
+    (xof 0303bzip / xof 0303tzip), splitting the payload into 32KB
+    chunks each prefixed by uncompressed/compressed size headers."""
     out = bytearray()
     if base_format == "bin":
         out += b"xof 0303bzip0032"
@@ -888,12 +948,197 @@ def _bl_bone_to_dx_world(bl_mat, bl_to_dx_3, inv_scale):
     dx_mat[2][3] *= inv_scale
     return dx_mat
 
+def _merge_split_group_for_export(group_objs, source_mesh_name):
+    """Merge a group of Blender mesh objects (split from one source
+    Mesh on import) into a single temporary object suitable for .x
+    export as one Mesh node with a multi-material MeshMaterialList.
+
+    The objects in `group_objs` are expected to be sorted by
+    _x_split_group_idx so the resulting material slot order matches
+    the original .x file's material declaration order.
+
+    Returns a NEW Blender object linked to the active collection. The
+    caller is responsible for unlinking + deleting it after use.
+    """
+    if not group_objs:
+        raise ValueError("Empty group")
+
+    # bmesh-based merge: concatenate verts/faces from all source meshes
+    # into one bmesh, tracking which source-mesh-index each face came
+    # from (for per-face material assignment) and which material to put
+    # in each slot.
+    merged_bm = bmesh.new()
+
+    # Result data layers
+    uv_layer = None
+    deform_layer = None    # vertex weights
+
+    # We'll build the material list in source-object order.
+    merged_materials: list = []
+
+    # Vertex-group name registry — the merged bmesh's deform layer
+    # uses integer indices; we map bone names → indices here, in the
+    # order they're first encountered. The output object's
+    # vertex_groups must be created in the SAME order.
+    vg_registry: list = []
+    def _vg_idx_for(bone_name: str) -> int:
+        try:
+            return vg_registry.index(bone_name)
+        except ValueError:
+            idx = len(vg_registry)
+            vg_registry.append(bone_name)
+            return idx
+
+    # Per-source-vert→merged-vert index map (re-keyed per source)
+    for src_idx, src_obj in enumerate(group_objs):
+        me_src = src_obj.data
+        if not me_src:
+            continue
+
+        # Pull this source object's material into the merged list
+        src_mats = _effective_materials(src_obj)
+        # The split-import produces one material per object, but be
+        # defensive: take the first non-None material.
+        chosen_mat = next((m for m in src_mats if m is not None), None)
+        merged_mat_idx = len(merged_materials)
+        merged_materials.append(chosen_mat)
+
+        # Build a temporary bmesh of THIS source mesh so we can iterate
+        # its verts/faces/UVs/groups cleanly with bmesh semantics.
+        src_bm = bmesh.new()
+        src_bm.from_mesh(me_src)
+        src_bm.faces.ensure_lookup_table()
+        src_bm.verts.ensure_lookup_table()
+
+        # Initialize the merged UV layer the first time we see one
+        if src_bm.loops.layers.uv:
+            src_uv = src_bm.loops.layers.uv.active or src_bm.loops.layers.uv[0]
+            if uv_layer is None:
+                uv_layer = merged_bm.loops.layers.uv.new(src_uv.name)
+        else:
+            src_uv = None
+
+        # Initialize the merged deform (vertex-group weights) layer
+        if src_bm.verts.layers.deform:
+            src_deform = src_bm.verts.layers.deform.active or src_bm.verts.layers.deform[0]
+            if deform_layer is None:
+                deform_layer = merged_bm.verts.layers.deform.new()
+        else:
+            src_deform = None
+
+        # Vertex group index → vertex group NAME mapping. The merged
+        # object inherits a fresh vertex_groups list (built in
+        # vg_registry order); we translate each source weight's
+        # integer vg-index through the source object's name list to
+        # find the matching merged index.
+        src_vg_index_to_name = {vg.index: vg.name for vg in src_obj.vertex_groups}
+
+        # Copy verts. Track the remap from src bmesh vert index → merged
+        # bmesh BMVert.
+        vert_remap: dict = {}
+        for src_v in src_bm.verts:
+            new_v = merged_bm.verts.new(src_v.co)
+            new_v.normal = src_v.normal
+            vert_remap[src_v.index] = new_v
+            # Copy vertex group weights.
+            if src_deform is not None and deform_layer is not None:
+                src_weights = src_v[src_deform]
+                for src_vg_idx, weight in src_weights.items():
+                    bone_name = src_vg_index_to_name.get(src_vg_idx)
+                    if bone_name is None:
+                        continue
+                    merged_vg_idx = _vg_idx_for(bone_name)
+                    new_v[deform_layer][merged_vg_idx] = weight
+        merged_bm.verts.ensure_lookup_table()
+        merged_bm.verts.index_update()
+
+        # Copy faces. Apply per-face material slot index pointing to
+        # this source object's material in the merged slot list.
+        for src_f in src_bm.faces:
+            try:
+                new_f = merged_bm.faces.new(
+                    tuple(vert_remap[v.index] for v in src_f.verts)
+                )
+            except ValueError:
+                # Duplicate face — bmesh refuses. Skip.
+                continue
+            new_f.smooth = src_f.smooth
+            new_f.material_index = merged_mat_idx
+            # Copy UVs (per-loop)
+            if src_uv is not None and uv_layer is not None:
+                for src_loop, new_loop in zip(src_f.loops, new_f.loops):
+                    new_loop[uv_layer].uv = src_loop[src_uv].uv
+
+        src_bm.free()
+
+    merged_bm.verts.ensure_lookup_table()
+    merged_bm.verts.index_update()
+    merged_bm.faces.ensure_lookup_table()
+    merged_bm.faces.index_update()
+
+    # Build the merged mesh/object.
+    merged_me = bpy.data.meshes.new(f"_xexp_merge_{source_mesh_name}")
+    merged_bm.to_mesh(merged_me)
+    merged_bm.free()
+    merged_me.update()
+
+    merged_obj = bpy.data.objects.new(f"_xexp_merge_{source_mesh_name}",
+                                       merged_me)
+
+    # Add materials to the merged object's data block in slot order
+    for m in merged_materials:
+        merged_me.materials.append(m)
+
+    # Add vertex groups by name, in the SAME order as vg_registry so
+    # the deform-layer integer indices match the object's vg list.
+    for vg_name in vg_registry:
+        merged_obj.vertex_groups.new(name=str(vg_name))
+
+    # Copy provenance + parenting + armature modifier from the FIRST
+    # source object so the exporter sees a fully-bound mesh.
+    first = group_objs[0]
+    # The frame/mesh names should be the ORIGINAL pre-split source.
+    merged_obj["_x_mesh_name"] = source_mesh_name
+    if first.get("_x_frame_name"):
+        merged_obj["_x_frame_name"] = first["_x_frame_name"]
+    # Match the first object's transform/parent/modifiers.
+    merged_obj.matrix_world = first.matrix_world.copy()
+    merged_obj.parent       = first.parent
+    merged_obj.parent_type  = first.parent_type
+    if first.parent_bone:
+        merged_obj.parent_bone = first.parent_bone
+    for mod_src in first.modifiers:
+        if mod_src.type == 'ARMATURE':
+            mod_dst = merged_obj.modifiers.new(name=mod_src.name, type='ARMATURE')
+            mod_dst.object = mod_src.object
+            mod_dst.use_vertex_groups = mod_src.use_vertex_groups
+
+    # Link into the source's collection (or scene if no collection)
+    placed = False
+    for col in first.users_collection:
+        try:
+            col.objects.link(merged_obj)
+            placed = True
+            break
+        except Exception:
+            pass
+    if not placed:
+        try:
+            bpy.context.scene.collection.objects.link(merged_obj)
+        except Exception:
+            pass
+
+    return merged_obj
+
+
+
 def _write_mesh_frame(obj, out, indent,
                       depsgraph, use_mesh_modifiers,
                       export_normals, export_uvs,
                       export_materials, export_weights,
                       arm_obj, bl_to_dx_3, inv_scale,
-                      triangulate, written_mats):
+                      triangulate, written_mats,
+                      unweld_on_export=True):
     w        = out.feed if isinstance(out, _BinarySerializer) else out.append
     ind      = "\t" * indent
     warnings = []
@@ -909,18 +1154,6 @@ def _write_mesh_frame(obj, out, indent,
     bm.free()
 
     me_work.update()
-
-    _bm_check = bmesh.new()
-    _bm_check.from_mesh(me_work)
-    _bm_check.edges.ensure_lookup_table()
-    non_manifold = [e.index for e in _bm_check.edges if not e.is_manifold]
-    _bm_check.free()
-    if non_manifold:
-        msg = (f"{obj.name}: {len(non_manifold)} non-manifold edge(s) — "
-               f"may cause broken normals or bad skinning "
-               f"(edges: {non_manifold[:10]}"
-               f"{'...' if len(non_manifold) > 10 else ''})")
-        warnings.append(msg)
 
     conv_inv_3 = bl_to_dx_3
 
@@ -977,6 +1210,25 @@ def _write_mesh_frame(obj, out, indent,
                 vi = me_work.loops[li].vertex_index
                 loop_to_new_vi[li] = vi
                 face_indices.append(vi)
+            faces.append(face_indices)
+    elif unweld_on_export:
+        # Unweld path: every loop becomes its own output vertex. No
+        # dedup is done — the dedup key is effectively the loop index
+        # itself. This restores the original file's vert count when
+        # the mesh was imported with welding enabled (the .x format
+        # naturally splits verts at UV/normal/smoothing-group seams,
+        # so what gets written here is one vert per face-corner, just
+        # like the original).
+        for poly in me_work.polygons:
+            face_indices = []
+            for li in poly.loop_indices:
+                src_vi = me_work.loops[li].vertex_index
+                new_vi = len(new_to_src)
+                new_to_src.append(src_vi)
+                new_loop_normal.append(raw_loop_normals[li] if raw_loop_normals is not None else None)
+                new_uv.append(tuple(uv_layer_active.data[li].uv) if uv_layer_active is not None else None)
+                loop_to_new_vi[li] = new_vi
+                face_indices.append(new_vi)
             faces.append(face_indices)
     else:
         for poly in me_work.polygons:
@@ -1286,11 +1538,7 @@ def _invert_dx_matrix(m16):
         ])
         inv_col = m_col.inverted()
         # Transpose back to row-major DX form
-        out = []
-        for r in range(4):
-            for c in range(4):
-                out.append(float(inv_col[c][r]))
-        return out
+        return [float(inv_col[c][r]) for r in range(4) for c in range(4)]
     except Exception:
         # Identity fallback if matrix is singular
         return [1.0, 0.0, 0.0, 0.0,
@@ -1347,11 +1595,6 @@ def _write_position_stride16(out: bytearray, pos_keys: dict, max_tick: int) -> i
         return 0
 
     n_written = 0
-
-    # Step 1: determine an extension value past max_tick to use as "lookahead"
-    # for the final record.  Use the last tick's value.
-    last_tick = max(pos_keys.keys())
-    last_pos = pos_keys[last_tick]
 
     # Sort ticks
     ticks = sorted(pos_keys.keys())
@@ -1447,15 +1690,63 @@ def _write_rotation_stride20(out: bytearray, rot_keys: dict, max_tick: int) -> i
     return n_written
 
 
-def _write_skin_weights(out: bytearray, skin: List[Tuple[int, float]]) -> int:
-    """Write skin weights for one bone."""
+def _write_skin_weights(out: bytearray, skin: List[Tuple]) -> int:
+    """Write skin weights for one bone.
+
+    Entries can be 2-tuples (vi, weight) for single-mesh exports, or
+    3-tuples (vi, weight, chunk_idx) for multi-mesh exports. Vi is
+    CHUNK-LOCAL — indexes into the sub-mesh's vert array, not a
+    combined one.
+
+    Chunk encoding (the "lookback" rule, matches _read_skin_weights):
+    --------------------------------------------------------------
+    The trailer u16 at byte offset 8 of each 10-byte entry stores
+    the chunk index of the NEXT entry, NOT the current one. The
+    current entry's chunk is given by the PREVIOUS entry's trailer
+    (or the bone's `pad` u16 header for entry [0]). This was
+    verified against Journal.xcache where the trailer values
+    transition at chunk boundaries.
+
+    So when writing:
+      * Header `pad` = first entry's chunk (entry [0] is in chunk
+        `pad`).
+      * Entry [N]'s trailer = entry [N+1]'s chunk.
+      * The LAST entry's trailer has no successor — we write its
+        own chunk index, which gives stable round-trip behaviour
+        when re-imported.
+    """
     n = len(skin)
     out += struct.pack('<I', n)
-    out += struct.pack('<H', 0)  # pad after count
+
+    # Extract per-entry (vi, weight, chunk) — defaulting chunk to 0
+    # for 2-tuple legacy entries.
+    parsed = []
+    for entry in skin:
+        if len(entry) == 3:
+            parsed.append((int(entry[0]), float(entry[1]),
+                           int(entry[2]) & 0xFFFF))
+        else:
+            parsed.append((int(entry[0]), float(entry[1]), 0))
+
+    # Pad field = primary chunk = chunk of the FIRST entry (per the
+    # lookback rule: entry [0]'s chunk is read from `pad`).
+    primary_chunk = parsed[0][2] if parsed else 0
+    out += struct.pack('<H', primary_chunk)
     n_written = 6
-    for vi, weight in skin:
-        # 10 bytes per entry: u16 vi, u16 pad, f32 weight, u16 pad2
-        out += struct.pack('<HHfH', int(vi) & 0xFFFF, 0, float(weight), 0)
+
+    for i, (vi, weight, chunk) in enumerate(parsed):
+        # The trailer of entry i is the chunk of entry i+1 (or this
+        # entry's own chunk if this is the last entry).
+        if i + 1 < len(parsed):
+            next_chunk = parsed[i + 1][2]
+        else:
+            next_chunk = chunk
+        # 10 bytes per entry: u16 vi, u16 pad, f32 weight, u16 trailer
+        out += struct.pack('<HHfH',
+                           vi & 0xFFFF,
+                           0,
+                           weight,
+                           next_chunk & 0xFFFF)
         n_written += 10
     return n_written
 
@@ -1475,7 +1766,8 @@ def _write_bone_block_alignment_trailer(out: bytearray, block_start_byte_count: 
 
 
 def _write_no_anim_placeholder(out: bytearray) -> int:
-    """Write the 16-byte 'anim placeholder' that appears in non-animated bones"""
+    """Write the 16-byte 'anim placeholder' (identity quaternion) that
+    appears in non-animated bones. Returns 16."""
     out += struct.pack('<4f', 1.0, 0.0, 0.0, 0.0)
     return 16
 
@@ -1560,7 +1852,7 @@ assert len(_MESH_TEX_TAIL) == 60
 
 
 def _compute_bbox(verts):
-    """Return ((min_x, min_y, min_z), (max_x, max_y, max_z)) for a list of"""
+    """Return ((min_x, min_y, min_z), (max_x, max_y, max_z)) for a list of 3-tuples."""
     if not verts:
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
     xs = [v[0] for v in verts]
@@ -1570,7 +1862,9 @@ def _compute_bbox(verts):
 
 
 def _write_mesh_common_header(out: bytearray, bbox_min, bbox_max) -> None:
-    """Write the 144-byte common material header that appears immediately"""
+    """Write the 144-byte common material header that appears immediately
+    after the mesh FTM: a fixed prologue, the bbox (6 floats), a fixed
+    epilogue, and the color tail."""
     out += _MESH_COMMON_HEADER_PROLOGUE
     out += struct.pack('<6f', *bbox_min, *bbox_max)
     out += _MESH_COMMON_HEADER_EPILOGUE
@@ -1579,7 +1873,9 @@ def _write_mesh_common_header(out: bytearray, bbox_min, bbox_max) -> None:
 
 def _write_mesh_texture_entry(out: bytearray, path: str,
                                include_separator: bool) -> int:
-    """Write one texture entry (presence flag + name_len + name + null) and"""
+    """Write one texture entry (presence flag + name_len + name + null) and
+    optionally a 1-byte alignment separator. Returns the number of bytes
+    written."""
     name_bytes = path.encode('ascii')
     out += struct.pack('<B', 0x01)
     out += struct.pack('<I', len(name_bytes))
@@ -1594,7 +1890,8 @@ def _write_mesh_texture_entry(out: bytearray, path: str,
 
 
 def _write_mesh_block(out: bytearray, mesh: dict) -> None:
-    """Write a complete mesh block (parent_idx + header + FTM + material/flags"""
+    """Write a complete mesh block (parent_idx + header + FTM + material/flags
+    block + verts/normals/uvs/faces) in the .xcache binary format."""
     # Bone-style header
     name_bytes = mesh['name'].encode('ascii')
     out += struct.pack('<II', int(mesh.get('parent_idx', 0)), len(name_bytes))
@@ -1670,7 +1967,9 @@ def _write_mesh_block(out: bytearray, mesh: dict) -> None:
 # ---------- Bone-block top-level writer ----------
 
 def _write_bone_block(out: bytearray, bone: dict, animated: bool, max_tick: int) -> None:
-    """Write a complete bone block including header (parent_idx, name_len, name,"""
+    """Write a complete bone block including header (parent_idx, name_len, name),
+    FTM (64 bytes), the 296-byte pre-anim decoration, and animation/skin data
+    if present."""
     # Bone header: parent_idx, name_len, name
     name_bytes = bone['name'].encode('ascii')
     out += struct.pack('<II', int(bone['parent_idx']), len(name_bytes))
@@ -1756,7 +2055,9 @@ def _write_bone_block(out: bytearray, bone: dict, animated: bool, max_tick: int)
 
 def encode_xcache_bytes(bones: List[dict], anim_frame_count: int,
                          meshes: Optional[List[dict]] = None) -> bytes:
-    """Build a complete .xcache file as bytes from a list of bone dicts and"""
+    """Build a complete .xcache file as bytes from a list of bone dicts and
+    optional mesh dicts. Writes the SEMS header, all bone blocks (with
+    animation/skin data), and any mesh blocks."""
     out = bytearray()
 
     n_meshes = len(meshes) if meshes else 0
@@ -1791,17 +2092,17 @@ def export_xcache_to_file(filepath: str, bones: List[dict], anim_frame_count: in
 # Blender bridge
 
 def _matrix_to_dx_floats(mat):
-    """Convert a mathutils.Matrix (4x4) into a list of 16 floats in"""
+    """Convert a mathutils.Matrix (4x4) into a list of 16 floats in DirectX
+    row-major order (Blender's column-major matrix, transposed)."""
     # Transpose: DX row-major = Blender column-major when read sequentially
-    out = []
-    for c in range(4):
-        for r in range(4):
-            out.append(float(mat[r][c]))
-    return out
+    return [float(mat[r][c]) for c in range(4) for r in range(4)]
 
 
 def _build_xcache_parent_idx(bones_in_order, idx, parent_name):
-    """Compute the relative parent_idx field for a bone at index `idx`"""
+    """Compute the relative parent_idx field for a bone at index `idx`
+    in the topologically sorted bone list. Returns the xcache sentinel
+    encoding: 2 for the first bone, 28 for the second, otherwise 1 if
+    the parent is the previous bone, 0 if it's the root."""
     if idx == 0:
         return 2
     if idx == 1:
@@ -1818,7 +2119,9 @@ def _build_xcache_parent_idx(bones_in_order, idx, parent_name):
 
 
 def _topo_sort_bones(armature_bones):
-    """Order Blender armature bones such that:"""
+    """Order Blender armature bones in depth-first parent-before-child order
+    suitable for .xcache emission. Multiple roots are flattened with the
+    first treated as bone[0] and the rest as its semantic children."""
     # Find roots
     roots = [b for b in armature_bones if b.parent is None]
     if not roots:
@@ -1849,7 +2152,9 @@ def _topo_sort_bones(armature_bones):
 def collect_bones_from_armature(arm_obj, bl_to_dx_3, inv_scale, scene=None,
                                  anim_frame_start=1, anim_frame_end=1,
                                  export_animation=False):
-    """Extract bone dicts (suitable for encode_xcache_bytes) from a Blender"""
+    """Extract bone dicts (suitable for encode_xcache_bytes) from a Blender
+    armature. Each dict carries name, parent_idx, FTM (parent-local),
+    bind_pose (world), skin_offset, and optional animation channels."""
 
     arm_data = arm_obj.data
     bones = list(arm_data.bones)
@@ -1937,16 +2242,28 @@ def collect_bones_from_armature(arm_obj, bl_to_dx_3, inv_scale, scene=None,
 
 
 def collect_skin_weights(mesh_dicts, arm_obj, bone_dicts):
-    """Populate the 'skin' field of each bone dict from the mesh dicts"""
-    name_to_idx = {bd['name']: i for i, bd in enumerate(bone_dicts)}
-    vertex_offset = 0
+    """Populate the 'skin' field of each bone dict from the mesh dicts'
+    Blender vertex groups.
 
-    for mesh_dict in mesh_dicts:
+    For single-mesh exports: each bone gets a flat list of (vi, weight)
+    pairs, with vi indexing directly into the mesh's vert array.
+
+    For multi-mesh exports (multiple mesh_dicts representing sub-meshes
+    of one source xcache): each bone gets a list of (vi, weight,
+    chunk_idx) triples. Vi values are CHUNK-LOCAL, not offset into a
+    combined array; the chunk_idx tells the reader which sub-mesh the
+    vi indexes into. This matches the original Bugsnax xcache format,
+    so multi-mesh files round-trip with their sub-mesh structure
+    intact.
+    """
+    name_to_idx = {bd['name']: i for i, bd in enumerate(bone_dicts)}
+    is_multi_mesh = len(mesh_dicts) > 1
+
+    for chunk_idx, mesh_dict in enumerate(mesh_dicts):
         mesh_obj = mesh_dict.get('_blender_obj')
         bl_to_export = mesh_dict.get('_bl_to_export')
         if mesh_obj is None or bl_to_export is None:
             # Mesh dict wasn't produced by our blender-side helper — skip
-            vertex_offset += len(mesh_dict.get('verts', []))
             continue
 
         # Check this mesh is bound to arm_obj (skip otherwise — verts won't
@@ -1959,7 +2276,6 @@ def collect_skin_weights(mesh_dicts, arm_obj, bone_dicts):
                 bound = True
                 break
         if not bound:
-            vertex_offset += len(mesh_dict.get('verts', []))
             continue
 
         me = mesh_obj.data
@@ -1969,7 +2285,11 @@ def collect_skin_weights(mesh_dicts, arm_obj, bone_dicts):
             if vg.name in name_to_idx:
                 vg_to_bone[vg.index] = vg.name
 
-        # Iterate Blender source vertices.  For each weight, emit one skin
+        # Iterate Blender source vertices. Vi values are CHUNK-LOCAL —
+        # they index into THIS mesh's vert array, not a combined one.
+        # When multi-mesh, we tag each entry with chunk_idx so the
+        # writer can set the trailer u16 to identify which sub-mesh
+        # the entry belongs to.
         for bl_vi, v in enumerate(me.vertices):
             if bl_vi >= len(bl_to_export):
                 continue
@@ -1985,18 +2305,18 @@ def collect_skin_weights(mesh_dicts, arm_obj, bone_dicts):
                     continue
                 bone_skin = bone_dicts[name_to_idx[bone_name]]['skin']
                 for export_vi in export_vis:
-                    bone_skin.append((vertex_offset + export_vi, w))
-
-        vertex_offset += len(mesh_dict.get('verts', []))
+                    if is_multi_mesh:
+                        bone_skin.append((export_vi, w, chunk_idx))
+                    else:
+                        bone_skin.append((export_vi, w))
 
 
 def collect_meshes_from_blender(mesh_objs, arm_obj, bl_to_dx_3, inv_scale,
                                   depsgraph=None, use_modifiers=True):
-    """Walk Blender mesh objects and produce mesh dicts ready for"""
-    from mathutils import Matrix, Vector
-    import bmesh
-    import bpy
-
+    """Walk Blender mesh objects and produce mesh dicts ready for
+    encode_xcache_bytes (name, ftm, verts, normals, uvs, faces). Mesh
+    data uses the raw bind-pose vertices (not depsgraph-evaluated, so
+    armature deformation doesn't bake into the export)."""
     meshes = []
     for obj in mesh_objs:
         # IMPORTANT: use the raw obj.data (bind-pose vertices), NOT the
@@ -2113,14 +2433,33 @@ def collect_meshes_from_blender(mesh_objs, arm_obj, bl_to_dx_3, inv_scale,
         # Texture paths: pull from material slots if any of them have a
         tex_paths = []
         seen_paths = set()
+
+        def _normalize_tex_path(p: str) -> str:
+            """Strip Blender's relative-path prefixes and backslash-encode.
+            Examples:
+              '//BefficaBody_D.dds' -> 'BefficaBody_D.dds'
+              '.\\BefficaBody_D.dds' -> 'BefficaBody_D.dds'
+              './foo/bar.dds' -> 'foo/bar.dds'
+              'Content/Models/.../X.dds' -> 'Content/Models/.../X.dds'
+            Engine-style 'Content/...' paths are kept as-is.
+            """
+            if not p:
+                return p
+            p = p.replace('\\', '/')
+            while p.startswith('./') or p.startswith('//'):
+                p = p[2:]
+            return p
+
         for mat in _effective_materials(obj):
             if mat is None:
                 continue
             stashed = mat.get('_x_texture_filename')
-            if isinstance(stashed, str) and stashed and stashed not in seen_paths:
-                tex_paths.append(stashed)
-                seen_paths.add(stashed)
-                continue
+            if isinstance(stashed, str) and stashed:
+                stashed = _normalize_tex_path(stashed)
+                if stashed and stashed not in seen_paths:
+                    tex_paths.append(stashed)
+                    seen_paths.add(stashed)
+                    continue
             try:
                 tree = mat.node_tree
                 if tree is not None:
@@ -2138,9 +2477,11 @@ def collect_meshes_from_blender(mesh_objs, arm_obj, bl_to_dx_3, inv_scale,
                             if p:
                                 picked = p
                                 break
-                    if picked and picked not in seen_paths:
-                        tex_paths.append(picked)
-                        seen_paths.add(picked)
+                    if picked:
+                        picked = _normalize_tex_path(picked)
+                        if picked and picked not in seen_paths:
+                            tex_paths.append(picked)
+                            seen_paths.add(picked)
             except Exception:
                 pass
 
@@ -2186,10 +2527,9 @@ def export_xcache_from_blender(context, filepath,
                                 anim_frame_start=1,
                                 anim_frame_end=250,
                                 **_):
-    """Top-level entry point for exporting the current Blender scene state to"""
-    import math
-    from .exporter import _axis_matrix
-
+    """Top-level entry point for exporting the current Blender scene state to
+    a .xcache binary file. Collects bones (with animation), meshes, and
+    skin weights, then writes the SEMS-format binary container."""
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
     objects = (context.selected_objects
@@ -2204,6 +2544,17 @@ def export_xcache_from_blender(context, filepath,
 
     armature_objs = [o for o in objects if o.type == 'ARMATURE']
     mesh_objs = [o for o in objects if o.type == 'MESH']
+
+    # Sort mesh objects by _x_submesh_idx if available, so split-mesh
+    # imports round-trip with sub-meshes in their original order. Objects
+    # without the property (e.g. user-created meshes) sort to the end,
+    # preserving their relative scene order.
+    def _submesh_key(o):
+        idx = o.get('_x_submesh_idx')
+        if idx is None:
+            return (1, 0, o.name)  # bucket 1: no stash, after stashed
+        return (0, int(idx), o.name)
+    mesh_objs.sort(key=_submesh_key)
 
     if not armature_objs and not mesh_objs:
         return {'CANCELLED'}, ['No armature or mesh found in scene; nothing to export.']
@@ -2258,8 +2609,8 @@ def export_xcache_from_blender(context, filepath,
         md.pop('_bl_to_export', None)
         md.pop('_blender_obj', None)
 
-    n_bytes = export_xcache_to_file(filepath, bone_dicts, anim_frame_count,
-                                     meshes=mesh_dicts or None)
+    export_xcache_to_file(filepath, bone_dicts, anim_frame_count,
+                          meshes=mesh_dicts or None)
 
     if mesh_dicts:
         total_verts = sum(len(m['verts']) for m in mesh_dicts)

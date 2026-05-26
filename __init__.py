@@ -9,7 +9,7 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "Generated for Burger.x",
-    "version": (1, 1, 6),
+    "version": (1, 2, 0),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -17,6 +17,7 @@ bl_info = {
 }
 
 import bpy
+import os
 from bpy.props import (
     StringProperty, BoolProperty, FloatProperty,
     EnumProperty, IntProperty,
@@ -39,6 +40,18 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         # and fnmatch is case-sensitive on Linux/macOS.
         default="*.x;*.X;*.xcache;*.XCACHE",
         options={"HIDDEN"},
+    )
+
+    # Multi-file selection: Blender populates `files` automatically when
+    # the user selects multiple files in the file browser.  `directory`
+    # holds the folder they were chosen from.
+    files: bpy.props.CollectionProperty(
+        type=bpy.types.OperatorFileListElement,
+        options={"HIDDEN", "SKIP_SAVE"},
+    )
+    directory: StringProperty(
+        subtype="DIR_PATH",
+        options={"HIDDEN", "SKIP_SAVE"},
     )
 
     use_apply_transform: BoolProperty(
@@ -66,6 +79,21 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
     import_uvs:       BoolProperty(name="Import UVs",       default=True)
     import_materials: BoolProperty(name="Import Materials", default=True)
     import_textures:  BoolProperty(name="Import Textures",  default=True)
+    use_diffuse_alpha: BoolProperty(
+        name="Use Diffuse Alpha",
+        description=(
+            "Connect the alpha channel of the diffuse (_D) texture to "
+            "the material's Alpha input, and set the blend mode to "
+            "alpha clip/blend. Bugsnax textures sometimes encode "
+            "transparency in the diffuse alpha channel (e.g. leaf "
+            "cutouts on plants, eye highlights). Without this, the "
+            "textures look opaque in Blender's viewport even when "
+            "they were authored with alpha.\n\n"
+            "If a texture has no alpha channel (most opaque materials), "
+            "connecting alpha is a no-op so this is safe to leave on."
+        ),
+        default=True,
+    )
     smooth_shade_from_faces: BoolProperty(
         name="Smooth Shade from Faces",
         description=(
@@ -78,25 +106,96 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         default=False,
     )
 
+    split_submeshes: BoolProperty(
+        name="Split Sub-Meshes",
+        description=(
+            "Import multi-part models as separate Blender objects "
+            "sharing one armature, rather than merged into one mesh.\n\n"
+            "Applies to:\n"
+            "  • xcache files with multiple internal sub-meshes "
+            "(e.g. Beffica has body + limbs, Queen has 11 chunks)\n"
+            "  • .x files whose Mesh has MULTIPLE materials assigned "
+            "to different faces (e.g. BalloonLow.x has BoatTrimSheet "
+            "on 12,525 faces and blinn2 on 736)\n\n"
+            "ON (default): each sub-mesh / material group becomes its "
+            "own object, named after the source mesh (BefficaGeo, "
+            "BefficaGeo_2, etc.). Each has its own material, texture "
+            "set, and vertex groups for the bones that weight it. "
+            "Round-trip export preserves the sub-mesh structure exactly "
+            "for xcache files.\n\n"
+            "OFF: legacy behavior. All sub-meshes / materials are kept "
+            "in one Blender object with per-face material assignments "
+            "and merged skin weights. Single-material .x files (the "
+            "Bugsnax characters like Olive, Apple, Watermelon) are "
+            "never split regardless of this setting"
+        ),
+        default=True,
+    )
+
+    triangulate_quads: BoolProperty(
+        name="Triangulate Quads",
+        description=(
+            "Convert quad and n-gon faces into pairs of triangles on "
+            "import.\n\n"
+            "ON (default): all imported meshes have only triangle "
+            "faces, matching what the engine actually uses internally. "
+            "Most .x files are exported from Maya with the original "
+            "quad topology (e.g. BalloonLow.x has 12,105 quads + "
+            "1,154 triangles); without this option, those quads come "
+            "through into Blender as-is. xcache files are already "
+            "stored as triangles, so this option has no effect on them.\n\n"
+            "OFF: preserve the original quad / n-gon topology from .x "
+            "files. Better for editing, subdivision, and animation "
+            "workflows that benefit from quad mesh structure. Round-trip "
+            "to xcache will still emit triangles (the format requires it), "
+            "but round-trip to .x will preserve the quads"
+        ),
+        default=True,
+    )
+
     import_armature:  BoolProperty(name="Import Armature",  default=True)
     import_weights:   BoolProperty(name="Import Weights",   default=True)
     import_animation: BoolProperty(name="Import Animation", default=True)
+    weld_duplicate_verts: BoolProperty(
+        name="Weld Duplicate Vertices",
+        description=(
+            "Collapse vertices that sit at the same XYZ position into "
+            "one and blend their bone weights.\n\n"
+            "ON (default): produces smooth shading across face "
+            "boundaries.  The .x format stores per-loop normals as "
+            "split verts; without welding, adjacent faces don't "
+            "share vertices, so smooth-shading has nothing to "
+            "average across and the mesh looks blocky.  Required "
+            "for any usable view of the model.\n\n"
+            "OFF: keeps the file's exact vertex authoring (~9424 "
+            "verts for Beffica vs ~2370 welded).  Use only when "
+            "round-trip preservation matters more than shading "
+            "quality, e.g. when bit-comparing exports against a "
+            "reference file"
+        ),
+        default=True,
+    )
 
     rest_pose_source: EnumProperty(
         name="Rest Pose Source",
         description=(
             "Where to read bone rest poses from.\n\n"
-            "Frame Hierarchy (default): uses the FrameTransformMatrix "
-            "chain — the canonical .x convention, matching dev-supplied "
-            ".x files.\n\n"
-            "Bind Pose: uses the SkinWeights offset matrices. Kept for "
-            "backwards compatibility with files whose FTM is ambiguous."
+            "Bind Pose (default): uses the SkinWeights matrixOffset "
+            "inverse-bind matrices. This is the correct interpretation "
+            "for Bugsnax xcache files, whose mesh data is stored in "
+            "bind pose (matching inv(matrixOffset)) while the FTM "
+            "encodes the first animation keyframe instead. Also "
+            "works for dev .x files where FTM and matrixOffset "
+            "agree by construction.\n\n"
+            "Frame Hierarchy: uses the FrameTransformMatrix chain. "
+            "Kept for the rare files where matrixOffset is missing "
+            "or stale and FTM is the only reliable source."
         ),
         items=[
-            ('FRAME_TRANSFORM', "Frame Hierarchy", "Use FrameTransformMatrix chain (canonical .x convention)"),
-            ('BIND',            "Bind Pose",       "Use SkinWeights offset matrices (legacy)"),
+            ('BIND',            "Bind Pose",       "Use SkinWeights matrixOffset (correct for xcache, equivalent for clean dev .x)"),
+            ('FRAME_TRANSFORM', "Frame Hierarchy", "Use FrameTransformMatrix chain"),
         ],
-        default='FRAME_TRANSFORM',
+        default='BIND',
     )
 
     anim_fps: FloatProperty(
@@ -134,43 +233,59 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         box.prop(self, "import_uvs")
         box.prop(self, "import_materials")
         box.prop(self, "import_textures")
+        box.prop(self, "use_diffuse_alpha")
+        box.prop(self, "split_submeshes")
+        box.prop(self, "triangulate_quads")
 
         box = layout.box()
         box.label(text="Armature & Animation", icon="ARMATURE_DATA")
         box.prop(self, "import_armature")
         box.prop(self, "import_weights")
+        box.prop(self, "weld_duplicate_verts")
         box.prop(self, "import_animation")
         box.prop(self, "rest_pose_source")
         box.prop(self, "anim_fps")
         box.prop(self, "set_frame_range")
 
     def execute(self, context):
-        keywords = self.as_keywords(ignore=("filter_glob",))
-        import os, tempfile, traceback
-        debug = bool(os.environ.get("SNAKFORGE_DEBUG"))
-        log_path = os.path.join(tempfile.gettempdir(), "snakforge_import.log")
-        try:
-            result = import_x(context, **keywords)
-        except Exception as e:
-            # When debug logging is on, dump the traceback so it
-            # survives even if Blender was launched without a console.
-            # When debug is off, skip the file I/O entirely — Blender's
-            # own error reporting will still surface the exception.
-            if debug:
-                try:
-                    with open(log_path, "a", encoding="utf-8") as fh:
-                        fh.write("\n!!! UNHANDLED EXCEPTION in execute():\n")
-                        fh.write(traceback.format_exc())
-                        fh.flush()
-                except Exception:
-                    pass
-                self.report({'ERROR'}, f"Import failed: {e}. Log: {log_path}")
-            else:
-                self.report({'ERROR'}, f"Import failed: {e}")
-            return {'CANCELLED'}
-        if debug:
-            self.report({'INFO'}, f"Import OK. Log: {log_path}")
-        return result
+        # Build the list of files to import.  When the user selects multiple
+        # files in the browser, `self.files` is populated and `self.directory`
+        # holds their common parent.  When only one file is chosen (or the
+        # operator is called programmatically), fall back to `self.filepath`.
+        if self.files and self.directory:
+            filepaths = [
+                os.path.join(self.directory, f.name)
+                for f in self.files
+                if f.name
+            ]
+        else:
+            filepaths = [self.filepath]
+
+        # Remove duplicates while preserving order (can happen when both
+        # `files` and `filepath` point at the same item).
+        seen = set()
+        unique_paths = []
+        for p in filepaths:
+            if p not in seen:
+                seen.add(p)
+                unique_paths.append(p)
+
+        keywords = self.as_keywords(ignore=("filter_glob", "files", "directory"))
+        last_result = {"FINISHED"}
+        errors = []
+        for fp in unique_paths:
+            keywords["filepath"] = fp
+            try:
+                last_result = import_x(context, **keywords)
+            except Exception as e:
+                errors.append((fp, e))
+
+        if errors:
+            msg = "; ".join(f"{os.path.basename(fp)}: {e}" for fp, e in errors)
+            self.report({'ERROR'}, f"Import failed: {msg}")
+            return {'CANCELLED'} if len(errors) == len(unique_paths) else {'FINISHED'}
+
+        return last_result
 
 class ExportDirectX(bpy.types.Operator, ExportHelper):
     """Export selected objects as a DirectX .x file"""
@@ -217,6 +332,28 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     export_armature:  BoolProperty(name="Export Armature",  default=True)
     export_weights:   BoolProperty(name="Export Weights",   default=True)
     export_animation: BoolProperty(name="Export Animation", default=True)
+
+    unweld_on_export: BoolProperty(
+        name="Unweld on Export (.x only)",
+        description=(
+            "Split every face-loop into its own output vertex so the "
+            "exported mesh has one vertex per loop (no shared verts "
+            "between faces). Applies only to .x export — .xcache uses "
+            "its own UV-seam-based unrolling.\n\n"
+            "ON (default): restores the original .x file's vert count "
+            "when the mesh was imported with welding enabled. Bugsnax "
+            ".x files store per-loop normals/UVs by splitting verts at "
+            "UV and smoothing-group seams, so welding-on-import "
+            "collapsed those splits — this option reverses that for "
+            "round-trip fidelity.\n\n"
+            "OFF: writes the mesh with the in-Blender vert count. Only "
+            "minimal de-duplication is done (verts shared between faces "
+            "that genuinely have identical normals + UVs). Smaller "
+            "files, but normals may render differently than the "
+            "original .x file"
+        ),
+        default=True,
+    )
 
     use_original_material_data: BoolProperty(
         name="Use Original Material Data",
@@ -269,6 +406,20 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     anim_frame_start: IntProperty(name="Frame Start", default=1)
     anim_frame_end:   IntProperty(name="Frame End",   default=250)
 
+    triangulate: BoolProperty(
+        name="Triangulate Faces",
+        description=(
+            "Convert all polygons to triangles on export.\n\n"
+            "ON (default): produces triangle-only meshes, which match "
+            "the .xcache engine format and load reliably in all DirectX "
+            "viewers.\n\n"
+            "OFF: preserves quads and n-gons. The dev .x reference "
+            "files use quads (Maya export convention) — turn this off "
+            "to match dev .x file structure more closely on round-trip"
+        ),
+        default=True,
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
@@ -288,6 +439,11 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.label(text="Data", icon="MESH_DATA")
         box.prop(self, "export_normals")
         box.prop(self, "export_uvs")
+        box.prop(self, "triangulate")
+        # Unweld only applies to .x — xcache uses its own UV-seam-based
+        # vert unrolling that produces engine-format vert counts.
+        if self.export_format != "XCACHE":
+            box.prop(self, "unweld_on_export")
         box.prop(self, "export_materials")
         box.prop(self, "export_textures")
         if self.export_materials:
@@ -340,9 +496,8 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
 
     def check(self, context):
         """Update the filename extension when the format dropdown changes."""
-        import os as _os
         fp = self.filepath or ""
-        base, cur_ext = _os.path.splitext(fp)
+        base, cur_ext = os.path.splitext(fp)
         wanted_ext = ".xcache" if self.export_format == "XCACHE" else ".x"
 
         changed = False
@@ -376,8 +531,8 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         fmt = keywords.pop("export_format", "TEXT_X")
 
         # If the user explicitly typed a filename ending in .xcache, that
-        import os as _os
-        base, cur_ext = _os.path.splitext(self.filepath)
+        # overrides whatever the dropdown said.
+        base, cur_ext = os.path.splitext(self.filepath)
         cur_ext_lower = cur_ext.lower()
         if cur_ext_lower == ".xcache":
             fmt = "XCACHE"
