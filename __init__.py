@@ -8,7 +8,7 @@ Supports: geometry, normals, UVs, materials, textures,
 
 bl_info = {
     "name": "DirectX X Format (.x)",
-    "author": "",
+    "author": "Saint Baron",
     "version": (1, 3, 0),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
