@@ -8,8 +8,8 @@ Supports: geometry, normals, UVs, materials, textures,
 
 bl_info = {
     "name": "DirectX X Format (.x)",
-    "author": "Generated for Burger.x",
-    "version": (1, 2, 0),
+    "author": "",
+    "version": (1, 3, 0),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -35,10 +35,10 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".x"
     filter_glob: StringProperty(
-        # Include uppercase variants because Project Zomboid (and some
+        # Include uppercase variants because some games (and some
         # legacy DirectX SDK exports) ship files as `.X` rather than `.x`,
         # and fnmatch is case-sensitive on Linux/macOS.
-        default="*.x;*.X;*.xcache;*.XCACHE",
+        default="*.x;*.X",
         options={"HIDDEN"},
     )
 
@@ -84,7 +84,7 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         description=(
             "Connect the alpha channel of the diffuse (_D) texture to "
             "the material's Alpha input, and set the blend mode to "
-            "alpha clip/blend. Bugsnax textures sometimes encode "
+            "alpha clip/blend. some games textures sometimes encode "
             "transparency in the diffuse alpha channel (e.g. leaf "
             "cutouts on plants, eye highlights). Without this, the "
             "textures look opaque in Blender's viewport even when "
@@ -111,23 +111,16 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         description=(
             "Import multi-part models as separate Blender objects "
             "sharing one armature, rather than merged into one mesh.\n\n"
-            "Applies to:\n"
-            "  • xcache files with multiple internal sub-meshes "
-            "(e.g. Beffica has body + limbs, Queen has 11 chunks)\n"
-            "  • .x files whose Mesh has MULTIPLE materials assigned "
-            "to different faces (e.g. BalloonLow.x has BoatTrimSheet "
-            "on 12,525 faces and blinn2 on 736)\n\n"
-            "ON (default): each sub-mesh / material group becomes its "
-            "own object, named after the source mesh (BefficaGeo, "
-            "BefficaGeo_2, etc.). Each has its own material, texture "
-            "set, and vertex groups for the bones that weight it. "
-            "Round-trip export preserves the sub-mesh structure exactly "
-            "for xcache files.\n\n"
-            "OFF: legacy behavior. All sub-meshes / materials are kept "
-            "in one Blender object with per-face material assignments "
-            "and merged skin weights. Single-material .x files (the "
-            "Bugsnax characters like Olive, Apple, Watermelon) are "
-            "never split regardless of this setting"
+            "Applies to .x files whose Mesh has MULTIPLE materials "
+            "assigned to different faces.\n\n"
+            "ON (default): each material group becomes its own object, "
+            "named after the source mesh. Each has its own material, "
+            "texture set, and vertex groups for the bones that weight "
+            "it.\n\n"
+            "OFF: all materials are kept in one Blender object with "
+            "per-face material assignments and merged skin weights. "
+            "Single-material .x files are never split regardless of "
+            "this setting"
         ),
         default=True,
     )
@@ -138,64 +131,58 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
             "Convert quad and n-gon faces into pairs of triangles on "
             "import.\n\n"
             "ON (default): all imported meshes have only triangle "
-            "faces, matching what the engine actually uses internally. "
-            "Most .x files are exported from Maya with the original "
-            "quad topology (e.g. BalloonLow.x has 12,105 quads + "
-            "1,154 triangles); without this option, those quads come "
-            "through into Blender as-is. xcache files are already "
-            "stored as triangles, so this option has no effect on them.\n\n"
+            "faces, matching what most engines use internally. Many .x "
+            "files are exported with the original quad topology; without "
+            "this option, those quads come through into Blender as-is.\n\n"
             "OFF: preserve the original quad / n-gon topology from .x "
             "files. Better for editing, subdivision, and animation "
             "workflows that benefit from quad mesh structure. Round-trip "
-            "to xcache will still emit triangles (the format requires it), "
-            "but round-trip to .x will preserve the quads"
+            "to .x preserves the quads"
         ),
         default=True,
+    )
+
+    import_type: EnumProperty(
+        name="Import Type",
+        description=(
+            "Which exporter produced this .x file. Each is a separate, "
+            "self-contained import path — picking the right one avoids the "
+            "guesswork of auto-detection and keeps the conversions independent"
+        ),
+        items=[
+            ("standard", "Standard .x",
+             "General DirectX .x files from common exporters. This is the "
+             "original, well-tested path"),
+            ("ms_dx8", "DirectX 8.0 (rigid skin)",
+             "A single skinned mesh with SkinWeights / matrixOffset bind "
+             "matrices and rigid (one-bone-per-vertex) binding"),
+        ],
+        default="standard",
     )
 
     import_armature:  BoolProperty(name="Import Armature",  default=True)
     import_weights:   BoolProperty(name="Import Weights",   default=True)
     import_animation: BoolProperty(name="Import Animation", default=True)
+
     weld_duplicate_verts: BoolProperty(
         name="Weld Duplicate Vertices",
         description=(
             "Collapse vertices that sit at the same XYZ position into "
             "one and blend their bone weights.\n\n"
             "ON (default): produces smooth shading across face "
-            "boundaries.  The .x format stores per-loop normals as "
+            "boundaries. The .x format stores per-loop normals as "
             "split verts; without welding, adjacent faces don't "
             "share vertices, so smooth-shading has nothing to "
-            "average across and the mesh looks blocky.  Required "
-            "for any usable view of the model.\n\n"
-            "OFF: keeps the file's exact vertex authoring (~9424 "
-            "verts for Beffica vs ~2370 welded).  Use only when "
+            "average across and the mesh looks blocky.\n\n"
+            "OFF: keeps the file's exact vertex authoring. Use when "
             "round-trip preservation matters more than shading "
             "quality, e.g. when bit-comparing exports against a "
-            "reference file"
+            "reference file.\n\n"
+            "Ignored for the DirectX 8.0 rigid-skin path, where welding "
+            "would fuse coincident verts that belong to different bones "
+            "(e.g. eyelid pairs) and collapse hard-edge seam splits"
         ),
         default=True,
-    )
-
-    rest_pose_source: EnumProperty(
-        name="Rest Pose Source",
-        description=(
-            "Where to read bone rest poses from.\n\n"
-            "Bind Pose (default): uses the SkinWeights matrixOffset "
-            "inverse-bind matrices. This is the correct interpretation "
-            "for Bugsnax xcache files, whose mesh data is stored in "
-            "bind pose (matching inv(matrixOffset)) while the FTM "
-            "encodes the first animation keyframe instead. Also "
-            "works for dev .x files where FTM and matrixOffset "
-            "agree by construction.\n\n"
-            "Frame Hierarchy: uses the FrameTransformMatrix chain. "
-            "Kept for the rare files where matrixOffset is missing "
-            "or stale and FTM is the only reliable source."
-        ),
-        items=[
-            ('BIND',            "Bind Pose",       "Use SkinWeights matrixOffset (correct for xcache, equivalent for clean dev .x)"),
-            ('FRAME_TRANSFORM', "Frame Hierarchy", "Use FrameTransformMatrix chain"),
-        ],
-        default='BIND',
     )
 
     anim_fps: FloatProperty(
@@ -220,6 +207,10 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         layout.use_property_split = True
 
         box = layout.box()
+        box.label(text="Import Type", icon="FILE_3D")
+        box.prop(self, "import_type")
+
+        box = layout.box()
         box.label(text="Transform", icon="ORIENTATION_GLOBAL")
         box.prop(self, "global_scale")
         box.prop(self, "axis_forward")
@@ -241,9 +232,11 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         box.label(text="Armature & Animation", icon="ARMATURE_DATA")
         box.prop(self, "import_armature")
         box.prop(self, "import_weights")
+        # The weld toggle is always available. It has no effect on the
+        # DirectX 8.0 rigid-skin path (welding is suppressed there), but
+        # stays visible so its meaning is discoverable.
         box.prop(self, "weld_duplicate_verts")
         box.prop(self, "import_animation")
-        box.prop(self, "rest_pose_source")
         box.prop(self, "anim_fps")
         box.prop(self, "set_frame_range")
 
@@ -295,7 +288,7 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
 
     filename_ext = ".x"
     filter_glob: StringProperty(
-        default="*.x;*.X;*.xcache;*.XCACHE",
+        default="*.x;*.X",
         options={"HIDDEN"},
     )
 
@@ -333,16 +326,39 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     export_weights:   BoolProperty(name="Export Weights",   default=True)
     export_animation: BoolProperty(name="Export Animation", default=True)
 
+    anim_key_format: EnumProperty(
+        name="Animation Keys",
+        description=(
+            "How animation is written to the .x file.\n\n"
+            "Quaternion (default): three separate tracks per bone — "
+            "rotation as a 4-component quaternion (keyType 0), scale "
+            "(keyType 1) and position (keyType 2). This is what most "
+            "DirectX tools emit, and what the widest range of importers "
+            "accept.\n\n"
+            "Matrix: one 4x4 transform per frame per bone (keyType 4). "
+            "This gives the most faithful round-trip for files authored "
+            "with matrix keys (no decomposition step), and preserves "
+            "transforms that a quaternion+scale split cannot represent "
+            "(e.g. shear)"
+        ),
+        items=[
+            ("TRS", "Quaternion",
+             "Separate rotation (quaternion), scale and position tracks"),
+            ("MATRIX", "Matrix",
+             "One 4x4 matrix per frame (keyType 4)"),
+        ],
+        default="TRS",
+    )
+
     unweld_on_export: BoolProperty(
-        name="Unweld on Export (.x only)",
+        name="Unweld on Export",
         description=(
             "Split every face-loop into its own output vertex so the "
             "exported mesh has one vertex per loop (no shared verts "
-            "between faces). Applies only to .x export — .xcache uses "
-            "its own UV-seam-based unrolling.\n\n"
+            "between faces).\n\n"
             "ON (default): restores the original .x file's vert count "
-            "when the mesh was imported with welding enabled. Bugsnax "
-            ".x files store per-loop normals/UVs by splitting verts at "
+            "when the mesh was imported with welding enabled. Many .x "
+            "files store per-loop normals/UVs by splitting verts at "
             "UV and smoothing-group seams, so welding-on-import "
             "collapsed those splits — this option reverses that for "
             "round-trip fidelity.\n\n"
@@ -374,7 +390,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
             ("BINARY_X",          "Binary .x",            "DirectX binary format (smaller, faster to parse)"),
             ("COMPRESSED_TEXT_X", "Compressed Text .x",   "DirectX text format compressed with MSZIP (tzip)"),
             ("COMPRESSED_BIN_X",  "Compressed Binary .x", "DirectX binary format compressed with MSZIP (bzip)"),
-            ("XCACHE",            "Binary .xcache",      "Horsepower Engine SEMS .xcache (skeleton + animation only — no mesh)"),
         ],
         default="TEXT_X",
     )
@@ -382,13 +397,12 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
     pz_compat: BoolProperty(
         name="High-precision animation ticks",
         description=(
-            "Write the animation block with the conventions used by 3DS Max "
-            "biped exports (and games like Project Zomboid):\n"
+            "Write the animation block with high-precision tick "
+            "conventions used by some biped/game exports:\n"
             "  • AnimTicksPerSecond = 4800 (vs the FPS field's value)\n"
             "  • AnimationKey nodes named 'R', 'S', 'T' (rotation/scale/translation)\n"
             "Blender frame numbers are scaled to the 4800-tick rate so the "
-            "animation plays at the correct real-time speed. Has no effect "
-            "when exporting .xcache."
+            "animation plays at the correct real-time speed."
         ),
         default=False,
     )
@@ -398,7 +412,7 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         description=(
             "Animation tick rate (AnimTicksPerSecond) and target real-time "
             "playback rate. Blender frame numbers are written directly as "
-            "tick values. When Project Zomboid Compatibility is on, this "
+            "tick values. When High-precision animation ticks is on, this "
             "field is ignored and 4800 is used instead."
         ),
         default=30.0, min=1.0, max=10000.0,
@@ -410,12 +424,10 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         name="Triangulate Faces",
         description=(
             "Convert all polygons to triangles on export.\n\n"
-            "ON (default): produces triangle-only meshes, which match "
-            "the .xcache engine format and load reliably in all DirectX "
-            "viewers.\n\n"
-            "OFF: preserves quads and n-gons. The dev .x reference "
-            "files use quads (Maya export convention) — turn this off "
-            "to match dev .x file structure more closely on round-trip"
+            "ON (default): produces triangle-only meshes, which load "
+            "reliably in all DirectX viewers.\n\n"
+            "OFF: preserves quads and n-gons. Turn this off to keep "
+            "quad topology on round-trip"
         ),
         default=True,
     )
@@ -440,10 +452,7 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.prop(self, "export_normals")
         box.prop(self, "export_uvs")
         box.prop(self, "triangulate")
-        # Unweld only applies to .x — xcache uses its own UV-seam-based
-        # vert unrolling that produces engine-format vert counts.
-        if self.export_format != "XCACHE":
-            box.prop(self, "unweld_on_export")
+        box.prop(self, "unweld_on_export")
         box.prop(self, "export_materials")
         box.prop(self, "export_textures")
         if self.export_materials:
@@ -477,10 +486,8 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.prop(self, "export_armature")
         box.prop(self, "export_weights")
         box.prop(self, "export_animation")
-        # The high-precision-ticks option only affects .x animation
-        # output; .xcache has its own engine-specific layout.
-        if self.export_format != "XCACHE":
-            box.prop(self, "pz_compat")
+        box.prop(self, "anim_key_format")
+        box.prop(self, "pz_compat")
         row = box.row()
         row.prop(self, "anim_fps")
         row = box.row()
@@ -495,18 +502,14 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         return super().invoke(context, event)
 
     def check(self, context):
-        """Update the filename extension when the format dropdown changes."""
+        """Keep the filename extension as .x."""
         fp = self.filepath or ""
         base, cur_ext = os.path.splitext(fp)
-        wanted_ext = ".xcache" if self.export_format == "XCACHE" else ".x"
+        wanted_ext = ".x"
 
         changed = False
         cur_ext_lower = cur_ext.lower()
-        if cur_ext_lower in (".x", ".xcache", ".xanim"):
-            # One of our extensions is already there.  If it matches what
-            # the dropdown wants, keep it.  Otherwise swap it for the
-            # dropdown's choice so the user doesn't have to retype the
-            # filename when toggling between .x and .xcache.
+        if cur_ext_lower in (".x", ".xanim"):
             if cur_ext_lower != wanted_ext:
                 self.filepath = base + wanted_ext
                 changed = True
@@ -516,11 +519,8 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
             self.filename_ext = wanted_ext
             changed = True
         else:
-            # Some unrelated extension — keep filename_ext aligned with
-            # the dropdown.
             self.filename_ext = wanted_ext
 
-        # Defer to ExportHelper for any other normalization it wants to do
         super_changed = super().check(context)
         return changed or super_changed
 
@@ -530,40 +530,15 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         # Pull format off keywords; default routes to text .x
         fmt = keywords.pop("export_format", "TEXT_X")
 
-        # If the user explicitly typed a filename ending in .xcache, that
-        # overrides whatever the dropdown said.
         base, cur_ext = os.path.splitext(self.filepath)
-        cur_ext_lower = cur_ext.lower()
-        if cur_ext_lower == ".xcache":
-            fmt = "XCACHE"
-        elif cur_ext_lower == ".x":
-            # Honour the dropdown's choice between TEXT_X and BINARY_X,
-            # but never let it pick XCACHE when the file is .x.
-            if fmt == "XCACHE":
-                fmt = "TEXT_X"
-        elif not cur_ext_lower:
-            # No extension at all — fall back to the dropdown and append
-            # the matching extension.
-            wanted_ext = ".xcache" if fmt == "XCACHE" else ".x"
-            self.filepath = base + wanted_ext
+        if not cur_ext:
+            self.filepath = base + ".x"
             keywords["filepath"] = self.filepath
 
-        if fmt == "XCACHE":
-            from .exporter import export_xcache_from_blender
-            # The Blender bridge takes only the parameters it understands;
-            # filter the keyword dict to drop .x-specific options it ignores.
-            xc_keywords = {k: v for k, v in keywords.items() if k in (
-                "filepath", "use_selection", "use_mesh_modifiers", "global_scale",
-                "axis_forward", "axis_up",
-                "export_armature", "export_weights", "export_animation",
-                "anim_frame_start", "anim_frame_end",
-            )}
-            result, warnings = export_xcache_from_blender(context, **xc_keywords)
-        else:
-            # Map format choice to (binary_format, compress) flags
-            keywords["binary_format"] = fmt in ("BINARY_X", "COMPRESSED_BIN_X")
-            keywords["compress"]      = fmt in ("COMPRESSED_TEXT_X", "COMPRESSED_BIN_X")
-            result, warnings = export_x(context, **keywords)
+        # Map format choice to (binary_format, compress) flags
+        keywords["binary_format"] = fmt in ("BINARY_X", "COMPRESSED_BIN_X")
+        keywords["compress"]      = fmt in ("COMPRESSED_TEXT_X", "COMPRESSED_BIN_X")
+        result, warnings = export_x(context, **keywords)
 
         for msg in warnings:
             self.report({'WARNING'}, msg)
