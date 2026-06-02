@@ -20,7 +20,7 @@ FPS Creator — plus a dedicated path for DirectX 8.0 rigid-skinned characters.
 | Source | Status |
 |---|---|
 | General `.x` exporters (text format) | ✅ Full support |
-| MilkShape 3D / Ultimate Unwrap 3D `.x` | ✅ |
+| MilkShape 3Dm (Directx 8.0) / Ultimate Unwrap 3D `.x` | ✅ |
 | Game Guru / FPS Creator `.x` | ✅ |
 | DirectX 8.0 rigid-skinned characters | ✅ Dedicated import option |
 | High-precision biped `.x` (`AnimTicksPerSecond = 4800`) | ✅ Round-trip preserves DeclData, auxiliary frames, templates |
