@@ -8,8 +8,8 @@ Supports: geometry, normals, UVs, materials, textures,
 
 bl_info = {
     "name": "DirectX X Format (.x)",
-    "author": "Saint Baron",
-    "version": (1, 3, 0),
+    "author": "",
+    "version": (1, 3, 1),
     "blender": (3, 0, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
@@ -199,6 +199,22 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
             "120 will play from frame 0 to 120 regardless of what the "
             "scene range was set to before"
         ),
+        # Off by default: silently changing the scene's frame range on
+        # import surprised users who had their own range set (it is still
+        # one click away for those who want it).
+        default=False,
+    )
+
+    use_import_collection: BoolProperty(
+        name="Group in Collection",
+        description=(
+            "Put everything from this file into a new collection named "
+            "after the file.\n\n"
+            "ON (default): imported objects are grouped together, keeping "
+            "the outliner tidy when importing several files.\n\n"
+            "OFF: objects are added straight to the scene's collection, "
+            "with no extra grouping"
+        ),
         default=True,
     )
 
@@ -239,6 +255,10 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         box.prop(self, "import_animation")
         box.prop(self, "anim_fps")
         box.prop(self, "set_frame_range")
+
+        box = layout.box()
+        box.label(text="Scene", icon="OUTLINER")
+        box.prop(self, "use_import_collection")
 
     def execute(self, context):
         # Build the list of files to import.  When the user selects multiple

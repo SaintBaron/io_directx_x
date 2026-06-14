@@ -15,7 +15,9 @@ need to exist in the armature for the animation tracks to work.  For those
 bones we fall back to the FTM-derived global matrix.
 
 Mesh-container frames (frames whose only child is a Mesh, with no sub-Frames)
-are NOT added to the armature as bones.
+DO become bones (unnamed ones land as 'Bone') unless they are inert helpers;
+unskinned meshes under them are bone-parented when the chain has unit rest
+scale, or driven by exact object-level chain F-curves when it does not.
 """
 
 import os
@@ -33,7 +35,7 @@ _KEY_TYPE_VALUES = {
     #   1 = scale    (3-float vector)
     #   2 = position (3-float vector)
     #   3 = matrix   (16-float 4x4)
-    # some files files also use keyType=4 for matrix tracks
+    # Some files also use keyType=4 for matrix tracks
     # (an engine-specific extension/deviation). Both 3 and 4 are
     # treated as 16-float matrix keys downstream.
     0: 4,
@@ -65,6 +67,46 @@ def _is_near_identity(M, tol=1e-4):
     return all(abs(M[r][c] - ident[r][c]) < tol
                for r in range(4) for c in range(4))
 
+
+# Any rest-world axis scale below this marks a "micro" blend/morph joint
+# (the 0.001 eyelid *Lid* Aux joints). Legitimate animated-scale joints
+# (candle ~0.62, chain ~2.35) sit well above it, so the split is clean.
+MICRO_SCALE_THRESH = 0.05
+
+
+def _strip_scale_mat(M, target_len=1.0):
+    """Return a copy of 4x4 Matrix M with each rotation column renormalized to
+    `target_len` (default 1.0, i.e. scale removed) and translation preserved.
+    Degenerate (near-zero) columns fall back to the corresponding identity axis.
+    Used to drive micro-scale blend joints: target_len=1.0 strips a joint's own
+    ~0.001 scale to its open/unit state; a caller may instead pass the parent
+    chain's rest scale to KEEP that (so a scaled-subtree parent's animation lands
+    the joint correctly). Uses only .col / .length / .translation so it is
+    portable across real mathutils and the numeric test harness."""
+    try:
+        ncols = []
+        for i in range(3):
+            c = M.col[i]
+            n = c.length
+            if n > 1e-9:
+                s = target_len / n
+                ncols.append((c[0] * s, c[1] * s, c[2] * s))
+            else:
+                e = [0.0, 0.0, 0.0]
+                e[i] = target_len
+                ncols.append(tuple(e))
+        t = M.translation
+        rows = [
+            [ncols[0][0], ncols[1][0], ncols[2][0], t[0]],
+            [ncols[0][1], ncols[1][1], ncols[2][1], t[1]],
+            [ncols[0][2], ncols[1][2], ncols[2][2], t[2]],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        return Matrix(rows)
+    except Exception:
+        return M.copy()
+
+
 class _SyntheticKeyNode:
     """Minimal object mimicking an XNode AnimationKey for synthetic tracks."""
     __slots__ = ("_nums",)
@@ -76,17 +118,14 @@ class _SyntheticKeyNode:
         return self._nums
 
 def _compose_type4_from_trs(rot_node, scale_node, trans_node):
-    """Compose per-channel TRS animation keys into a single type-4 (matrix)
-    key sequence.
+    """Compose per-channel TRS keys into one type-4 (matrix) key sequence.
 
-    This is an optimization for files where rotation, scale, and translation
-    tracks share identical tick sequences (e.g. some exports).
-    For files where the tracks have different key densities — e.g. Project
-    some games, where scale is often just 2 keys while rotation has 21 — the
-    composition cannot be done by simple index-pairing without distorting
-    the animation. In that case we return None and let the caller fall back
-    to per-track processing, which handles arbitrary key densities correctly
-    via Blender's separate F-curve channels.
+    Only valid when the rotation, scale, and translation tracks share an
+    identical tick sequence — then index-pairing composes them correctly.
+    When the tracks have different key densities (e.g. 2 scale keys vs 21
+    rotation keys), index-pairing would distort the result, so return None
+    and let the caller fall back to per-track F-curves, which handle
+    arbitrary densities independently.
     """
     def _parse(node, expected):
         nums = node.nums()
@@ -334,19 +373,38 @@ def _collect_ftm_globals(frame_node, parent_mat=None):
     return result
 
 
-def _collect_ftm_globals_by_node(frame_node, parent_mat=None, out=None):
-    """Like _collect_ftm_globals, but keyed by the frame XNode object
-    rather than its name string.
+def _collect_ftm_globals_multi(frame_node, parent_mat=None, out=None):
+    """Like _collect_ftm_globals, but maps each frame name to the LIST of all
+    global FTMs for frames sharing that name. DirectX .x permits non-unique
+    frame names, and the plain name-keyed map keeps only the last writer — so a
+    skin bone whose name collides with an unrelated frame (e.g. HUD__1_'s two
+    'Body' frames) can be handed the wrong global, flinging its verts. This
+    multimap lets the bake disambiguate by the bone's own matrixOffset (it
+    binds to the frame whose global ~ inv(offset))."""
+    if out is None:
+        out = {}
+    if parent_mat is None:
+        parent_mat = Matrix.Identity(4)
+    ftm       = frame_node.child("FrameTransformMatrix")
+    local_mat = _mat4_from_list(ftm.nums()) if ftm else Matrix.Identity(4)
+    global_mat = parent_mat @ local_mat
+    out.setdefault(frame_node.name, []).append(global_mat)
+    for child in frame_node.children:
+        if child.kind == "Frame":
+            _collect_ftm_globals_multi(child, global_mat, out)
+    return out
 
-    The name-keyed map collapses frames that share a name into a single
-    entry (DirectX .x permits non-unique frame names, and exporters lean
-    on this: a chain of unnamed helper frames all key to ""). When that
-    happens, every colliding frame gets whichever global transform was
-    written last, so most of them are positioned wrong. Keying by node
-    identity gives each frame its own correct global FTM regardless of
-    naming, which is what the bone rest positions must be built from.
-    The name-keyed map is still returned by _collect_ftm_globals for
-    SkinWeights resolution, which is inherently name-based.
+
+def _collect_ftm_globals_by_node(frame_node, parent_mat=None, out=None):
+    """Like _collect_ftm_globals, but keyed by the frame XNode identity rather
+    than its name.
+
+    The name-keyed map collapses same-named frames into one entry (exporters
+    lean on this — a chain of unnamed helpers all key to ""), so colliding
+    frames all get whichever global was written last and end up mispositioned.
+    Keying by node identity gives each frame its own correct global FTM, which
+    is what bone rest positions must be built from. _collect_ftm_globals still
+    returns the name-keyed map for SkinWeights resolution (inherently name-based).
     """
     if out is None:
         out = {}
@@ -397,23 +455,14 @@ def _build_cross_content_search_paths(basename: str, anchor_dir: str) -> list:
     """Return candidate absolute paths for a texture that may live in a
     different subfolder than the file being imported.
 
-    some games textures are stored at full engine paths such as:
-        Content/Models/Bugs/Banana/Banana_D.dds
-
-    When the xcache is in e.g. Content/Characters/Banana/ the existing
-    four search paths don't reach the Models/ subtree.  This function
-    adds three more tiers:
-
-      1. Derive a likely subdirectory name from the texture stem by
-         stripping common material suffixes (_D, _N, _S, _AO, …) and
-         probe that named sibling folder at every ancestor level up to
-         5 hops.  This is the highest-priority hit for the standard
-         some games layout: Banana_D.dds → probe …/Banana/Banana_D.dds.
-
-      2. Scan all sibling directories at the same level as anchor_dir.
-
-      3. Walk up to find a "Content" ancestor and do a depth-2 scan of
-         every folder inside it (e.g. Content/Models/Bugs/*/Banana_D.dds).
+    Some engines store textures at full paths (e.g.
+    Content/Models/Bugs/Banana/Banana_D.dds) while the model sits elsewhere
+    (Content/Characters/Banana/), out of reach of the four standard search
+    paths. This adds three more tiers:
+      1. Strip material suffixes (_D, _N, _S, _AO, …) from the stem to guess a
+         folder name, and probe that sibling at every ancestor level (<=5 hops).
+      2. Scan all sibling directories at anchor_dir's level.
+      3. Walk up to a "Content" ancestor and depth-2 scan every folder in it.
     """
     candidates = []
     stem_full = os.path.splitext(basename)[0]   # "Banana_D"
@@ -489,8 +538,9 @@ def import_x(context, filepath,
              import_armature=True,
              import_weights=True,
              import_animation=True,
+             use_import_collection=True,
              anim_fps=0.0,
-             set_frame_range=True,
+             set_frame_range=False,
              infer_sharps=True,
              sharp_angle_deg=75.0,
              lock_root_translation=False,
@@ -520,18 +570,6 @@ def import_x(context, filepath,
     # The some editors DX8 path is independent of the standard path; standard
     # behaviour is exactly as it was before it was added.
     is_ms_dx8 = (import_type == "ms_dx8")
-
-    def _count(node, kind):
-        n = 0
-        if node.kind == kind:
-            n += 1
-        for c in node.children:
-            n += _count(c, kind)
-        return n
-    n_frames = _count(root, 'Frame')
-    n_meshes = _count(root, 'Mesh')
-    n_sw = _count(root, 'SkinWeights')
-    n_anim = _count(root, 'Animation')
 
     base_dir = os.path.dirname(filepath)
 
@@ -666,13 +704,16 @@ def import_x(context, filepath,
     # regardless of the weld checkbox.
     state._is_ms_dx8 = is_ms_dx8
 
-    # Create a collection named after the file (without extension) and link it
-    # into the active scene so all imported objects land there together rather
-    # than loose in the top-level scene collection.
-    import_col_name = os.path.splitext(os.path.basename(filepath))[0]
-    import_col = bpy.data.collections.new(import_col_name)
-    context.scene.collection.children.link(import_col)
-    state._import_collection = import_col
+    # Objects land in a collection named after the file, unless the user
+    # disabled that — in which case they go straight into the scene's master
+    # collection. _link_target is whatever new objects should be linked into.
+    if use_import_collection:
+        import_col_name = os.path.splitext(os.path.basename(filepath))[0]
+        import_col = bpy.data.collections.new(import_col_name)
+        context.scene.collection.children.link(import_col)
+        state._import_collection = import_col
+    else:
+        state._import_collection = context.scene.collection
 
     file_ticks_per_second = None
     for node in root.children:
@@ -723,21 +764,23 @@ def import_x(context, filepath,
         bind_poses = _collect_offset_matrices(root)
         ftm_globals = {}
         ftm_by_node = {}
+        ftm_globals_multi = {}
         for fn in frame_nodes:
             ftm_globals.update(_collect_ftm_globals(fn))
             _collect_ftm_globals_by_node(fn, out=ftm_by_node)
+            _collect_ftm_globals_multi(fn, out=ftm_globals_multi)
+        # Keep the per-name candidate list so the bake can disambiguate a skin
+        # bone whose name collides with an unrelated frame (last-writer in the
+        # plain name map can be the wrong frame — see HUD__1_'s two 'Body's).
+        state._ftm_globals_multi = ftm_globals_multi
 
-        # SkinWeights matrixOffset is the inverse bind pose (the mesh
-        # was authored against this), and FTM is the bone position at
-        # the first animation keyframe. For some files and some .x
-        # files these disagree; matrixOffset is the ground truth for
-        # binding, FTM drives rest-pose orientation. Bones without
-        # SkinWeights data fall back to FTM.
-        n_with_bind = len(bind_poses)
-        n_without_bind = len(ftm_globals) - n_with_bind
-
+        # SkinWeights matrixOffset is the inverse bind pose (the mesh was
+        # authored against it); FTM is the bone position at the first keyframe.
+        # When they disagree, matrixOffset is ground truth for binding and FTM
+        # drives rest orientation. Bones with no SkinWeights fall back to FTM.
         state.build_armature(frame_nodes, context, bind_poses, ftm_globals,
                              conv_mat, ftm_by_node=ftm_by_node)
+
 
         # Stash passthrough text on the armature so the exporter can
         # re-emit templates and auxiliary frames verbatim on round-trip.
@@ -1016,21 +1059,17 @@ def _apply_custom_normals(me, loop_normals):
     # or the viewport rebuilds the mesh. Replace anything suspect
     # with (0, 0, 1) — geometry will still shade reasonably.
     safe_normals = []
-    n_bad = 0
     for n in loop_normals:
         if n is None or len(n) != 3:
             safe_normals.append((0.0, 0.0, 1.0))
-            n_bad += 1
             continue
         nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
         if not (math.isfinite(nx) and math.isfinite(ny) and math.isfinite(nz)):
             safe_normals.append((0.0, 0.0, 1.0))
-            n_bad += 1
             continue
         mag = (nx*nx + ny*ny + nz*nz) ** 0.5
         if mag < 1e-6:
             safe_normals.append((0.0, 0.0, 1.0))
-            n_bad += 1
             continue
         # Always renormalise — even mostly-unit normals can drift to
         # 0.9999 or 1.0001, and the C solver is strict.
@@ -1123,6 +1162,16 @@ class _ImportState:
         self._ftm_globals:       dict   = {}
         self._refbake_done:  bool   = False
         self._global_parent_map: dict   = {}
+        # Frame-node ancestry by identity (id(child frame) -> parent frame
+        # node), populated by import_frame_meshes as it walks. Used to
+        # resolve the nearest ANCESTOR bone for rigid-parenting unskinned
+        # meshes whose immediate container frame never became a bone
+        # (e.g. an unnamed mesh-holder under a named, animated frame).
+        self._frame_parent_node: dict   = {}
+        # Unskinned mesh objects whose container frame never became a bone,
+        # awaiting exact object-level animation from the composed DX frame
+        # chain (see _apply_object_chain_anim). (obj, frame_node) pairs.
+        self._pending_rigid_object_anim: list = []
         # Data for repairing matrix-key animation on bones inside a scaled
         # subtree (e.g. Colonel-X_L's facial bones under Head_bone's 0.107
         # scale, which Blender's scale-free edit-bones cannot represent).
@@ -1131,6 +1180,22 @@ class _ImportState:
         self._scaled_subtree_info: dict = {}
         self._has_scaled_subtree:  bool = False
         self._scaled_dx_by_frame:  dict = {}
+        # Micro-scale blend/morph joints (e.g. Banana/Cake eyelid *Lid* Aux):
+        # their rest FTM carries an extreme shrink (~0.001) that is the closed
+        # morph state, with a scale track animating 0.001<->1.0 to blink. Baking
+        # at the literal 0.001 rest (while Blender's edit bone is unit-scale)
+        # collapses the lid and, through the scaled-subtree correction, flung
+        # body-falloff verts ~127u on Banana. Fix: bake these at unit scale
+        # (scale stripped from the FTM) and keep them OUT of
+        # _scaled_subtree_info so they take the plain path; the scale track is
+        # left untouched so the blink still works. Distinct from real scaled
+        # joints (candle 0.62, chain 2.35), which carry a legitimate inherited
+        # scale and still need the correction.
+        self._micro_joints: set = set()
+        # Per micro joint: the PARENT chain's uniform rest scale, used by the
+        # bake to keep that scale (so a scaled-subtree parent's animation lands
+        # the joint correctly). 1.0 (the default) reduces to a plain strip.
+        self._micro_bake_uscale: dict = {}
         # Pre→post weld vertex map, set per mesh by the weld path so the
         # FRAME_TRANSFORM rebind can remap influence indices. None = identity.
         self._last_pre_to_post = None
@@ -1148,11 +1213,10 @@ class _ImportState:
         # material with this name (e.g. via a REF resolution earlier
         # in the same file), reuse it. We deliberately DON'T check
         # bpy.data.materials.get(name) here — that would reuse a
-        # material from a PREVIOUS bulk-import iteration. common tools-exported
-        # .x files all tend to name their materials "blinn1", "lambert1"
-        # etc., so cross-file name collisions are the norm rather than
-        # the exception. Reusing them would mean every file after the
-        # first inherits the first file's textures.
+        # material from a PREVIOUS bulk-import iteration. Many .x files
+        # name their materials generically ("blinn1", "lambert1"), so
+        # cross-file name collisions are the norm; reusing them would
+        # mean every file after the first inherits the first's textures.
         existing = self.materials.get(name)
         if existing:
             return existing
@@ -1190,7 +1254,8 @@ class _ImportState:
             mat["_x_face_color"] = (r, g, b, a)
         if len(nums) >= 5:
             shininess = nums[4]
-            # The .x format pre-dates PBR.  Most exporters (Blender's old
+            # The .x format pre-dates PBR; map specular power to roughness on a
+            # log curve and clamp to a floor so old assets don't read as mirrors.
             raw_roughness = max(0.0, min(1.0,
                 1.0 - math.log(max(shininess, 1e-6)) / math.log(128.0)))
             ROUGHNESS_FLOOR = 0.5
@@ -1200,7 +1265,7 @@ class _ImportState:
         if len(nums) >= 8:
             sr, sg, sb = nums[5], nums[6], nums[7]
             spec_val   = (sr + sg + sb) / 3.0
-            # Same rationale as above — the raw spec value in .x files is
+            # Raw .x specular tends to run hot for a PBR workflow; cap it low.
             spec_val = min(spec_val, 0.2)
             spec_input = (bsdf.inputs.get("Specular IOR Level")
                           or bsdf.inputs.get("Specular"))
@@ -1343,7 +1408,8 @@ class _ImportState:
             if img is not None:
                 tex_img_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
                 tex_img_node.image = img
-                # Stash the original (engine-format) path on the
+                # Stash the original (engine-format) path on the node so the
+                # exporter can round-trip it.
                 tex_img_node["_x_texture_filename"] = original_tex_name
                 try:
                     mat.node_tree.links.new(
@@ -1399,12 +1465,10 @@ class _ImportState:
         self._bone_name_for_node = {}     # id(frame_node) -> real bone name
         self._real_bone_for_skinname = {} # SkinWeights name -> real bone name
 
-        # Rest pose is ALWAYS the FrameTransformMatrix hierarchy, which
-        # is what some exporters uses for its viewport (confirmed against its
         # Rest pose is always the FrameTransformMatrix hierarchy. The mesh is
         # rebound from its authored bind pose into that rest; the per-mesh bake
-        # (_bake_ref_rest) is the primary path, and this name->matrix
-        # rebind is retained as the fallback used only if a bake fails.
+        # (_bake_ref_rest) is the primary path, and this name->matrix rebind is
+        # retained as the fallback used only if a bake fails.
         self._bone_rebind = {}
 
         # Identify which top-level frames root the skeleton.
@@ -1430,6 +1494,18 @@ class _ImportState:
             if (not any(c.kind == "Mesh" for c in f.children))
             or any(c.kind == "Frame" for c in f.children)
         ]
+
+        # Fallback: if NOTHING qualified as a skeleton root, the file has no
+        # bone hierarchy at all — its entire content is bare mesh-wrapper
+        # frames (Frame{FTM; Mesh}, e.g. a static prop). Rather than build an
+        # empty armature and leave the meshes unparented, promote those wrapper
+        # frames to root bones so each .x Frame becomes a node and its mesh
+        # parents to it, mirroring the file's structure 1:1. Only triggers when
+        # there would otherwise be zero bones, so files with a real skeleton
+        # are unaffected. (A file that is purely N wrappers yields N root bones,
+        # one per frame — faithful to the file, just one bone each.)
+        if not skel_roots:
+            skel_roots = list(frame_nodes)
 
         # Skeleton-root membership is tested by node identity, not name.
         # The old name-set collapsed every unnamed root to a single ""
@@ -1490,9 +1566,6 @@ class _ImportState:
         context.view_layer.objects.active = arm_obj
         bpy.ops.object.mode_set(mode="EDIT")
 
-        bone_count     = [0]
-        fallback_count = [0]
-
         def add_bone(frame_node, parent_edit_bone):
             # Skip inert unnamed helper/locator frames so they don't
             # show up as spurious 'Bone.NNN' clutter. They have no
@@ -1522,8 +1595,6 @@ class _ImportState:
             if ftm_glob_node is None:
                 ftm_glob_node = ftm_globals.get(name)
 
-            # Rest = frame-hierarchy world (FTM). Fall back to the
-            # inverse-bind only for a skinned bone with no FTM of its own.
             # Rest = frame-hierarchy world (FTM). Blender edit-bones cannot
             # store scale, so a scaled subtree (Colonel-X_L's face under
             # Head_bone's 0.107) lands at its SCALED position with scale
@@ -1536,7 +1607,6 @@ class _ImportState:
                 rest_mat = conv_mat @ ftm_glob_node
             elif name in bind_poses:
                 rest_mat = conv_mat @ bind_poses[name]
-                fallback_count[0] += 1
             else:
                 rest_mat = Matrix.Identity(4)
 
@@ -1560,13 +1630,51 @@ class _ImportState:
             _named = bool(name) and name.strip() != ""
             try:
                 _wscale = rest_mat.to_scale()
-                _is_scaled = _named and any(abs(c - 1.0) > 1e-3 for c in _wscale)
+                _is_micro = _named and any(c < MICRO_SCALE_THRESH
+                                           for c in _wscale)
+                _is_scaled = (_named and not _is_micro
+                              and any(abs(c - 1.0) > 1e-3 for c in _wscale))
             except Exception:
+                _is_micro = False
                 _is_scaled = False
             _par_scaled = (_named
                            and parent_name is not None
                            and parent_name in self._scaled_subtree_info)
-            if _named and (_is_scaled or _par_scaled):
+            if _is_micro and not _par_scaled:
+                # Scale-driven blend/morph joint (0.001 eyelid Aux) whose parent
+                # chain is UNIT scale. Treat as rigid at unit scale: the bake
+                # strips its OWN scale (un-collapsing the eyelid to its spread/
+                # open state). Kept OUT of _scaled_subtree_info so the
+                # scale-reintroduction correction never reaches it. Its weights
+                # are untouched. (A micro joint UNDER a scaled subtree is handled
+                # by the scaled branch below instead — see there.)
+                self._micro_joints.add(name)
+                # Fallback only: if the parent carries scale but was NOT
+                # registered as a scaled subtree (e.g. an unnamed helper), keep
+                # that parent scale in the bake so the joint isn't decoupled and
+                # blown up. For a genuine unit parent this is 1.0 (a plain strip).
+                _pu = 1.0
+                if parent_name is not None:
+                    _pg = ftm_globals.get(parent_name)
+                    if _pg is not None:
+                        try:
+                            _ps = _pg.to_scale()
+                            _pu = (abs(_ps[0]) + abs(_ps[1]) + abs(_ps[2])) / 3.0
+                        except Exception:
+                            _pu = 1.0
+                if _pu <= 1e-9:
+                    _pu = 1.0
+                self._micro_bake_uscale[name] = _pu
+            elif _named and (_is_scaled or _par_scaled or _is_micro):
+                # Scaled subtree — INCLUDING a micro joint whose parent is itself
+                # a scaled subtree (e.g. the Popcorn eyelid Aux joints under the
+                # character-reveal head, which scales 0.125 -> unit at the blink).
+                # Such a micro joint must be driven by its TRUE per-frame chain
+                # world (target pose), exactly like its scaled parent/head, not
+                # strip-baked rigid: stripping decouples it from the reveal and
+                # the inherited parent scale flings it off (8x, far from the eye).
+                # Its full animated chain multiplies out to unit-on-face at the
+                # active frame, which the scaled correction reproduces.
                 # Parent's TRUE (scaled) rest world, needed at the subtree
                 # boundary (e.g. Head_bone's parent Bip01_Head, outside the
                 # scaled set). Pulled from FTM globals.
@@ -1655,8 +1763,6 @@ class _ImportState:
             if parent_edit_bone:
                 eb.parent = parent_edit_bone
 
-            bone_count[0] += 1
-
             for child in frame_node.children:
                 if child.kind == "Frame":
                     add_bone(child, eb)
@@ -1683,6 +1789,9 @@ class _ImportState:
                 except Exception:
                     pass
             elif child.kind == "Frame":
+                # Record ancestry so _build_mesh can walk UP to the
+                # nearest frame that became a bone (rigid-parenting).
+                self._frame_parent_node[id(child)] = frame_node
                 self.import_frame_meshes(child, context, world_mat)
 
     def _bake_ref_rest(self, mesh_node, verts):
@@ -1765,6 +1874,38 @@ class _ImportState:
                     O_dx = inv_bind.inverted()  # = O_source (the authored offset)
                 except ValueError:
                     continue
+            # Disambiguate duplicate frame names. DirectX .x allows several
+            # frames to share a name, and the name-keyed FTM map keeps only the
+            # last writer — which may be an unrelated frame, not the skin bone.
+            # HUD__1_ has two 'Body' frames: the real skin bone deep in the
+            # finger chain (global ~ inv(offset), so its bake net is identity)
+            # and a shallow decoy under the root; the decoy won the name map and
+            # gave Body a bogus 134u net that flung all 676 of its verts into a
+            # flat sail. When the name is ambiguous, pick the candidate whose
+            # global best matches this bone's own bind (inv(offset)) — the frame
+            # the skin is actually bound to. Single-name bones are untouched.
+            _cands = getattr(self, "_ftm_globals_multi", {}).get(bn)
+            if _cands and len(_cands) > 1:
+                try:
+                    _it = O_dx.inverted().translation
+                    W_dx = min(_cands,
+                               key=lambda g: (g.translation - _it).length)
+                except Exception:
+                    pass
+            # Micro-scale blend joint (eyelid Aux). Strip its OWN ~0.001 scale so
+            # the weighted verts un-collapse from the joint pivot to their spread
+            # rest, but renormalize to the PARENT chain's rest scale rather than
+            # to unit. If the parent is a scaled subtree that animates (e.g. a
+            # character whose root reveals from 0.125 up to unit), that parent
+            # animation multiplies this joint at runtime; baking at
+            # (spread x parent_rest) makes it land at authored size when revealed
+            # — matching the non-micro head under the same parent — instead of an
+            # 8x blow-up. Unit-scale parent => target 1.0 => a plain strip.
+            # Verified against measured pose scales: lid bbox at the blink
+            # 6.35 -> 0.78 (authored), hidden when the blend is inactive.
+            if bn in getattr(self, "_micro_joints", ()):
+                _pu = getattr(self, "_micro_bake_uscale", {}).get(bn, 1.0)
+                W_dx = _strip_scale_mat(W_dx, _pu)
             Wb = to_blender(W_dx)
             Ob = to_blender(O_dx)
             if Wb is None or Ob is None:
@@ -1884,8 +2025,6 @@ class _ImportState:
             for vi in face:
                 if vi > _max_face_idx:
                     _max_face_idx = vi
-        _recon_start = n_verts_total
-        _n_reconstructed = 0
         # Map each missing index -> list of valid co-face vertex indices.
         self._recon_src_vert = {}   # new vi -> a valid source vi (for UV/normal copy)
         if _max_face_idx >= n_verts_total:
@@ -1919,52 +2058,28 @@ class _ImportState:
                         cx = cy = cz = 0.0
                     self._recon_src_vert[new_vi] = 0 if verts else None
                 verts.append((cx, cy, cz))
-                _n_reconstructed += 1
             n_verts_total = len(verts)
-            if _n_reconstructed:
-                import warnings as _w
-                _w.warn(
-                    f"{name_hint}: the source .x file references "
-                    f"{_n_reconstructed} vertex(es) it never defined "
-                    f"(declared {_recon_start}, faces use up to "
-                    f"{_max_face_idx}). Reconstructed them from neighbouring "
-                    f"geometry so all faces import without holes."
-                )
 
         _kept_face_src_idx = []      # post-filter idx -> source face idx
         _filtered_faces = []
-        n_degen_dropped = 0
-        n_oob_dropped = 0
         for fsi, face in enumerate(faces):
             if len(face) < 3:
-                n_degen_dropped += 1
                 continue
             if len(set(face)) < 3:
                 # Duplicate index within face — e.g. [0,0,0], [2,0,0].
                 # Not a valid polygon.
-                n_degen_dropped += 1
                 continue
             # Out-of-range vertex index. Some real exports contain these
             # (e.g. a source mesh with 19 faces referencing verts
             # past the end of the vertex array) — passing them to
             # from_pydata corrupts the mesh or errors out, and the later
             # custom-normals C call can segfault on the broken loops. Drop
-            # the offending faces and warn rather than failing the import.
+            # the offending faces rather than failing the import.
             if any(vi < 0 or vi >= n_verts_total for vi in face):
-                n_oob_dropped += 1
                 continue
             _filtered_faces.append(face)
             _kept_face_src_idx.append(fsi)
         faces = _filtered_faces
-
-        if n_oob_dropped:
-            import warnings as _w
-            _w.warn(
-                f"{name_hint}: dropped {n_oob_dropped} face(s) with "
-                f"out-of-range vertex indices (mesh has {n_verts_total} "
-                f"vertices). The source .x file is malformed; the rest of "
-                f"the mesh was imported normally."
-            )
 
         me  = bpy.data.meshes.new(name_hint)
         obj = bpy.data.objects.new(name_hint, me)
@@ -2102,10 +2217,10 @@ class _ImportState:
                             list(face_norm_indices[k])
                             + [0] * (len(face) - len(face_norm_indices[k])))
 
-                # Per-pre-vi normal lookup: average all the corner
-                # normals that referenced this pre-vi. (For most verts
-                # the corner normals are identical anyway; this just
-                # picks something reasonable when they differ.)
+                # Per-pre-vi normal lookup: take the FIRST corner normal that
+                # referenced each pre-vi (setdefault). For most verts the
+                # corner normals are identical anyway; this just picks a
+                # representative when they differ.
                 pre_vi_normal: dict = {}
                 for face_idx, face in enumerate(faces):
                     for corner_idx, pre_vi in enumerate(face):
@@ -2254,14 +2369,14 @@ class _ImportState:
                         poly.material_index = face_mat_indices[i]
 
         # Only take the skinned path when the mesh actually carries
-        # SkinWeights. A mesh with none — e.g. the rigid mesh-per-bone
-        # pieces of a some editors/JT export like burger.x — must fall to
-        # the rigid-placement branch below, which positions it at its
-        # frame's world transform and bone-parents it. Without the
-        # SkinWeights check, building an armature (which now happens for
-        # burger.x) diverted these meshes here, left them at the origin
-        # with fallback weights, and bypassed the placement entirely.
-        if self.import_weights and self.armature_obj and mesh_node.children_of("SkinWeights"):
+        # SkinWeights. A mesh with none must fall to the rigid-placement
+        # branch below, which positions it at its frame's world transform
+        # and bone-parents it (when an armature exists). Weights are kept
+        # whenever they are present and Import Weights is on, even if no
+        # armature is being built — the vertex groups are created on the
+        # mesh regardless, and the armature parenting/modifier is added
+        # only when an armature object exists.
+        if self.import_weights and mesh_node.children_of("SkinWeights"):
             sw_nodes = mesh_node.children_of("SkinWeights")
 
             pre_weld_skin = []
@@ -2299,13 +2414,16 @@ class _ImportState:
                         continue
                 indices = [int(sw_nums[1 + i])             for i in range(influence_count)]
                 weights = [sw_nums[1 + influence_count + i] for i in range(influence_count)]
+
                 pre_weld_skin.append((bone_name, list(zip(indices, weights))))
 
+
             obj.matrix_world  = Matrix.Identity(4)
-            obj.parent        = self.armature_obj
-            arm_mod           = obj.modifiers.new("Armature", "ARMATURE")
-            arm_mod.object    = self.armature_obj
-            arm_mod.use_vertex_groups = True
+            if self.armature_obj is not None:
+                obj.parent        = self.armature_obj
+                arm_mod           = obj.modifiers.new("Armature", "ARMATURE")
+                arm_mod.object    = self.armature_obj
+                arm_mod.use_vertex_groups = True
 
             do_weld = getattr(self, "weld_duplicate_verts", False)
 
@@ -2315,12 +2433,12 @@ class _ImportState:
                 do_weld = False
 
             if do_weld:
-                # Optional: weld duplicate-position verts so bone-deformation
-                # boundaries don't visibly separate when animated (the xcache
-                # stores UV/normal seams + skin-set boundaries as separate
-                # verts at the same XYZ). OFF by default — only matters when
-                # animating, and weld blends weights that approximate skin
-                # boundaries rather than preserving the file's exact authoring.
+                # Weld duplicate-position verts so bone-deformation boundaries
+                # don't visibly separate when animated, and so per-loop normals
+                # have shared vertices to smooth across (the .x format stores
+                # UV/normal seams + skin-set boundaries as separate verts at the
+                # same XYZ). ON by default; turn off to keep the file's exact
+                # vertex authoring for bit-comparable round trips.
                 self._weld_and_assign_skin(
                     obj, me, pre_weld_skin, _source_positions,
                     _pending_per_vi_normal, _pending_loop_normals)
@@ -2518,7 +2636,6 @@ class _ImportState:
 
         else:
 
-            # No skin weights on this mesh. Two cases:
             # No skin weights on this mesh.
             #
             # IMPORTANT regression note: historically this branch set
@@ -2613,6 +2730,43 @@ class _ImportState:
                     and getattr(self, "rigid_parent_unskinned", True)):
                 rigid_bone = self._bone_name_for_node.get(id(parent_frame))
 
+                # Bone-parenting composes through the POSE chain. The
+                # scaled-bone correction re-bases poses so pose @ rest^-1
+                # equals the skinned delta — right for LBS verts, wrong
+                # for a rigidly parented object whenever the chain carries
+                # non-unit rest scale. NOTE: mesh-container frames DO
+                # become bones (unnamed ones land as 'Bone'), so the
+                # container almost always resolves here — the decision
+                # cannot key on rigid_bone being None alone. HUD: the
+                # crowbar's container became 'Bone' under the 0.169x EAI
+                # chain and rode the pose chain to the wrong place. Route
+                # any mesh on a scale-carrying chain to exact object-level
+                # chain F-curves instead (import_animation_set); chains
+                # with unit rest scale keep bone-parenting unchanged.
+                _chain_scaled = False
+                _g = self._ftm_by_node.get(id(parent_frame))
+                if _g is not None:
+                    try:
+                        _chain_scaled = any(abs(c - 1.0) > 1e-3
+                                            for c in _g.to_scale())
+                    except Exception:
+                        _chain_scaled = False
+                if not _chain_scaled:
+                    _pm = getattr(self, "_frame_parent_node", {})
+                    _n = parent_frame
+                    _hops = 0
+                    while _n is not None and _hops < 200:
+                        if _n.name and _n.name in self._scaled_subtree_info:
+                            _chain_scaled = True
+                            break
+                        _n = _pm.get(id(_n))
+                        _hops += 1
+
+                if rigid_bone is None or _chain_scaled:
+                    self._pending_rigid_object_anim.append(
+                        (obj, parent_frame))
+                    rigid_bone = None
+
             if rigid_bone is not None:
                 bone = self.armature_obj.pose.bones.get(rigid_bone)
                 if bone is not None:
@@ -2639,7 +2793,24 @@ class _ImportState:
             elif _pending_loop_normals is not None:
                 _apply_custom_normals(obj.data, _pending_loop_normals)
                 if self.infer_sharps:
-                    self._infer_sharps_from_normal_list(obj.data, _pending_loop_normals)
+                    # If the mesh is mostly disconnected (split-vertex authoring
+                    # where each face carries its own verts), auto-smooth has no
+                    # shared vertices to average across and would flat-shade every
+                    # face — the "blocky" symptom on static props like BalloonLow.
+                    # Keep the authored per-loop normals as the shading source in
+                    # that case (they match across the split seams, so the surface
+                    # reads smooth); for a connected mesh, clear and auto-smooth
+                    # as usual.
+                    _me_u = obj.data
+                    _ef: dict = {}
+                    for _poly in _me_u.polygons:
+                        for _ek in _poly.edge_keys:
+                            _ef[_ek] = _ef.get(_ek, 0) + 1
+                    _disconnected = bool(_ef) and (
+                        sum(1 for _c in _ef.values() if _c == 1) > len(_ef) * 0.5)
+                    self._infer_sharps_from_normal_list(
+                        _me_u, _pending_loop_normals,
+                        clear_normals=not _disconnected)
 
     def _assign_skin_no_weld(self, obj, pre_weld_skin):
         """Default path: assign skin weights per-vert, no welding.
@@ -2788,8 +2959,6 @@ class _ImportState:
         # can safely copy weights from the geometrically-nearest
         # weighted vertex without side restrictions.
         per_bone_fallback: dict = {}
-        n_exact = 0
-        n_nearest = 0
 
         for vi in unweighted:
             p = positions[vi]
@@ -2797,12 +2966,10 @@ class _ImportState:
             cands = pos_buckets.get(k)
             if cands:
                 src_vi = cands[0]
-                n_exact += 1
             elif _kd is not None:
                 # Nearest weighted vert via KD-tree
                 _co, _local_idx, _dist = _kd.find((p[0], p[1], p[2]))
                 src_vi = weighted[_local_idx]
-                n_nearest += 1
             else:
                 # KD-tree unavailable; brute-force fallback
                 best_vi = weighted[0]
@@ -2816,7 +2983,6 @@ class _ImportState:
                         best_d2 = d2
                         best_vi = wvi
                 src_vi = best_vi
-                n_nearest += 1
             # Copy weights from src_vi
             src_vert = obj.data.vertices[src_vi]
             for g in src_vert.groups:
@@ -2856,7 +3022,6 @@ class _ImportState:
                     else:
                         vi_to_accum[vi] = contrib
                     vi_to_wsum[vi] = vi_to_wsum.get(vi, 0.0) + w
-            n_rebound = 0
             for vi, accum in vi_to_accum.items():
                 ws = vi_to_wsum[vi]
                 if ws <= 0:
@@ -2867,7 +3032,6 @@ class _ImportState:
                 obj.data.vertices[vi].co = Vector((v_new.x / ws,
                                                     v_new.y / ws,
                                                     v_new.z / ws))
-                n_rebound += 1
 
     def _pick_fallback_root_bone(self, obj):
         """Return a bone name to use as the catch-all for unweighted
@@ -2927,6 +3091,43 @@ class _ImportState:
                    vi_weight_sig[vi])
             key_to_vis.setdefault(key, []).append(vi)
 
+        # Split each position+weight group by normal direction so verts whose
+        # normals point into (nearly) OPPOSITE hemispheres are NOT merged. A
+        # coincident double-sided sheet (e.g. a flag) authors its front and
+        # back faces at the SAME positions with the SAME weights but opposite
+        # (~180°) normals. Position+weight alone fuses them, collapsing front
+        # onto back into coincident, oppositely-wound faces — non-manifold
+        # geometry that Z-fights and facets under animation ("blocky") and
+        # makes edge-sharpness meaningless. Only near-opposite normals split
+        # (dot < -0.5, i.e. >120° apart); smooth UV/normal seams, which differ
+        # by far less, still merge exactly as before, so single-sided meshes
+        # are unaffected. Greedy one-pass clustering: a vert joins an existing
+        # cluster if its normal is within 120° of that cluster's first normal.
+        if pending_per_vi_normal:
+            MERGE_DOT = -0.5
+            refined: dict = {}
+            for base_key, vis in key_to_vis.items():
+                clusters = []   # [ [rep_normal_or_None, [vi, ...]], ... ]
+                for vi in vis:
+                    n = pending_per_vi_normal.get(vi)
+                    placed = False
+                    for cl in clusters:
+                        rep = cl[0]
+                        if rep is None and n is None:
+                            cl[1].append(vi); placed = True; break
+                        if rep is not None and n is not None and (
+                                rep[0] * n[0] + rep[1] * n[1]
+                                + rep[2] * n[2]) > MERGE_DOT:
+                            cl[1].append(vi); placed = True; break
+                    if not placed:
+                        clusters.append([n, [vi]])
+                if len(clusters) == 1:
+                    refined[base_key] = clusters[0][1]
+                else:
+                    for ci, cl in enumerate(clusters):
+                        refined[base_key + (ci,)] = cl[1]
+            key_to_vis = refined
+
         # Build pre_to_post mapping
         keeper_pre_vis = sorted(min(vs) for vs in key_to_vis.values())
         keep_to_post = {keep: i for i, keep in enumerate(keeper_pre_vis)}
@@ -2936,7 +3137,6 @@ class _ImportState:
             for vi in vs:
                 pre_to_keep[vi] = keep
         pre_to_post = {vi: keep_to_post[pre_to_keep[vi]] for vi in range(_pre_count)}
-        _post_count = len(keeper_pre_vis)
 
         # Apply weld via bmesh
         _bm = _bmesh.new()
@@ -3075,45 +3275,18 @@ class _ImportState:
         # from their nearest weighted neighbor.
         self._assign_fallback_weights(obj)
 
-        # Rebuild post-weld custom normals by averaging across
-        # collapsed pre-verts. Uses the corrected pre_to_post built
-        # from actual post-weld mesh positions (above).
-        if pending_per_vi_normal is not None:
-            post_vi_normals: dict = {}
-            for pre_vi, post_vi in pre_to_post.items():
-                n = pending_per_vi_normal.get(pre_vi)
-                if n is None:
-                    continue
-                post_vi_normals.setdefault(post_vi, []).append(n)
-            post_vi_to_normal: dict = {}
-            for post_vi, ns in post_vi_normals.items():
-                if len(ns) == 1:
-                    post_vi_to_normal[post_vi] = ns[0]
-                    continue
-                sx = sum(n[0] for n in ns)
-                sy = sum(n[1] for n in ns)
-                sz = sum(n[2] for n in ns)
-                mag = (sx*sx + sy*sy + sz*sz) ** 0.5
-                if mag > 1e-9:
-                    post_vi_to_normal[post_vi] = (sx/mag, sy/mag, sz/mag)
-                else:
-                    post_vi_to_normal[post_vi] = ns[0]
-            post_loop_normals = []
-            for poly in obj.data.polygons:
-                for loop_idx in poly.loop_indices:
-                    post_vi = obj.data.loops[loop_idx].vertex_index
-                    n = post_vi_to_normal.get(post_vi)
-                    post_loop_normals.append(n if n is not None else (0.0, 0.0, 1.0))
-            _apply_custom_normals(obj.data, post_loop_normals)
-            if self.infer_sharps:
-                self._infer_sharps_from_normal_list(obj.data, post_loop_normals)
-        elif pending_loop_normals is not None:
-            # Fallback: file had no MeshNormals, only DeclData
+        # Custom normals + sharp edges for the welded mesh are applied by the
+        # post-weld shading block in _build_mesh, which rebuilds per-loop
+        # normals from the per-pre-vertex table and runs sharp inference once.
+        # The only case it does NOT cover is a file with DeclData-only normals
+        # (no MeshNormals, hence no per-vi table) on the weld path — handle
+        # that here so those meshes still get their authored shading.
+        if pending_per_vi_normal is None and pending_loop_normals is not None:
             _apply_custom_normals(obj.data, pending_loop_normals)
             if self.infer_sharps:
                 self._infer_sharps_from_normal_list(obj.data, pending_loop_normals)
 
-    def _infer_sharps_from_normal_list(self, me, loop_normals):
+    def _infer_sharps_from_normal_list(self, me, loop_normals, clear_normals=True):
         threshold_cos = math.cos(math.radians(self.sharp_angle_deg))
 
         if hasattr(me, "calc_normals"):
@@ -3128,7 +3301,6 @@ class _ImportState:
                 ei = me.loops[li].edge_index
                 edge_to_polys.setdefault(ei, []).append(poly.index)
 
-        sharp_count = 0
         for edge in me.edges:
             polys = edge_to_polys.get(edge.index, [])
             if len(polys) != 2:
@@ -3138,15 +3310,19 @@ class _ImportState:
             cos_a = max(-1.0, min(1.0, n0.dot(n1)))
             if cos_a < threshold_cos:
                 edge.use_edge_sharp = True
-                sharp_count += 1
 
-        # Drop file-authored loop normals so Blender smooth-shades across
-        # faces, breaking only at the sharp edges we just marked.
-        _clear_custom_split_normals(me)
         for poly in me.polygons:
             poly.use_smooth = True
         if hasattr(me, "use_auto_smooth"):
             me.use_auto_smooth = True
+        # By default, drop the file-authored loop normals so Blender smooth-
+        # shades across faces, breaking only at the sharp edges marked above.
+        # That assumes a connected mesh; callers working on disconnected
+        # (split-vertex) geometry pass clear_normals=False to KEEP the authored
+        # normals as the shading source, since auto-smooth has no shared
+        # vertices to average across there and would flat-shade every face.
+        if clear_normals:
+            _clear_custom_split_normals(me)
         me.update()
 
     def _build_scaled_target_poses(self, anim_set_node):
@@ -3169,11 +3345,17 @@ class _ImportState:
         scaled = getattr(self, "_scaled_subtree_info", {})
         if not scaled:
             return
+        conv_inv = conv.inverted()   # constant; reused throughout this method
 
         # Collect raw animated local matrices per bone from the AnimationSet.
-        # Only matrix keys (type 3/4) carry a full local transform; TRS-animated
-        # bones are uncommon in this chain, and if present we fall back to their
-        # static rest local (captured below).
+        # Matrix keys (type 3/4) are read directly. TRS-keyed files
+        # (rotation/scale/position tracks, types 0/1/2 — e.g. Cake.x, whose
+        # candle and eyelid Aux joints animate by SCALE) are composed into
+        # matrix keys with the validated composers; previously these were
+        # skipped entirely, so every scaled bone fell back to its static
+        # rest local and the whole scaled set imported FROZEN (the left
+        # candle never squashed while the unit-rest right candle animated
+        # fine on the standard path).
         anim_local = {}   # bone -> {frame_key: Matrix (DX local)}
         for anim_node in anim_set_node.children_of("Animation"):
             ref = anim_node.child("REF")
@@ -3182,26 +3364,40 @@ class _ImportState:
             bn = next((v for t, v in ref.values if t in ("WORD", "STR")), None)
             if not bn:
                 continue
-            for kn in anim_node.children_of("AnimationKey"):
-                nums = kn.nums()
-                if len(nums) < 2:
-                    continue
-                kt = int(nums[0])
-                if kt not in (3, 4):
-                    continue
-                nk = int(nums[1])
-                i = 2
-                fk_map = anim_local.setdefault(bn, {})
-                cnt = 0
-                while i + 1 < len(nums) and cnt < nk:
-                    ftick = nums[i]; i += 1
-                    i += 1  # skip nvals
-                    if i + 16 > len(nums):
-                        break
-                    M = _mat4_from_list(nums[i:i + 16])
-                    i += 16
-                    fk_map[round(float(ftick) * self.tick_scale)] = M
-                    cnt += 1
+            key_nodes = anim_node.children_of("AnimationKey")
+            mat_node = next((k for k in key_nodes
+                             if k.nums() and int(k.nums()[0]) in (3, 4)),
+                            None)
+            if mat_node is None:
+                by_type = {}
+                for k in key_nodes:
+                    knums = k.nums()
+                    if knums:
+                        by_type.setdefault(int(knums[0]), k)
+                if all(t in by_type for t in (0, 1, 2)):
+                    mat_node = _compose_type4_from_trs(
+                        by_type[0], by_type[1], by_type[2])
+                    if mat_node is None:
+                        mat_node = _compose_type4_from_trs_resampled(
+                            by_type[0], by_type[1], by_type[2])
+            if mat_node is None:
+                continue
+            nums = mat_node.nums()
+            if len(nums) < 2:
+                continue
+            nk = int(nums[1])
+            i = 2
+            fk_map = anim_local.setdefault(bn, {})
+            cnt = 0
+            while i + 1 < len(nums) and cnt < nk:
+                ftick = nums[i]; i += 1
+                i += 1  # skip nvals
+                if i + 16 > len(nums):
+                    break
+                M = _mat4_from_list(nums[i:i + 16])
+                i += 16
+                fk_map[round(float(ftick) * self.tick_scale)] = M
+                cnt += 1
 
         # DX rest locals & parent map from the frame hierarchy. We reconstruct
         # them from the stored Blender-space rest worlds W (= conv @ W_dx):
@@ -3211,7 +3407,7 @@ class _ImportState:
         def W_dx_of(bone):
             info = scaled.get(bone)
             if info and info.get("W") is not None:
-                return conv.inverted() @ info["W"]
+                return conv_inv @ info["W"]
             return None
 
         def parentname(bone):
@@ -3224,9 +3420,9 @@ class _ImportState:
                 return None
             pn = info.get("par")
             if pn in scaled and scaled[pn].get("W") is not None:
-                return conv.inverted() @ scaled[pn]["W"]
+                return conv_inv @ scaled[pn]["W"]
             if info.get("par_W") is not None:
-                return conv.inverted() @ info["par_W"]
+                return conv_inv @ info["par_W"]
             return None
 
         # rest DX local per scaled bone
@@ -3324,7 +3520,7 @@ class _ImportState:
                     ml = actual_rest.get(bn)
                     if ml is None:
                         ml = strip_scale(scaled[bn]["W"])
-                    target = (conv @ delta @ conv.inverted()) @ ml
+                    target = (conv @ delta @ conv_inv) @ ml
                     frame_entry[bn] = target
                 except (ValueError, ZeroDivisionError):
                     continue
@@ -3427,8 +3623,22 @@ class _ImportState:
             return None
         try:
             pb = arm.pose.bones.get(bone_name)
-            if pb is None or pb.parent is None:
+            if pb is None:
                 return None
+            if pb.parent is None:
+                # Scaled ROOT bone (e.g. the 20 chainlink-bone* top-level
+                # frames whose rest world AND matrix keys both carry a
+                # uniform 2.35 scale). For a parentless pose bone Blender
+                # composes pose_world = matrix_local @ matrix_basis, so
+                # emitting basis = matrix_local^-1 @ target lands the bone
+                # exactly on its cached target (delta @ strip(rest)),
+                # making the LBS deform = delta — the dropped rest scale
+                # cancels. Previously this returned None and the standard
+                # parentless path ran (pose_world = conv @ dx_local, scale
+                # included, against a scale-stripped rest), so every posed
+                # frame re-applied the dropped rest scale to the mesh: the
+                # chain rendered 2.35x too large around each link.
+                return pb.bone.matrix_local.inverted() @ target
             par_name = info.get("par")
             # Parent's target pose: another scaled bone's cached target, or the
             # boundary parent's scale-free rest world (strip of its Blender W).
@@ -3769,4 +3979,199 @@ class _ImportState:
                                 kp.interpolation = "LINEAR"
                             fc.update()
 
+        # Exact object-level animation for unskinned meshes whose container
+        # frame never became a bone (see _apply_object_chain_anim).
+        try:
+            self._apply_object_chain_anim(anim_set_node, context)
+        except Exception:
+            # A failure here leaves the affected objects static rather than
+            # aborting the import; the rest of the scene is already built.
+            pass
+
         bpy.ops.object.mode_set(mode="OBJECT")
+
+    def _chain_anim_worlds(self, frame_node, anim_local):
+        """Compose the Blender-form animated world of `frame_node` (a mesh's
+        owning frame) for every tick, walking root -> node via the identity
+        ancestry map (_frame_parent_node). Each ancestor contributes its
+        matrix-key local at that tick when animated (nearest tick when
+        sparse), else its static FTM local. Node-identity keying means
+        unnamed frames can never collide. Returns (ticks, {tick: Matrix}),
+        or (None, None) when no ancestor is animated — the caller skips
+        such chains so purely static files keep today's placement. bpy-free
+        so it can be validated headlessly."""
+        pmap = getattr(self, "_frame_parent_node", {})
+        chain = []
+        n = frame_node
+        seen = set()
+        while n is not None and id(n) not in seen and len(chain) < 200:
+            chain.append(n)
+            seen.add(id(n))
+            n = pmap.get(id(n))
+        chain.reverse()                      # root first
+
+        animated = [fn for fn in chain if fn.name and fn.name in anim_local]
+        if not animated:
+            return None, None
+
+        ticks = set()
+        for fn in animated:
+            ticks.update(anim_local[fn.name].keys())
+        ticks = sorted(ticks)
+
+        rest_local = {}
+        for fn in chain:
+            ftm = fn.child("FrameTransformMatrix")
+            rest_local[id(fn)] = (_mat4_from_list(ftm.nums())
+                                  if ftm else Matrix.Identity(4))
+
+        out = {}
+        for t in ticks:
+            W = Matrix.Identity(4)
+            for fn in chain:
+                if fn.name and fn.name in anim_local:
+                    keys = anim_local[fn.name]
+                    L = keys.get(t)
+                    if L is None:
+                        nt = min(keys.keys(), key=lambda k: abs(k - t))
+                        L = keys[nt]
+                else:
+                    L = rest_local[id(fn)]
+                W = W @ L
+            out[t] = W
+        return ticks, out
+
+    def _apply_object_chain_anim(self, anim_set_node, context):
+        """Drive unskinned meshes whose container frame never became a bone
+        (stashed in _pending_rigid_object_anim) with object-level F-curves
+        computed from the composed DX frame chain — the exact transform the
+        DirectX runtime gives the mesh, including non-uniform key scale
+        (the HUD crowbar's 4.15x/2.16x stretch lives in its keys, not its
+        geometry). Bone-parenting these objects composes through the POSE
+        chain instead, which the scaled-bone correction deliberately
+        re-bases, so a rigid child inherits the wrong world whenever an
+        ancestor carries non-unit rest scale. Object curves are absolute
+        and exact by construction. Pending chains with no animated ancestor
+        in this set are left pending (a later set may animate them) and
+        otherwise keep the old static placement."""
+        pending = getattr(self, "_pending_rigid_object_anim", None)
+        if not pending:
+            return
+
+        # name -> {tick: Blender-form local}. Matrix keys are read directly;
+        # TRS-keyed files (rotation/scale/position tracks, types 0/1/2 —
+        # the HUD weapons) are composed into matrix keys with the existing
+        # validated composers, resampling when track densities differ.
+        anim_local = {}
+        for anim_node in anim_set_node.children_of("Animation"):
+            ref = anim_node.child("REF")
+            if not ref:
+                continue
+            bn = next((v for t, v in ref.values if t in ("WORD", "STR")),
+                      None)
+            if not bn:
+                continue
+            key_nodes = anim_node.children_of("AnimationKey")
+            mat_node = next((k for k in key_nodes
+                             if k.nums() and int(k.nums()[0]) in (3, 4)),
+                            None)
+            if mat_node is None:
+                by_type = {}
+                for k in key_nodes:
+                    knums = k.nums()
+                    if knums:
+                        by_type.setdefault(int(knums[0]), k)
+                if all(t in by_type for t in (0, 1, 2)):
+                    mat_node = _compose_type4_from_trs(
+                        by_type[0], by_type[1], by_type[2])
+                    if mat_node is None:
+                        mat_node = _compose_type4_from_trs_resampled(
+                            by_type[0], by_type[1], by_type[2])
+            if mat_node is None:
+                continue
+            nums = mat_node.nums()
+            if len(nums) < 2:
+                continue
+            nk = int(nums[1])
+            i = 2
+            fk_map = anim_local.setdefault(bn, {})
+            cnt = 0
+            while i + 1 < len(nums) and cnt < nk:
+                ftick = nums[i]
+                i += 2                       # tick + nvals
+                if i + 16 > len(nums):
+                    break
+                fk_map[round(float(ftick))] = _mat4_from_list(
+                    nums[i:i + 16])
+                i += 16
+                cnt += 1
+
+        conv = self._conv_mat
+        conv_inv = conv.inverted()
+        remaining = []
+        for obj, frame_node in pending:
+            try:
+                ticks, worlds = self._chain_anim_worlds(frame_node,
+                                                        anim_local)
+            except Exception:
+                ticks, worlds = None, None
+            if not ticks:
+                remaining.append((obj, frame_node))
+                continue
+
+            obj.rotation_mode = 'QUATERNION'
+            if obj.animation_data is None:
+                obj.animation_data_create()
+            anim_data = obj.animation_data
+            if anim_data.action is None:
+                action = bpy.data.actions.new(obj.name + "_xframe")
+                # Mirror the armature path's slotted-action setup
+                # (Blender 4.4+/5.x): a fresh action has no slots, and
+                # without an assigned OBJECT slot the F-curves never bind
+                # to the object — they exist but evaluate to nothing.
+                if hasattr(action, "slots"):
+                    slot = action.slots.new(id_type="OBJECT",
+                                            name=obj.name)
+                    anim_data.action = action
+                    anim_data.action_slot = slot
+                else:
+                    anim_data.action = action
+            action = anim_data.action
+
+            chans = {("location", i): [] for i in range(3)}
+            chans.update({("rotation_quaternion", i): [] for i in range(4)})
+            chans.update({("scale", i): [] for i in range(3)})
+            prev_q = None
+            for t in ticks:
+                M = conv @ worlds[t] @ conv_inv
+                if self.global_scale != 1.0:
+                    M = M.copy()
+                    M.translation = M.translation * self.global_scale
+                loc = M.to_translation()
+                q = M.to_quaternion()
+                if prev_q is not None:
+                    q.make_compatible(prev_q)
+                prev_q = q.copy()
+                sca = M.to_scale()
+                fr = float(t) * self.tick_scale
+                for ci in range(3):
+                    chans[("location", ci)].append((fr, loc[ci]))
+                    chans[("scale", ci)].append((fr, sca[ci]))
+                for ci in range(4):
+                    chans[("rotation_quaternion", ci)].append((fr, q[ci]))
+
+            for (path, ci), pts in chans.items():
+                # _get_or_create_fcurve handles BOTH the legacy
+                # action.fcurves API and the slotted/layered action API
+                # (channelbags) — calling action.fcurves directly raises
+                # AttributeError on Blender 4.4+/5.x and silently killed
+                # this whole pass.
+                fc = _get_or_create_fcurve(action, anim_data, path, ci,
+                                           obj.name)
+                fc.keyframe_points.add(len(pts))
+                for kp, (fr, v) in zip(fc.keyframe_points[-len(pts):], pts):
+                    kp.co = (fr, v)
+                    kp.interpolation = "LINEAR"
+                fc.update()
+
+        self._pending_rigid_object_anim = remaining
