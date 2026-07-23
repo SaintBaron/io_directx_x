@@ -30,7 +30,6 @@ import math
 import struct
 import zlib
 import bmesh
-from typing import List, Optional, Tuple
 from mathutils import Matrix, Vector
 
 _BT_NAME      = 0x0001
@@ -64,6 +63,12 @@ template ColorRGB {
  FLOAT blue;
 }
 
+template IndexedColor {
+ <1630b820-7842-11cf-8f52-0040333594a3>
+ DWORD index;
+ ColorRGBA indexColor;
+}
+
 template Material {
  <3d82ab4d-62da-11cf-ab39-0020af71e433>
  ColorRGBA faceColor;
@@ -78,9 +83,17 @@ template TextureFilename {
  STRING filename;
 }
 
-template Frame {
- <3d82ab46-62da-11cf-ab39-0020af71e433>
- [...]
+template Coords2d {
+ <f6f23f44-7686-11cf-8f52-0040333594a3>
+ FLOAT u;
+ FLOAT v;
+}
+
+template Vector {
+ <3d82ab5e-62da-11cf-ab39-0020af71e433>
+ FLOAT x;
+ FLOAT y;
+ FLOAT z;
 }
 
 template Matrix4x4 {
@@ -93,11 +106,9 @@ template FrameTransformMatrix {
  Matrix4x4 frameMatrix;
 }
 
-template Vector {
- <3d82ab5e-62da-11cf-ab39-0020af71e433>
- FLOAT x;
- FLOAT y;
- FLOAT z;
+template Frame {
+ <3d82ab46-62da-11cf-ab39-0020af71e433>
+ [...]
 }
 
 template MeshFace {
@@ -115,10 +126,12 @@ template Mesh {
  [...]
 }
 
-template MeshFaceWraps {
- <ed1ec5c0-c0a8-11d0-941c-0080c80cfa7b>
- DWORD nFaceWrapValues;
- array Boolean2d faceWrapValues[nFaceWrapValues];
+template MeshNormals {
+ <f6f23f43-7686-11cf-8f52-0040333594a3>
+ DWORD nNormals;
+ array Vector normals[nNormals];
+ DWORD nFaceNormals;
+ array MeshFace faceNormals[nFaceNormals];
 }
 
 template MeshTextureCoords {
@@ -127,18 +140,10 @@ template MeshTextureCoords {
  array Coords2d textureCoords[nTextureCoords];
 }
 
-template Coords2d {
- <f6f23f44-7686-11cf-8f52-0040333594a3>
- FLOAT u;
- FLOAT v;
-}
-
-template MeshNormals {
- <f6f23f43-7686-11cf-8f52-0040333594a3>
- DWORD nNormals;
- array Vector normals[nNormals];
- DWORD nFaceNormals;
- array MeshFace faceNormals[nFaceNormals];
+template MeshVertexColors {
+ <1630b821-7842-11cf-8f52-0040333594a3>
+ DWORD nVertexColors;
+ array IndexedColor vertexColors[nVertexColors];
 }
 
 template MeshMaterialList {
@@ -165,6 +170,20 @@ template DeclData {
  array DWORD data[nDWords];
 }
 
+template FVFData {
+ <b6e70a0e-8ef9-4e83-94ad-ecc8b0c04897>
+ DWORD dwFVF;
+ DWORD nDWords;
+ array DWORD data[nDWords];
+}
+
+template VertexDuplicationIndices {
+ <b8d65549-d7c9-4995-89cf-53a9a8b031e3>
+ DWORD nIndices;
+ DWORD nOriginalVertices;
+ array DWORD indices[nIndices];
+}
+
 template XSkinMeshHeader {
  <3cf169ce-ff7c-44ab-93c0-f78f62d172e2>
  WORD nMaxSkinWeightsPerVertex;
@@ -186,16 +205,6 @@ template AnimTicksPerSecond {
  DWORD AnimTicksPerSecond;
 }
 
-template Animation {
- <3d82ab4f-62da-11cf-ab39-0020af71e433>
- [...]
-}
-
-template AnimationSet {
- <3d82ab50-62da-11cf-ab39-0020af71e433>
- [Animation <3d82ab4f-62da-11cf-ab39-0020af71e433>]
-}
-
 template FloatKeys {
  <10dd46a9-775b-11cf-8f52-0040333594a3>
  DWORD nValues;
@@ -213,7 +222,89 @@ template AnimationKey {
  DWORD keyType;
  DWORD nKeys;
  array TimedFloatKeys keys[nKeys];
+}
+
+template AnimationOptions {
+ <e2bf56c0-840f-11cf-8f52-0040333594a3>
+ DWORD openclosed;
+ DWORD positionquality;
+}
+
+template Animation {
+ <3d82ab4f-62da-11cf-ab39-0020af71e433>
+ [...]
+}
+
+template AnimationSet {
+ <3d82ab50-62da-11cf-ab39-0020af71e433>
+ [Animation <3d82ab4f-62da-11cf-ab39-0020af71e433>]
 }"""
+
+_TEMPLATE_DECL_RE = re.compile(r'template\s+([A-Za-z_][A-Za-z0-9_]*)')
+
+def _split_default_templates():
+    """Return the canonical template block as an ordered {name: text} map."""
+    chunks = {}
+    starts = [m for m in _TEMPLATE_DECL_RE.finditer(_DEFAULT_TEMPLATES)]
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(_DEFAULT_TEMPLATES)
+        chunks[m.group(1)] = _DEFAULT_TEMPLATES[m.start():end].rstrip()
+    return chunks
+
+def _assemble_templates(passthrough_text=""):
+    """Build the template block to write at the top of an export.
+
+    Starts from the stashed source-file templates (if any) so round-trips
+    stay faithful, then appends any canonical template the stash lacks.
+    Dependency order is preserved: the stash keeps its own order, and the
+    canonical set is already declared dependency-first, so appending the
+    missing subset in canonical order keeps every referenced type declared
+    before use for legacy RegisterTemplates-style validators.
+    """
+    passthrough_text = (passthrough_text or "").strip()
+    have = set(_TEMPLATE_DECL_RE.findall(passthrough_text))
+    missing = [txt for name, txt in _split_default_templates().items()
+               if name not in have]
+    parts = []
+    if passthrough_text:
+        parts.append(passthrough_text)
+    parts.extend(missing)
+    return "\n\n".join(parts)
+
+
+class _NameSanitizer:
+    """Map arbitrary Blender names to legal, unique .x identifiers.
+
+    Text-format .x names must match [A-Za-z_][A-Za-z0-9_]* — Blender's
+    default names ('Cube.001', 'Material.001', action names with '|' or
+    spaces) are illegal and break strict parsers (and even D3DX). Every
+    name-emission site shares one instance of this class so a given
+    source name always maps to the same output identifier, keeping
+    Frame names, SkinWeights transformNodeName strings and { Name }
+    references mutually consistent.
+    """
+
+    _BAD = re.compile(r'[^A-Za-z0-9_]')
+
+    def __init__(self):
+        self._map = {}
+        self._used = set()
+
+    def get(self, name, fallback="unnamed"):
+        key = "" if name is None else str(name)
+        if key in self._map:
+            return self._map[key]
+        s = self._BAD.sub('_', key) or fallback
+        if s[0].isdigit():
+            s = '_' + s
+        base, n = s, 1
+        while s in self._used:
+            s = f"{base}_{n}"
+            n += 1
+        self._used.add(s)
+        self._map[key] = s
+        return s
+
 
 class _BinarySerializer:
     """Convert the text-oriented write stream to DirectX binary tokens."""
@@ -232,7 +323,42 @@ class _BinarySerializer:
         self._pending_ints   : list[int]   = []
         self._in_float_ctx   = False
 
+    @staticmethod
+    def _strip_comments(text: str) -> str:
+        """Remove text-format comments ('//' and '#' to end of line)
+        outside quoted strings. The token regex has no comment rule, so
+        without this, comment words (e.g. slender.x's '//End of ...'
+        annotations inside stashed passthrough blocks) would be emitted
+        as bogus NAME tokens and corrupt the binary stream.
+        """
+        if '//' not in text and '#' not in text:
+            return text
+        out = []
+        in_str = False
+        i, n = 0, len(text)
+        while i < n:
+            c = text[i]
+            if in_str:
+                out.append(c)
+                if c == '"':
+                    in_str = False
+                i += 1
+                continue
+            if c == '"':
+                in_str = True
+                out.append(c)
+                i += 1
+                continue
+            if c == '#' or (c == '/' and i + 1 < n and text[i + 1] == '/'):
+                while i < n and text[i] != '\n':
+                    i += 1
+                continue
+            out.append(c)
+            i += 1
+        return ''.join(out)
+
     def feed(self, text: str):
+        text = self._strip_comments(text)
         for m in self._RE.finditer(text):
             qstr, punc, num, word = m.groups()
             if qstr is not None:
@@ -252,8 +378,7 @@ class _BinarySerializer:
                     pass
             elif num is not None:
 
-                is_plain_int = ('.' not in num and 'e' not in num.lower()
-                                and not num.startswith('-'))
+                is_plain_int = ('.' not in num and 'e' not in num.lower())
                 if is_plain_int:
                     v = int(num)
                     self._pending_ints.append(v)
@@ -271,6 +396,118 @@ class _BinarySerializer:
     def getvalue(self) -> bytes:
         self._flush_pending()
         return bytes(self._buf)
+
+    # ---- binary template declarations -----------------------------------
+    # Legacy IDirectXFile consumers (FPSC/DBPro's ConvX) fail the whole
+    # load when a data object's template is neither pre-registered nor
+    # declared in-file, in binary exactly as in text. Templates cannot go
+    # through feed(): the text tokenizer would turn 'template', member
+    # type keywords and <GUID>s into bogus NAME tokens. This emits the
+    # proper token forms, verified 1:1 against the template sections of
+    # native binary files (Virtual Sailor's boat.x):
+    #   TEMPLATE NAME(name) OBRACE GUID
+    #     primitive member : TYPE_TOKEN NAME(member) SEMICOLON
+    #     named-type member: NAME(type) NAME(member) SEMICOLON
+    #     array member     : ARRAY TYPE NAME(member)
+    #                        { OBRACKET (INTEGER n | NAME dim) CBRACKET }+
+    #                        SEMICOLON
+    #     open class       : OBRACKET DOT DOT DOT CBRACKET
+    #     restricted class : OBRACKET NAME(type) [GUID] CBRACKET
+    #   CBRACE
+    _BT_TEMPLATE = 0x001f
+    _BT_GUID     = 0x0005
+    _BT_INTEGER  = 0x0003
+    _BT_OBRACKET = 0x000e
+    _BT_CBRACKET = 0x000f
+    _BT_DOT      = 0x0012
+    _BT_ARRAY    = 0x0034
+    _PRIM_TOKENS = {
+        "WORD": 0x0028, "DWORD": 0x0029, "FLOAT": 0x002a, "DOUBLE": 0x002b,
+        "CHAR": 0x002c, "UCHAR": 0x002d, "SWORD": 0x002e, "SDWORD": 0x002f,
+        # The text keyword STRING maps to TOKEN_LPSTR in binary form.
+        "STRING": 0x0031, "LPSTR": 0x0031, "UNICODE": 0x0032,
+        "CSTRING": 0x0033,
+    }
+    _TPL_RE   = re.compile(
+        r'template\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*'
+        r'<([0-9a-fA-F-]{36})>\s*(.*?)\}',
+        re.DOTALL)
+    _GUID_RE  = re.compile(r'<([0-9a-fA-F-]{36})>')
+    _ARRAY_RE = re.compile(
+        r'array\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)'
+        r'((?:\s*\[\s*[A-Za-z0-9_]+\s*\])+)')
+    _MEMBER_RE = re.compile(
+        r'([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)')
+    _DIM_RE   = re.compile(r'\[\s*([A-Za-z0-9_]+)\s*\]')
+
+    def _emit_guid(self, guid_text: str):
+        h = guid_text.replace('-', '')
+        d1 = int(h[0:8], 16)
+        d2 = int(h[8:12], 16)
+        d3 = int(h[12:16], 16)
+        self._emit_u16(self._BT_GUID)
+        self._buf += struct.pack('<IHH', d1, d2, d3)
+        self._buf += bytes.fromhex(h[16:32])
+
+    def emit_templates(self, templates_text: str):
+        templates_text = self._strip_comments(templates_text)
+        for m in self._TPL_RE.finditer(templates_text):
+            name, guid, body = m.group(1), m.group(2), m.group(3)
+            self._emit_u16(self._BT_TEMPLATE)
+            self._emit_name(name)
+            self._emit_u16(_BT_OBRACE)
+            self._emit_guid(guid)
+            for raw in body.split(';'):
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith('['):
+                    inner = line.strip('[]').strip()
+                    self._emit_u16(self._BT_OBRACKET)
+                    if inner in ('...', '. . .'):
+                        for _ in range(3):
+                            self._emit_u16(self._BT_DOT)
+                    else:
+                        gm = self._GUID_RE.search(inner)
+                        tname = inner.split('<')[0].strip()
+                        self._emit_name(tname)
+                        if gm:
+                            self._emit_guid(gm.group(1))
+                    self._emit_u16(self._BT_CBRACKET)
+                    continue    # class restrictions carry no semicolon
+                am = self._ARRAY_RE.match(line)
+                if am:
+                    a_type, a_name, dims = am.group(1), am.group(2), am.group(3)
+                    self._emit_u16(self._BT_ARRAY)
+                    prim = self._PRIM_TOKENS.get(a_type)
+                    if prim is not None:
+                        self._emit_u16(prim)
+                    else:
+                        self._emit_name(a_type)
+                    self._emit_name(a_name)
+                    for dm in self._DIM_RE.finditer(dims):
+                        d = dm.group(1)
+                        self._emit_u16(self._BT_OBRACKET)
+                        if d.isdigit():
+                            self._emit_u16(self._BT_INTEGER)
+                            self._emit_u32(int(d))
+                        else:
+                            self._emit_name(d)
+                        self._emit_u16(self._BT_CBRACKET)
+                    self._emit_u16(_BT_SEMICOLON)
+                    continue
+                mm = self._MEMBER_RE.match(line)
+                if mm:
+                    m_type, m_name = mm.group(1), mm.group(2)
+                    prim = self._PRIM_TOKENS.get(m_type)
+                    if prim is not None:
+                        self._emit_u16(prim)
+                    else:
+                        self._emit_name(m_type)
+                    self._emit_name(m_name)
+                    self._emit_u16(_BT_SEMICOLON)
+            self._emit_u16(_BT_CBRACE)
+
 
     def _emit_u16(self, v: int):
         self._buf += struct.pack('<H', v)
@@ -292,7 +529,11 @@ class _BinarySerializer:
         self._emit_u16(_BT_STRING)
         self._emit_u32(len(enc))
         self._buf += enc
-        self._buf += b'\x00\x00'
+        # Every STRING in the binary format ends with a terminator TOKEN
+        # (TOKEN_SEMICOLON or TOKEN_COMMA). Real files use SEMICOLON;
+        # a zero word here is an invalid token that makes D3DX-family
+        # readers reject the whole file.
+        self._emit_u16(_BT_SEMICOLON)
 
     def _flush_ints(self):
         if not self._pending_ints:
@@ -300,7 +541,10 @@ class _BinarySerializer:
         self._emit_u16(_BT_INT_LIST)
         self._emit_u32(len(self._pending_ints))
         for v in self._pending_ints:
-            self._emit_u32(v)
+            # Two's-complement wrap: DWORD fields are unsigned on disk,
+            # but signed values can legitimately appear (e.g. clamped
+            # negative animation ticks from odd source files).
+            self._emit_u32(v & 0xFFFFFFFF)
         self._pending_ints = []
 
     def _flush_floats(self):
@@ -404,12 +648,22 @@ def export_x(context, filepath,
              binary_format=False,
              compress=False,
              pz_compat=False,
+             write_templates=True,
+             inline_materials=False,
+             fill_missing_uvs=False,
              anim_key_format="TRS",
              **_):
 
     scene     = context.scene
     depsgraph = context.evaluated_depsgraph_get()
     objects   = context.selected_objects if use_selection else list(context.scene.objects)
+
+    # One shared name registry for the whole export: every emitted
+    # identifier (Frame/Mesh/Material/AnimationSet names, { Ref }
+    # targets and SkinWeights transformNodeName strings) goes through
+    # it, so a given Blender name always maps to the same legal, unique
+    # .x identifier and cross-references stay consistent.
+    _names = _NameSanitizer()
 
     # Compose with the importer's axis_fix (180° around Z) so a re-import
     axis_fix = Matrix.Rotation(math.pi, 4, 'Z').to_3x3()
@@ -464,25 +718,42 @@ def export_x(context, filepath,
         except Exception:
             pass
 
+    # AnimTicksPerSecond is only meaningful when the file will actually
+    # carry an AnimationSet. Emitting it on static meshes breaks strict
+    # legacy loaders (FPSC's IDirectXFile registers only the D3DRM
+    # template set, which predates AnimTicksPerSecond) and no known
+    # engine needs it without animation — none of the native Virtual
+    # Sailor files carry it at all.
+    _will_write_animation = bool(export_animation and arm_objs_for_passthrough)
+
+    # Assemble the template block to declare in-file. Strict template-
+    # driven consumers (FPSC/DBPro's legacy IDirectXFile converter,
+    # ModelConverterX, Virtual Sailor NG) hard-fail on any data object
+    # whose template is neither built in nor declared in the file, so by
+    # default every export declares the full canonical set. A stashed
+    # source-file copy is preferred for round-trip fidelity, topped up
+    # with any canonical templates it lacks for objects we may emit.
+    _templates_out = ""
+    if write_templates or pz_compat:
+        _templates_out = _assemble_templates(_passthrough_templates)
+    elif _passthrough_templates:
+        _templates_out = _passthrough_templates
+
     if binary_format:
 
         _bin_header = b"xof 0303bin 0032"
 
-        w(f"AnimTicksPerSecond {{ {file_ticks_per_second}; }}\n")
+        if _templates_out:
+            _ser.emit_templates(_templates_out)
+        if _will_write_animation:
+            w(f"AnimTicksPerSecond {{ {file_ticks_per_second}; }}\n")
     else:
         w("xof 0303txt 0032\n\n")
-        # Emit DirectX templates. Prefer the stashed source-file copy
-        # for byte-identical round-trips; fall back to the canonical
-        # set when there's nothing stashed (e.g. a from-scratch model
-        # in Blender) so that high-precision-style engines that expect templates
-        # at the top of the file still get them.
-        if _passthrough_templates:
-            w(_passthrough_templates)
+        if _templates_out:
+            w(_templates_out)
             w("\n\n")
-        elif pz_compat:
-            w(_DEFAULT_TEMPLATES)
-            w("\n\n")
-        w(f"AnimTicksPerSecond {{\n\t{file_ticks_per_second};\n}}\n")
+        if _will_write_animation:
+            w(f"AnimTicksPerSecond {{\n\t{file_ticks_per_second};\n}}\n")
 
     mesh_objs     = [o for o in objects if o.type == "MESH"]
     armature_objs = [o for o in objects if o.type == "ARMATURE"]
@@ -490,70 +761,33 @@ def export_x(context, filepath,
 
     written_mats = {}
     if export_materials:
-        for obj in mesh_objs:
-            for mat in _effective_materials(obj):
-                if not mat or mat.name in written_mats:
-                    continue
-                written_mats[mat.name] = mat
-                bsdf = _get_principled(mat)
+        if not inline_materials:
+            for obj in mesh_objs:
+                for mat in _effective_materials(obj):
+                    if not mat or mat.name in written_mats:
+                        continue
+                    written_mats[mat.name] = mat
+                    _write_material_block(w, mat, "", _names.get(mat.name),
+                                          export_textures, filepath)
 
-                face_color = mat.get("_x_face_color")
-                power      = mat.get("_x_power")
-                specular   = mat.get("_x_specular")
-                emissive   = mat.get("_x_emissive")
-                x_tex_name = mat.get("_x_texture_filename")
-
-                if face_color is not None and len(face_color) >= 4:
-                    r, g, b, a = face_color[0], face_color[1], face_color[2], face_color[3]
-                elif bsdf:
-                    col = bsdf.inputs["Base Color"].default_value
-                    r, g, b, a = col[0], col[1], col[2], col[3]
-                else:
-                    r, g, b, a = 0.8, 0.8, 0.8, 1.0
-
-                if power is not None:
-                    shininess = power
-                elif bsdf:
-                    roughness = bsdf.inputs["Roughness"].default_value
-                    shininess = max(1.0, 128.0 ** (1.0 - roughness))
-                else:
-                    shininess = 32.0
-
-                if specular is not None and len(specular) >= 3:
-                    sr, sg, sb = specular[0], specular[1], specular[2]
-                elif bsdf:
-                    spec_inp = (bsdf.inputs.get("Specular IOR Level")
-                                or bsdf.inputs.get("Specular"))
-                    sv = spec_inp.default_value if spec_inp else 0.5
-                    sr = sg = sb = sv
-                else:
-                    sr = sg = sb = 0.5
-
-                if emissive is not None and len(emissive) >= 3:
-                    er, eg, eb = emissive[0], emissive[1], emissive[2]
-                else:
-                    er = eg = eb = 0.0
-
-                w(f"Material {mat.name} {{\n")
-                w(f"\t {r:.6f}; {g:.6f}; {b:.6f}; {a:.6f};;\n")
-                w(f"\t {shininess:.6f};\n")
-                w(f"\t {sr:.6f}; {sg:.6f}; {sb:.6f};;\n")
-                w(f"\t {er:.6f}; {eg:.6f}; {eb:.6f};;\n")
-                if export_textures:
-                    if x_tex_name:
-
-                        esc = x_tex_name.replace("\\", "\\\\")
-                        w(f'\tTextureFileName {{"{esc}";}}\n')
-                    else:
-                        tp = _tex_path(mat)
-                        if tp:
-                            try:
-                                rel = os.path.relpath(tp, os.path.dirname(filepath))
-                            except ValueError:
-                                rel = os.path.basename(tp)
-                            rel = rel.replace("\\", "\\\\")
-                            w(f'\tTextureFileName {{"{rel}";}}\n')
-                w("}\n")
+    # Meshes parented to a BONE (FPSC weapon attachments like Colonel-X's
+    # FIRESPOT gun; HUD gun parts) must be written NESTED inside that
+    # bone's Frame with a bone-relative FTM. Writing them as top-level
+    # frames — worse, with an Identity FTM, since obj.parent == arm_obj —
+    # dropped both the attachment hierarchy and the placement, so the
+    # re-exported prop sat at the origin and never followed the hand.
+    _bone_child_meshes = {}
+    _bone_nested_ids = set()
+    _nested_mesh_warnings = []
+    _nested_temp_cleanup = []
+    if arm_obj is not None:
+        for _bobj in mesh_objs:
+            if (_bobj.parent == arm_obj
+                    and getattr(_bobj, "parent_type", "") == "BONE"
+                    and getattr(_bobj, "parent_bone", "")):
+                _bone_child_meshes.setdefault(
+                    _bobj.parent_bone, []).append(_bobj)
+                _bone_nested_ids.add(id(_bobj))
 
     if export_armature and arm_obj:
         arm_data = arm_obj.data
@@ -569,20 +803,111 @@ def export_x(context, filepath,
                     local_mat = bone.parent.matrix_local.inverted() @ bone.matrix_local
 
                 else:
-
-                    local_mat = _bl_bone_to_dx_world(bone.matrix_local, bl_to_dx_3, inv_scale)
+                    # Root bones carry the armature OBJECT transform (when
+                    # non-identity) so the exported hierarchy composes to
+                    # true world space — matching the offsets and keys.
+                    _arm_M = _arm_world_or_none(arm_obj)
+                    _root_rest = (_arm_M @ bone.matrix_local
+                                  if _arm_M is not None
+                                  else bone.matrix_local)
+                    local_mat = _bl_bone_to_dx_world(_root_rest, bl_to_dx_3, inv_scale)
                 ftm_string = _mat4_to_dx(local_mat)
 
-            w(f"{ind}Frame {bone.name} {{\n")
+            w(f"{ind}Frame {_names.get(bone.name)} {{\n")
             w(f"{ind}\tFrameTransformMatrix {{\n")
             w(f"{ind}\t\t{ftm_string};;\n")
             w(f"{ind}\t}}\n")
+            # Bone-parented meshes nest here, with an FTM relative to
+            # THIS bone. Parent-relative locals are identical in Blender
+            # and DX space under the rotation-only axis conversion (the
+            # same fact the child-bone FTMs above rely on), so the local
+            # is computed purely in Blender space.
+            # Bone-nested meshes that were SPLIT from one multi-material
+            # source Mesh on import re-merge into a single Mesh node,
+            # exactly as the standalone path does — otherwise a
+            # multi-material container mesh (kwXport cube) exports as N
+            # separate Mesh nodes and the re-import mis-places pieces.
+            _pending_nested = list(_bone_child_meshes.get(bone.name, ()))
+            _nst_groups = {}
+            _nst_order = []
+            for _cobj in _pending_nested:
+                _src = _cobj.get('_x_split_source_mesh')
+                _gkey = ('split', str(_src)) if _src else ('solo', id(_cobj))
+                if _gkey not in _nst_groups:
+                    _nst_groups[_gkey] = []
+                    _nst_order.append(_gkey)
+                _nst_groups[_gkey].append(_cobj)
+            _emit_nested = []
+            for _gkey in _nst_order:
+                _grp = _nst_groups[_gkey]
+                if _gkey[0] == 'split' and len(_grp) > 1:
+                    _grp = sorted(
+                        _grp,
+                        key=lambda o: int(o.get('_x_split_group_idx', 0)))
+                    try:
+                        _tmp = _merge_split_group_for_export(_grp, _gkey[1])
+                        _nested_temp_cleanup.append(_tmp)
+                        _emit_nested.append(_tmp)
+                        continue
+                    except Exception as _me:
+                        _nested_mesh_warnings.append(
+                            f"Failed to re-merge bone-nested split group "
+                            f"'{_gkey[1]}': {_me}. Writing "
+                            f"{len(_grp)} separate Mesh nodes.")
+                _emit_nested.extend(_grp)
+            for _cobj in _emit_nested:
+                try:
+                    _arm_inv = arm_obj.matrix_world.inverted()
+                except ValueError:
+                    _arm_inv = Matrix.Identity(4)
+                try:
+                    _local = (bone.matrix_local.inverted()
+                              @ (_arm_inv @ _cobj.matrix_world))
+                except ValueError:
+                    _local = Matrix.Identity(4)
+                # A mesh whose bone WAS its own container frame on import
+                # (stashed by the importer) is written directly inside this
+                # bone's Frame with its object-local vertices verbatim —
+                # the source layout ('Frame X { FTM  Mesh X {...} }').
+                # The old nested holder frame duplicated the bone's name
+                # and flipped the re-importer's placement heuristic on
+                # some meshes (PZ Wrench/Handgun/scope drift).
+                # DeclData-stashed meshes keep the old path: the verbatim
+                # DeclData block indexes untransformed vertices.
+                _as_container = (
+                    str(_cobj.get("_x_container_bone") or "") == bone.name
+                    and not _cobj.get("_x_decldata"))
+                _nested_mesh_warnings.extend(_write_mesh_frame(
+                    _cobj, out, indent + (0 if _as_container else 1),
+                    depsgraph, use_mesh_modifiers,
+                    export_normals, export_uvs,
+                    export_materials, export_weights,
+                    arm_obj, bl_to_dx_3, inv_scale,
+                    triangulate, written_mats,
+                    unweld_on_export=unweld_on_export,
+                    names=_names,
+                    frame_matrix_override=(None if _as_container else _local),
+                    suppress_frame_wrapper=_as_container,
+                    inline_materials=inline_materials,
+                    fill_missing_uvs=fill_missing_uvs,
+                    export_textures=export_textures,
+                    filepath=filepath))
             for child in bone.children:
                 write_bone(child, indent + 1)
             w(f"{ind}}}\n")
 
         for rb in (b for b in arm_data.bones if not b.parent):
             write_bone(rb, 0)
+
+    # Delete any temp objects created for bone-nested split-group
+    # merges — they were only needed while write_bone emitted them.
+    for _tmp in _nested_temp_cleanup:
+        try:
+            _tmp_data = _tmp.data
+            bpy.data.objects.remove(_tmp, do_unlink=True)
+            bpy.data.meshes.remove(_tmp_data)
+        except Exception:
+            pass
 
     # Re-emit any auxiliary top-level frames (e.g. Translation_Data)
     # captured from the source .x file. These sit between the skeleton
@@ -592,6 +917,7 @@ def export_x(context, filepath,
         w("\n\n")
 
     all_warnings = []
+    all_warnings.extend(_nested_mesh_warnings)
 
     # Group mesh objects by _x_split_source_mesh — objects that were
     # split from a single multi-material .x Mesh on import need to be
@@ -603,6 +929,8 @@ def export_x(context, filepath,
     split_groups: dict = {}        # source_name → list of objects
     standalone_objs: list = []
     for obj in mesh_objs:
+        if id(obj) in _bone_nested_ids:
+            continue          # already written nested under its bone
         src = obj.get('_x_split_source_mesh')
         if src:
             split_groups.setdefault(str(src), []).append(obj)
@@ -617,6 +945,8 @@ def export_x(context, filepath,
 
     seen_split_sources: set = set()
     for obj in mesh_objs:
+        if id(obj) in _bone_nested_ids:
+            continue          # already written nested under its bone
         src = obj.get('_x_split_source_mesh')
         if src:
             if src in seen_split_sources:
@@ -659,7 +989,12 @@ def export_x(context, filepath,
                               export_materials, export_weights,
                               arm_obj, bl_to_dx_3, inv_scale,
                               triangulate, written_mats,
-                              unweld_on_export=unweld_on_export))
+                              unweld_on_export=unweld_on_export,
+                              names=_names,
+                              inline_materials=inline_materials,
+                              fill_missing_uvs=fill_missing_uvs,
+                              export_textures=export_textures,
+                              filepath=filepath))
     finally:
         # Clean up temporary merged objects regardless of success/failure
         for temp in temp_objects_to_cleanup:
@@ -754,46 +1089,61 @@ def export_x(context, filepath,
 
         # Second pass: for each frame we need, set the scene to that
         # frame and bake whichever bones have a key there.
+        # Pre-resolve the per-bone data ONCE: iterating arm_obj.pose.bones
+        # re-creates the RNA collection every frame, and dict lookups +
+        # three membership tests per bone per frame add up across dense
+        # rigs (55 bones x 2500 frames). Bones with no keyed frames at
+        # all are dropped here instead of being re-tested every frame.
+        _bone_iter = []
+        for pb in arm_obj.pose.bones:
+            rs, ss, ts = per_bone_frames[pb.name]
+            if rs or ss or ts:
+                _bone_iter.append((pb, pb.name, rs, ss, ts, pb.parent))
+        _need_mat = (anim_key_format == "MATRIX")
         for fr in sorted(all_sample_frames):
             scene.frame_set(fr)
 
-            for pb in arm_obj.pose.bones:
-                name = pb.name
-                rot_set, sc_set, tr_set = per_bone_frames[name]
-                if fr not in rot_set and fr not in sc_set and fr not in tr_set:
+            for pb, name, rot_set, sc_set, tr_set, pb_parent in _bone_iter:
+                in_rot = fr in rot_set
+                in_sc  = fr in sc_set
+                in_tr  = fr in tr_set
+                if not (in_rot or in_sc or in_tr):
                     continue
 
-                world_bl = pb.matrix.copy()
+                world_bl = pb.matrix
 
-                if pb.parent:
-                    parent_world_bl = pb.parent.matrix.copy()
-                    local_bl = parent_world_bl.inverted() @ world_bl
+                if pb_parent:
+                    local_bl = pb_parent.matrix.inverted() @ world_bl
 
                     dx_local = local_bl
-                    dx_rot = dx_local.to_3x3()
-                    dx_t   = dx_local.to_translation()
-                    dx_s   = dx_local.to_scale()
-                    q      = dx_rot.to_quaternion()
+                    dx_t = dx_local.to_translation() if (in_tr or in_sc) else None
+                    dx_s = dx_local.to_scale() if in_sc else None
+                    q    = dx_local.to_quaternion() if in_rot else None
                 else:
                     # ROOT: write absolute rotation in un-conv'd file space,
                     # not just the pose offset. The importer reconstructs
                     # via local_rest_q = (conv.inv @ matrix_local).to_quat()
                     # and pose_q = local_rest_q.inv @ abs_q, so we must
                     # write abs_q = rotation of (conv.inv @ pb.matrix).
-                    # Translation/scale come from the world matrix.
-                    dx_world = _bl_bone_to_dx_world(world_bl, bl_to_dx_3, inv_scale)
+                    # Translation/scale come from the world matrix. A
+                    # non-identity armature object transform enters here
+                    # too, keeping keys in the same space as the FTMs.
+                    _arm_M = _arm_world_or_none(arm_obj)
+                    _world_full = (_arm_M @ world_bl if _arm_M is not None
+                                   else world_bl)
+                    dx_world = _bl_bone_to_dx_world(_world_full, bl_to_dx_3, inv_scale)
                     dx_t = dx_world.to_translation()
                     dx_s = dx_world.to_scale()
-                    un_conv_pose = bl_to_dx_3 @ pb.matrix.to_3x3()
+                    _pose_full = (_arm_M @ pb.matrix if _arm_M is not None
+                                  else pb.matrix)
+                    un_conv_pose = bl_to_dx_3 @ _pose_full.to_3x3()
                     q = un_conv_pose.to_quaternion()
 
-                qw, qx, qy, qz = q.w, -q.x, -q.y, -q.z
-
-                if fr in rot_set:
-                    baked[name]["rot"]  [fr] = (qw, qx, qy, qz)
-                if fr in sc_set:
+                if in_rot:
+                    baked[name]["rot"]  [fr] = (q.w, -q.x, -q.y, -q.z)
+                if in_sc:
                     baked[name]["scale"][fr] = (dx_s.x, dx_s.y, dx_s.z)
-                if fr in tr_set:
+                if in_tr:
                     baked[name]["pos"]  [fr] = (dx_t.x, dx_t.y, dx_t.z)
 
                 # Matrix-key export: store the full DX-space local 4x4 for
@@ -803,8 +1153,8 @@ def export_x(context, filepath,
                 # encodes. For the root we store the DX-space world transform
                 # (already computed for the TRS path), which the importer's
                 # matrix path consumes for a parentless bone.
-                if anim_key_format == "MATRIX":
-                    if pb.parent:
+                if _need_mat:
+                    if pb_parent:
                         baked[name]["mat"][fr] = local_bl.copy()
                     else:
                         baked[name]["mat"][fr] = dx_world.copy()
@@ -830,7 +1180,7 @@ def export_x(context, filepath,
                     _animset_name = _nm
         except Exception:
             pass
-        w(f"AnimationSet {_animset_name} {{\n")
+        w(f"AnimationSet {_names.get(_animset_name)} {{\n")
         # some biped/game biped exports name the AnimationKey
         # nodes 'R', 'S', 'T' for rotation/scale/translation. Plain DirectX
         # leaves them unnamed.
@@ -840,7 +1190,7 @@ def export_x(context, filepath,
         # Helper: scale a Blender frame number to a file tick value.
         # int(round(...)) keeps the file's tick field DWORD-compatible.
         def _tick(fr):
-            return int(round(fr * tick_scale_out))
+            return max(0, int(round(fr * tick_scale_out)))
         for pb in arm_obj.pose.bones:
             name = pb.name
             rot_keys   = baked[name]["rot"]
@@ -848,7 +1198,7 @@ def export_x(context, filepath,
             pos_keys   = baked[name]["pos"]
             mat_keys   = baked[name]["mat"]
 
-            w(f"\tAnimation {{\n\t\t{{ {name} }}\n")
+            w(f"\tAnimation {{\n\t\t{{ {_names.get(name)} }}\n")
 
             if anim_key_format == "MATRIX":
                 # Single 4x4 matrix track (keyType 4). DirectX stores the
@@ -869,21 +1219,114 @@ def export_x(context, filepath,
                 w("\t}\n")
                 continue
 
-            w(f"\t\t{_ak_rot} {{\n\t\t\t0;\n\t\t\t{len(rot_keys)};\n")
+            # A track with zero keys is skipped entirely: emitting the
+            # header with an empty array leaves a dangling separator that
+            # strict tokenizers reject, and a keyless track carries no
+            # information anyway (the per-bone fallback above guarantees
+            # at least one non-empty track per bone).
+            def _emit_rot(rot_keys=rot_keys):
+                if not rot_keys:
+                    return
+                w(f"\t\t{_ak_rot} {{\n\t\t\t0;\n\t\t\t{len(rot_keys)};\n")
+                entries = [f"\t\t\t{_tick(fr)};4;{qw:.6f},{qx:.6f},{qy:.6f},{qz:.6f};;"
+                           for fr, (qw, qx, qy, qz) in sorted(rot_keys.items())]
+                w(",\n".join(entries) + ";\n\t\t}\n")
+
+            def _emit_scale(scale_keys=scale_keys):
+                if not scale_keys:
+                    return
+                w(f"\t\t{_ak_scale} {{\n\t\t\t1;\n\t\t\t{len(scale_keys)};\n")
+                entries = [f"\t\t\t{_tick(fr)};3;{sx:.6f},{sy:.6f},{sz:.6f};;"
+                           for fr, (sx, sy, sz) in sorted(scale_keys.items())]
+                w(",\n".join(entries) + ";\n\t\t}\n")
+
+            def _emit_trans(pos_keys=pos_keys):
+                if not pos_keys:
+                    return
+                w(f"\t\t{_ak_trans} {{\n\t\t\t2;\n\t\t\t{len(pos_keys)};\n")
+                entries = [f"\t\t\t{_tick(fr)};3;{px:.6f},{py:.6f},{pz:.6f};;"
+                           for fr, (px, py, pz) in sorted(pos_keys.items())]
+                w(",\n".join(entries) + ";\n\t\t}\n")
+
+            # PZ high-precision originals order the tracks S, R, T per
+            # bone; plain exports keep the historical R, S, T. Type-
+            # tagged loaders accept either — matching the native order
+            # just keeps diffs against original files clean.
+            if pz_compat:
+                _emit_scale(); _emit_rot(); _emit_trans()
+            else:
+                _emit_rot(); _emit_scale(); _emit_trans()
+
+            w("\t}\n")
+
+        # Object-level animation tracks: rigid meshes whose container
+        # frames never became bones carry their placement and animation
+        # as OBJECT F-curves (the importer's exact object-level chain
+        # path — sb.X's x3ds pieces, HUD's crowbar). Without these
+        # tracks the re-imported file loses both the animation and, for
+        # FPSC-style files where keys replace FTMs, the placement.
+        # Keys are written in the same conjugated file space as the
+        # standalone frame FTMs, with the file-form conjugate
+        # quaternion (w, -x, -y, -z) the importer's composer reads.
+        def _obj_key_frames(o):
+            frames = set()
+            try:
+                _ad = o.animation_data
+                _act = _ad.action if _ad else None
+            except Exception:
+                _act = None
+            if _act is None:
+                return []
+            _fc_iters = []
+            if getattr(_act, "fcurves", None):
+                _fc_iters.append(_act.fcurves)
+            if hasattr(_act, "layers"):
+                for _ly in _act.layers:
+                    for _st in _ly.strips:
+                        for _cb in _st.channelbags:
+                            _fc_iters.append(_cb.fcurves)
+            for _fcs in _fc_iters:
+                for _fc in _fcs:
+                    for _kp in _fc.keyframe_points:
+                        _f = int(round(_kp.co[0]))
+                        if anim_frame_start <= _f <= anim_frame_end:
+                            frames.add(_f)
+            return sorted(frames)
+
+        _anim_obj_ids = set()
+        for _aobj in mesh_objs:
+            if id(_aobj) in _bone_nested_ids:
+                continue
+            _ofrs = _obj_key_frames(_aobj)
+            if not _ofrs:
+                continue
+            _anim_obj_ids.add(id(_aobj))
+            _o_rot, _o_scl, _o_pos = {}, {}, {}
+            for _fr in _ofrs:
+                scene.frame_set(_fr)
+                _L = _bl_world_to_dx_frame(_aobj.matrix_world,
+                                           bl_to_dx_3, inv_scale)
+                _q = _L.to_quaternion()
+                _o_rot[_fr] = (_q.w, -_q.x, -_q.y, -_q.z)
+                _sv = _L.to_scale()
+                _o_scl[_fr] = (_sv[0], _sv[1], _sv[2])
+                _tv = _L.to_translation()
+                _o_pos[_fr] = (_tv[0], _tv[1], _tv[2])
+            scene.frame_set(orig_frame)
+            _ofn = _aobj.get("_x_frame_name") or _aobj.name
+            w(f"\tAnimation {{\n\t\t{{ {_names.get(_ofn)} }}\n")
+            w(f"\t\t{_ak_rot} {{\n\t\t\t0;\n\t\t\t{len(_o_rot)};\n")
             entries = [f"\t\t\t{_tick(fr)};4;{qw:.6f},{qx:.6f},{qy:.6f},{qz:.6f};;"
-                       for fr, (qw, qx, qy, qz) in sorted(rot_keys.items())]
+                       for fr, (qw, qx, qy, qz) in sorted(_o_rot.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
-
-            w(f"\t\t{_ak_scale} {{\n\t\t\t1;\n\t\t\t{len(scale_keys)};\n")
+            w(f"\t\t{_ak_scale} {{\n\t\t\t1;\n\t\t\t{len(_o_scl)};\n")
             entries = [f"\t\t\t{_tick(fr)};3;{sx:.6f},{sy:.6f},{sz:.6f};;"
-                       for fr, (sx, sy, sz) in sorted(scale_keys.items())]
+                       for fr, (sx, sy, sz) in sorted(_o_scl.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
-
-            w(f"\t\t{_ak_trans} {{\n\t\t\t2;\n\t\t\t{len(pos_keys)};\n")
+            w(f"\t\t{_ak_trans} {{\n\t\t\t2;\n\t\t\t{len(_o_pos)};\n")
             entries = [f"\t\t\t{_tick(fr)};3;{px:.6f},{py:.6f},{pz:.6f};;"
-                       for fr, (px, py, pz) in sorted(pos_keys.items())]
+                       for fr, (px, py, pz) in sorted(_o_pos.items())]
             w(",\n".join(entries) + ";\n\t\t}\n")
-
             w("\t}\n")
 
         # Auxiliary-frame animations (e.g. Translation_Data on high-precision
@@ -930,43 +1373,174 @@ def export_x(context, filepath,
     return {"FINISHED"}, all_warnings
 
 
+def _arm_world_or_none(arm_obj):
+    """arm_obj.matrix_world when it meaningfully differs from identity,
+    else None. Gating on None keeps every existing identity-armature
+    export byte-identical while making non-identity armature transforms
+    (e.g. the uniform-rig object scale the importer now applies, or a
+    user-moved armature) flow consistently into root FTMs, root
+    animation keys, skin offsets and parented-mesh vertices — all four
+    must agree on the space or the skin detaches."""
+    if arm_obj is None:
+        return None
+    try:
+        M = arm_obj.matrix_world
+        ident = Matrix.Identity(4)
+        for r in range(4):
+            for c in range(4):
+                if abs(M[r][c] - ident[r][c]) > 1e-9:
+                    return M.copy()
+    except Exception:
+        return None
+    return None
+
+
+def _write_material_block(w, mat, ind, name_or_none,
+                          export_textures, filepath):
+    """Emit one Material block. `name_or_none` carries the (sanitized)
+    identifier for a named root-level declaration, or None for an
+    anonymous inline block inside a MeshMaterialList (the style every
+    native Virtual Sailor text generator uses). Shared by the root
+    writer and the inline-materials compat path so both stay in sync."""
+    bsdf = _get_principled(mat)
+
+    face_color = mat.get("_x_face_color")
+    power      = mat.get("_x_power")
+    specular   = mat.get("_x_specular")
+    emissive   = mat.get("_x_emissive")
+    x_tex_name = mat.get("_x_texture_filename")
+
+    if face_color is not None and len(face_color) >= 4:
+        r, g, b, a = face_color[0], face_color[1], face_color[2], face_color[3]
+    elif bsdf:
+        col = bsdf.inputs["Base Color"].default_value
+        r, g, b, a = col[0], col[1], col[2], col[3]
+    else:
+        r, g, b, a = 0.8, 0.8, 0.8, 1.0
+
+    if power is not None:
+        shininess = power
+    elif bsdf:
+        roughness = bsdf.inputs["Roughness"].default_value
+        shininess = max(1.0, 128.0 ** (1.0 - roughness))
+    else:
+        shininess = 32.0
+
+    if specular is not None and len(specular) >= 3:
+        sr, sg, sb = specular[0], specular[1], specular[2]
+    elif bsdf:
+        spec_inp = (bsdf.inputs.get("Specular IOR Level")
+                    or bsdf.inputs.get("Specular"))
+        sv = spec_inp.default_value if spec_inp else 0.5
+        sr = sg = sb = sv
+    else:
+        sr = sg = sb = 0.5
+
+    if emissive is not None and len(emissive) >= 3:
+        er, eg, eb = emissive[0], emissive[1], emissive[2]
+    else:
+        er = eg = eb = 0.0
+
+    head = f"Material {name_or_none} {{" if name_or_none else "Material {"
+    w(f"{ind}{head}\n")
+    w(f"{ind}\t {r:.6f}; {g:.6f}; {b:.6f}; {a:.6f};;\n")
+    w(f"{ind}\t {shininess:.6f};\n")
+    w(f"{ind}\t {sr:.6f}; {sg:.6f}; {sb:.6f};;\n")
+    w(f"{ind}\t {er:.6f}; {eg:.6f}; {eb:.6f};;\n")
+    if export_textures:
+        # Standard spelling is 'TextureFilename'. Some engines
+        # (Bugsnax/Horsepower) author 'TextureFileName'; the importer
+        # stashes the source spelling so round-trips keep it, while
+        # fresh exports stay spec-standard — a declared-template/name
+        # mismatch is exactly what strict .NET-style parsers fall
+        # over on.
+        _texfn_tag = str(mat.get("_x_texfn_case") or "TextureFilename")
+        if _texfn_tag not in ("TextureFilename", "TextureFileName"):
+            _texfn_tag = "TextureFilename"
+        if x_tex_name:
+            esc = x_tex_name.replace("\\", "\\\\")
+            w(f'{ind}\t{_texfn_tag} {{"{esc}";}}\n')
+        else:
+            tp = _tex_path(mat)
+            if tp:
+                try:
+                    rel = os.path.relpath(tp, os.path.dirname(filepath))
+                except ValueError:
+                    rel = os.path.basename(tp)
+                rel = rel.replace("\\", "\\\\")
+                w(f'{ind}\t{_texfn_tag} {{"{rel}";}}\n')
+    w(f"{ind}}}\n")
+
+
 def _mszip_wrap_x(payload: bytes, base_format: str = "bin") -> bytes:
-    """Wrap a raw .x payload in the MSZIP-compressed container format
-    (xof 0303bzip / xof 0303tzip), splitting the payload into 32KB
-    chunks each prefixed by uncompressed/compressed size headers."""
+    """Wrap a raw .x payload in the MSZIP-compressed container
+    (xof 0303bzip / xof 0303tzip).
+
+    Framing verified byte-level against native FPSC bzip files
+    (Colonel-X.X and nine others):
+
+        magic(16) | u32 totalUncompressedSize | chunk*
+
+        chunk := u16 uncompressedSize (<= 32768)   -- on EVERY chunk
+                 u16 compressedSize               -- INCLUDES the 2-byte 'CK'
+                 'CK'
+                 raw deflate
+
+    totalUncompressedSize counts the 16-byte magic that is NOT stored in
+    the stream (i.e. payload + 16). Native encoders chain the deflate
+    dictionary across chunks; compressing each chunk independently is
+    fully compatible (chained decoders simply see no back-references),
+    so that is what we do.
+    """
     out = bytearray()
     if base_format == "bin":
         out += b"xof 0303bzip0032"
     else:
         out += b"xof 0303tzip0032"
 
-    # Size prefix.  The bundled parser skips this if the bytes
-    total_size = len(payload)
-    first_chunk_uncomp = min(total_size, 32768) if total_size else 0
-    out += total_size.to_bytes(4, "little")
-    out += first_chunk_uncomp.to_bytes(2, "little")
+    out += (len(payload) + 16).to_bytes(4, "little")
 
     CHUNK_SIZE = 32768
     pos = 0
-    while pos < len(payload):
+    while pos < len(payload) or (pos == 0 and not payload):
         chunk = payload[pos:pos + CHUNK_SIZE]
-        # Raw deflate (no zlib header/trailer) — wbits = -15
         co = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15)
         compressed = co.compress(chunk) + co.flush(zlib.Z_FINISH)
-        # Per-chunk header: u16 compressed-size, then 'CK' magic
-        out += len(compressed).to_bytes(2, "little")
+        out += len(chunk).to_bytes(2, "little")            # uncompressed size
+        out += (len(compressed) + 2).to_bytes(2, "little") # incl. 'CK'
         out += b"CK"
         out += compressed
         pos += CHUNK_SIZE
-    # Empty payload edge case — still emit one empty chunk so the parser
-    # doesn't trip on an unexpected EOF in the middle of its read loop.
-    if not payload:
-        co = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15)
-        compressed = co.compress(b"") + co.flush(zlib.Z_FINISH)
-        out += len(compressed).to_bytes(2, "little")
-        out += b"CK"
-        out += compressed
+        if not payload:
+            break
     return bytes(out)
+def _bl_world_to_dx_frame(bl_mat, bl_to_dx_3, inv_scale):
+    """Conjugated Blender→DX world conversion (C @ M @ C^-1) for
+    standalone mesh Frame FTMs. The importer rebuilds frame worlds by
+    conjugation, and the mesh vertices are one-side-converted, so this
+    is the form that composes back to the identical Blender world.
+    Maps an Identity Blender world to an Identity FTM."""
+    conv_4 = Matrix.Identity(4)
+    conv_inv_4 = Matrix.Identity(4)
+    inv3 = bl_to_dx_3.inverted()
+    for r in range(3):
+        for c in range(3):
+            conv_4[r][c] = bl_to_dx_3[r][c]
+            conv_inv_4[r][c] = inv3[r][c]
+    dx_mat = conv_4 @ bl_mat @ conv_inv_4
+    dx_mat[0][3] *= inv_scale
+    dx_mat[1][3] *= inv_scale
+    dx_mat[2][3] *= inv_scale
+    # Conjugation turns exact zeros into ±1e-9 epsilons that format as
+    # '-0.000000' under %.6f; snap anything below the format's precision
+    # so an Identity world writes the same clean '0.000000' bytes the
+    # source files carry (keeps Bugsnax round-trip exports byte-identical).
+    for _r in range(4):
+        for _c in range(4):
+            if abs(dx_mat[_r][_c]) < 5e-7:
+                dx_mat[_r][_c] = 0.0
+    return dx_mat
+
 
 def _bl_bone_to_dx_world(bl_mat, bl_to_dx_3, inv_scale):
 
@@ -1134,6 +1708,45 @@ def _merge_split_group_for_export(group_objs, source_mesh_name):
     merged_obj["_x_mesh_name"] = source_mesh_name
     if first.get("_x_frame_name"):
         merged_obj["_x_frame_name"] = first["_x_frame_name"]
+    if first.get("_x_container_bone"):
+        # Split pieces of a container-frame mesh: the merged whole is
+        # the container mesh, so the wrapperless bone-nested write
+        # applies to it exactly as it would to the unsplit original.
+        merged_obj["_x_container_bone"] = first["_x_container_bone"]
+    if first.data.get("_x_vcolors_name"):
+        merged_me["_x_vcolors_name"] = first.data["_x_vcolors_name"]
+
+    # Per-vertex colors: the bmesh concatenation above does not carry
+    # POINT-domain color attributes, silently dropping baked lighting /
+    # kwXport vertex colours from any merged multi-material mesh. The
+    # merged vertex order is the plain concatenation of the sources'
+    # vertex orders, so rebuild the attribute sequentially.
+    _src_vc = []
+    _any_vc = False
+    for _sobj in group_objs:
+        _attr = None
+        for _ca in getattr(_sobj.data, "color_attributes", ()) or ():
+            if getattr(_ca, "domain", "") == 'POINT':
+                _attr = _ca
+                break
+        _src_vc.append(_attr)
+        _any_vc = _any_vc or (_attr is not None)
+    if _any_vc:
+        try:
+            _vc_name = next((a.name for a in _src_vc if a is not None), "Col")
+            _mattr = merged_me.color_attributes.new(
+                name=_vc_name, type='FLOAT_COLOR', domain='POINT')
+            _mi = 0
+            for _sobj, _attr in zip(group_objs, _src_vc):
+                for _vi in range(len(_sobj.data.vertices)):
+                    if _attr is not None:
+                        _mattr.data[_mi].color = _attr.data[_vi].color
+                    else:
+                        _mattr.data[_mi].color = (1.0, 1.0, 1.0, 1.0)
+                    _mi += 1
+        except Exception:
+            pass
+
     # Match the first object's transform/parent/modifiers.
     merged_obj.matrix_world = first.matrix_world.copy()
     merged_obj.parent       = first.parent
@@ -1171,7 +1784,16 @@ def _write_mesh_frame(obj, out, indent,
                       export_materials, export_weights,
                       arm_obj, bl_to_dx_3, inv_scale,
                       triangulate, written_mats,
-                      unweld_on_export=True):
+                      unweld_on_export=True,
+                      names=None,
+                      frame_matrix_override=None,
+                      suppress_frame_wrapper=False,
+                      inline_materials=False,
+                      fill_missing_uvs=False,
+                      export_textures=True,
+                      filepath=""):
+    if names is None:
+        names = _NameSanitizer()
     w        = out.feed if isinstance(out, _BinarySerializer) else out.append
     ind      = "\t" * indent
     warnings = []
@@ -1296,8 +1918,37 @@ def _write_mesh_frame(obj, out, indent,
     n_verts = len(new_to_src)
     n_faces = len(faces)
 
-    verts_dx = [(conv_inv_3 @ Vector(bl_verts[src_vi].co)) * inv_scale
-                for src_vi in new_to_src]
+    # A mesh parented to the armature is written with an Identity frame,
+    # so its vertices must already BE in the composed space the offsets
+    # and skeleton describe. With the armature at identity (every legacy
+    # case) obj.matrix_world is identity too and this is a no-op; with a
+    # transformed armature (uniform-rig object scale, user-moved rig)
+    # the world transform is baked into the vertices here. Bone-nested
+    # meshes (frame_matrix_override) keep object-local verts — their
+    # frame carries the placement.
+    _vert_world_M = None
+    if (frame_matrix_override is None and arm_obj is not None
+            and obj.parent == arm_obj
+            and getattr(obj, "parent_type", "OBJECT") != "BONE"):
+        _vert_world_M = _arm_world_or_none(obj)  # non-identity world only
+        if _vert_world_M is not None:
+            _vert_world_M = obj.matrix_world.copy()
+    if _vert_world_M is not None:
+        verts_dx = [(conv_inv_3 @ (_vert_world_M @ Vector(bl_verts[src_vi].co)))
+                    * inv_scale
+                    for src_vi in new_to_src]
+    else:
+        verts_dx = [(conv_inv_3 @ Vector(bl_verts[src_vi].co)) * inv_scale
+                    for src_vi in new_to_src]
+
+    # Wrapperless container write (suppress_frame_wrapper): the mesh's
+    # container frame on import became the bone whose Frame the caller
+    # is currently writing, and the importer never transformed the mesh
+    # data itself (placement lives on the object). So the vertices are
+    # written verbatim in object-local space — they ARE the original
+    # frame-local data — and no holder Frame or transform is emitted.
+    # (Verified: applying the Blender parent-relative local here instead
+    # re-introduced the exact drift this path exists to fix.)
 
     # Build a loop-aligned normal list for the MeshNormals writer below.
     # The downstream code expects one entry per loop in poly-iteration
@@ -1309,25 +1960,81 @@ def _write_mesh_frame(obj, out, indent,
         loop_normals = []
 
     frame_name = obj.get("_x_frame_name") or obj.name
-    mesh_name  = obj.get("_x_mesh_name")  or (f"{obj.name}Geo"
-                                               if not obj.name.endswith("Geo")
-                                               else obj.name)
-    stashed_frame_ftm = obj.get("_x_frame_ftm")
-
-    w(f"{ind}Frame {frame_name} {{\n")
-    w(f"{ind}\tFrameTransformMatrix {{\n")
-    if stashed_frame_ftm is not None and len(stashed_frame_ftm) >= 16:
-        ftm_str = ",".join(f"{float(v):.6f}" for v in stashed_frame_ftm[:16])
+    _mn_stash = obj.get("_x_mesh_name")
+    if _mn_stash is not None:
+        # Stash present: reproduce the source name exactly. An empty
+        # string means the source Mesh node was UNNAMED — write it
+        # unnamed rather than inventing a 'Geo' suffix that compounds
+        # on every round trip.
+        mesh_name = str(_mn_stash)
     else:
-        if arm_obj and obj.parent == arm_obj:
-            frame_mat = Matrix.Identity(4)
-        else:
-            frame_mat = _bl_bone_to_dx_world(obj.matrix_world, bl_to_dx_3, inv_scale)
-        ftm_str = _mat4_to_dx(frame_mat)
-    w(f"{ind}\t\t{ftm_str};;\n")
-    w(f"{ind}\t}}\n")
+        mesh_name = (f"{obj.name}Geo" if not obj.name.endswith("Geo")
+                     else obj.name)
+    stashed_frame_ftm = obj.get("_x_frame_ftm")
+    # The stashed source FTM is only valid for a standalone frame write:
+    # a bone-nested emission needs the caller's bone-RELATIVE local, and
+    # world-baked vertices (transformed armature) have moved out of the
+    # space the stash described.
+    if frame_matrix_override is not None or _vert_world_M is not None:
+        stashed_frame_ftm = None
 
-    w(f"{ind}\tMesh {mesh_name} {{\n")
+    if not suppress_frame_wrapper:
+        w(f"{ind}Frame {names.get(frame_name)} {{\n")
+        w(f"{ind}\tFrameTransformMatrix {{\n")
+        if stashed_frame_ftm is not None and len(stashed_frame_ftm) >= 16:
+            # Snap ±1e-9 epsilons left by the flatten pass's matrix math:
+            # they format as '-0.000000' and needlessly dirty the diff
+            # against the source file's clean zeros.
+            ftm_str = ",".join(
+                f"{(0.0 if abs(float(v)) < 5e-7 else float(v)):.6f}"
+                for v in stashed_frame_ftm[:16])
+        else:
+            if frame_matrix_override is not None:
+                # Nested emission (bone-parented mesh): the caller supplies
+                # the bone-relative local transform.
+                frame_mat = frame_matrix_override
+            elif arm_obj and obj.parent == arm_obj:
+                # Skinned meshes sit at Identity world (their verts are
+                # in composed model space), and when the ARMATURE itself
+                # is transformed the vertices were baked through
+                # matrix_world above — both cases need an Identity
+                # frame. But a RIGID mesh parented to the armature at
+                # object level has a non-identity world that an Identity
+                # frame silently discards, scattering the pieces on
+                # re-import. Write its world as the frame FTM.
+                if _vert_world_M is not None:
+                    frame_mat = Matrix.Identity(4)
+                else:
+                    frame_mat = _bl_world_to_dx_frame(obj.matrix_world,
+                                                      bl_to_dx_3, inv_scale)
+            else:
+                # Standalone mesh frame. The FTM must be the CONJUGATED
+                # world (C @ W @ C^-1): the mesh vertices below are
+                # written one-side-converted (C @ v), and the importer
+                # rebuilds frame worlds by conjugation, so a one-sided
+                # FTM here composes to C@W@C@v in file space — verts
+                # rotated by C^2 whenever W carries rotation or
+                # translation (sb.X's x3ds pieces sat 2142 units off).
+                # For the common Identity world this now writes an
+                # Identity FTM, matching the source files byte-for-byte
+                # instead of writing the bare conversion matrix.
+                frame_mat = _bl_world_to_dx_frame(obj.matrix_world,
+                                                  bl_to_dx_3, inv_scale)
+            ftm_str = _mat4_to_dx(frame_mat)
+        w(f"{ind}\t\t{ftm_str};;\n")
+        w(f"{ind}\t}}\n")
+
+    if n_verts > 65535:
+        warnings.append(
+            f"Mesh '{obj.name}' exports with {n_verts} vertices — above "
+            f"the 65535 limit of 16-bit-index legacy tools (fragMOTION "
+            f"and some older engines may truncate or reject it). The "
+            f".x format itself is fine with it.")
+
+    if mesh_name:
+        w(f"{ind}\tMesh {names.get(mesh_name)} {{\n")
+    else:
+        w(f"{ind}\tMesh {{\n")
 
     w(f"{ind}\t\t{n_verts};\n")
     vert_lines = [f"{ind}\t\t {v.x:.6f}; {v.y:.6f}; {v.z:.6f};" for v in verts_dx]
@@ -1352,9 +2059,143 @@ def _write_mesh_frame(obj, out, indent,
         and int(_stashed_orig_vc) == len(bl_verts)
     )
 
-    if export_normals and loop_normals and not _use_stashed_decl:
+    # Row-remapped DeclData: when welding changed the vertex count the
+    # verbatim stash above no longer lines up, and falling back to
+    # standard MeshNormals/MeshTextureCoords silently drops tangents and
+    # any second TEXCOORD set the DeclData carried. The import-time
+    # weld map (_x_declmap: original row -> post-weld vert) lets us pick,
+    # for every OUTPUT vertex, the original row whose UV/normal match
+    # that vertex — re-emitting the source data bit-exactly in the new
+    # vertex order. Resolution happens up front; any unmatched vertex
+    # aborts the mode and the standard blocks below emit as before.
+    _decl_remap_rows = None
+    _decl_stash_parsed = None
+    if (_stashed_decldata and not _use_stashed_decl
+            and obj.get("_x_declmap") is not None):
+        try:
+            import re as _re
+            import struct as _st
+            _dnums = [int(x) for x in
+                      _re.findall(r'-?\d+', str(_stashed_decldata))]
+            _ne = _dnums[0]
+            _els = []
+            _di = 1
+            for _ in range(_ne):
+                _els.append(tuple(_dnums[_di:_di + 4]))
+                _di += 4
+            _nd = _dnums[_di]; _di += 1
+            _dwords = _dnums[_di:_di + _nd]
+            _tf = {1: 2, 2: 3, 3: 4}
+            _stride = sum(_tf.get(t, 0) for t, _m, _u, _ui in _els)
+            if (len(_dwords) == _nd and _stride > 0
+                    and _nd % _stride == 0
+                    and all(t in _tf for t, _m, _u, _ui in _els)):
+                _rows = _nd // _stride
+                _declmap = [int(v) for v in obj["_x_declmap"]]
+                if _rows == len(_declmap):
+                    _offs = {}
+                    _off = 0
+                    for t, _m, _u, _ui in _els:
+                        _offs.setdefault((_u, _ui), _off)
+                        _off += _tf[t]
+                    _floats = [
+                        _st.unpack('<f', _st.pack('<I', d & 0xFFFFFFFF))[0]
+                        for d in _dwords]
+                    _uv0o = _offs.get((5, 0))
+                    _nrmo = _offs.get((3, 0))
+                    _groups = {}
+                    for _ri, _post in enumerate(_declmap):
+                        _groups.setdefault(_post, []).append(_ri)
+                    _resolved = []
+                    _ok = True
+                    for _oi, _svi in enumerate(new_to_src):
+                        _cands = _groups.get(_svi)
+                        if not _cands:
+                            _ok = False
+                            break
+                        if len(_cands) == 1 or (_uv0o is None
+                                                and _nrmo is None):
+                            _resolved.append(_cands[0])
+                            continue
+                        _tuv = new_uv[_oi] if _oi < len(new_uv) else None
+                        _tn = (new_loop_normal[_oi]
+                               if _oi < len(new_loop_normal) else None)
+                        if _tn is not None:
+                            _tnd = conv_inv_3 @ Vector(_tn)
+                        _best = None
+                        _bscore = None
+                        for _ri in _cands:
+                            _b = _ri * _stride
+                            _uverr = 0.0
+                            if _uv0o is not None and _tuv is not None:
+                                _uverr = (abs(_floats[_b + _uv0o]
+                                              - _tuv[0])
+                                          + abs(_floats[_b + _uv0o + 1]
+                                                - (1.0 - _tuv[1])))
+                            _ndot = 0.0
+                            if _nrmo is not None and _tn is not None:
+                                _ndot = (_floats[_b + _nrmo] * _tnd.x
+                                         + _floats[_b + _nrmo + 1] * _tnd.y
+                                         + _floats[_b + _nrmo + 2] * _tnd.z)
+                            _score = (_uverr, -_ndot)
+                            if _bscore is None or _score < _bscore:
+                                _bscore = _score
+                                _best = _ri
+                        if (_uv0o is not None and _tuv is not None
+                                and _bscore[0] > 2e-3):
+                            _ok = False
+                            break
+                        _resolved.append(_best)
+                    if _ok and len(_resolved) == n_verts:
+                        _decl_remap_rows = _resolved
+                        _decl_stash_parsed = (_els, _stride, _dwords)
+        except Exception:
+            _decl_remap_rows = None
+    _use_decl_remap = _decl_remap_rows is not None
 
-        dx_loop_normals = [conv_inv_3 @ Vector(n) for n in loop_normals]
+    if (export_normals and loop_normals and not _use_stashed_decl
+            and not _use_decl_remap):
+
+        if _vert_world_M is not None:
+            # Vertices were baked through the object's world transform
+            # above, so normals must rotate through the same basis (its
+            # normalized 3x3; uniform scale drops out, rotation is kept)
+            # or lighting detaches from the geometry.
+            _nrm_R = _vert_world_M.to_3x3()
+            _ns = _nrm_R.to_scale()
+            _nrm_R = Matrix([[_nrm_R[r][c] / (_ns[c] or 1.0)
+                              for c in range(3)] for r in range(3)])
+            dx_loop_normals = [conv_inv_3 @ (_nrm_R @ Vector(n))
+                               for n in loop_normals]
+        else:
+            dx_loop_normals = [conv_inv_3 @ Vector(n) for n in loop_normals]
+
+        # Blender zeroes corner normals on zero-area faces — including
+        # explicitly-set custom split normals — so meshes with degenerate
+        # triangles (57 PZ weapon/prop files carry them) read back
+        # (0,0,0) for those loops. A literal 0;0;0 in MeshNormals breaks
+        # loaders that normalize on load, so borrow a nonzero normal
+        # from another loop of the same source vertex; the degenerate
+        # face always shares its verts with real geometry, and the
+        # neighbour's value is what the original exporters wrote there.
+        if any(n.length_squared < 1e-12 for n in dx_loop_normals):
+            _vert_nrm = {}
+            _li = 0
+            for _poly in me_work.polygons:
+                for _pl in _poly.loop_indices:
+                    _n = dx_loop_normals[_li]
+                    if _n.length_squared >= 1e-12:
+                        _vert_nrm.setdefault(
+                            me_work.loops[_pl].vertex_index, _n)
+                    _li += 1
+            _li = 0
+            for _poly in me_work.polygons:
+                for _pl in _poly.loop_indices:
+                    if dx_loop_normals[_li].length_squared < 1e-12:
+                        _sub = _vert_nrm.get(me_work.loops[_pl].vertex_index)
+                        dx_loop_normals[_li] = (Vector(_sub) if _sub is not None
+                                                else Vector((0.0, 1.0, 0.0)))
+                    _li += 1
 
         unique_norms   = []
         norm_key_to_idx = {}
@@ -1377,7 +2218,7 @@ def _write_mesh_frame(obj, out, indent,
             face_norm_idx.append(corners)
 
         w(f"\n{ind}\t\tMeshNormals {{\n{ind}\t\t\t{len(unique_norms)};\n")
-        w(",\n".join(f"{ind}\t\t\t {nx:.6f},{ny:.6f},{nz:.6f};"
+        w(",\n".join(f"{ind}\t\t\t {nx:.6f};{ny:.6f};{nz:.6f};"
                      for nx, ny, nz in unique_norms) + ";\n")
         w(f"\n{ind}\t\t\t{n_faces};\n")
         face_norm_lines = [f"{ind}\t\t\t{len(fni)};{','.join(str(i) for i in fni)};"
@@ -1385,7 +2226,19 @@ def _write_mesh_frame(obj, out, indent,
         w(",\n".join(face_norm_lines) + ";\n")
         w(f"{ind}\t\t}}\n")
 
-    if export_uvs and me_work.uv_layers and not _use_stashed_decl:
+    if (export_uvs and fill_missing_uvs and not me_work.uv_layers
+            and not _use_stashed_decl and not _use_decl_remap):
+        # Compat fill: every native Virtual Sailor mesh carries a
+        # MeshTextureCoords block, and some strict consumers treat its
+        # absence as malformed. Zeroed coordinates keep them loading
+        # untextured rather than failing.
+        w(f"\n{ind}\t\tMeshTextureCoords {{\n{ind}\t\t\t{n_verts};\n")
+        w(",\n".join(f"{ind}\t\t\t 0.000000;0.000000;"
+                     for _ in range(n_verts)) + ";\n")
+        w(f"{ind}\t\t}}\n")
+
+    if (export_uvs and me_work.uv_layers and not _use_stashed_decl
+            and not _use_decl_remap):
         uv_layer = me_work.uv_layers.active
 
         new_uvs = [(0.0, 0.0)] * n_verts
@@ -1400,14 +2253,61 @@ def _write_mesh_frame(obj, out, indent,
         w(",\n".join(uv_lines) + ";\n")
         w(f"{ind}\t\t}}\n")
 
+    # Per-vertex colors (kwXport-style; FPSC segment meshes use them for
+    # baked lighting). Emitted from the active POINT-domain color
+    # attribute, one indexed entry per OUTPUT vertex via the same
+    # new_to_src mapping the position writer uses, so colors stay glued
+    # to their vertices across the unweld/preserve-order paths. Format
+    # matches native files: nVertexColors; then index;r;g;b;a;; entries.
+    _vcol_attr = None
+    try:
+        for _ca in getattr(me_work, "color_attributes", ()) or ():
+            if getattr(_ca, "domain", "") == 'POINT':
+                _vcol_attr = _ca
+                break
+    except Exception:
+        _vcol_attr = None
+    if _vcol_attr is not None:
+        try:
+            _vc_name = str(me_work.get("_x_vcolors_name")
+                           or obj.data.get("_x_vcolors_name") or "")
+            _vc_head = (f"MeshVertexColors {_vc_name} {{" if _vc_name
+                        else "MeshVertexColors {")
+            w(f"\n{ind}\t\t{_vc_head}\n{ind}\t\t\t{n_verts};\n")
+            _vc_lines = []
+            for _ovi, _svi in enumerate(new_to_src):
+                try:
+                    _c = _vcol_attr.data[_svi].color
+                    _r, _g, _b = float(_c[0]), float(_c[1]), float(_c[2])
+                    _a = float(_c[3]) if len(_c) > 3 else 1.0
+                except Exception:
+                    _r = _g = _b = _a = 1.0
+                _vc_lines.append(
+                    f"{ind}\t\t\t{_ovi};"
+                    f"{_r:.6f};{_g:.6f};{_b:.6f};{_a:.6f};;")
+            w(",\n".join(_vc_lines) + ";\n")
+            w(f"{ind}\t\t}}\n")
+        except Exception:
+            pass
+
     if export_materials:
         mats = _effective_materials(obj)
         if mats:
             w(f"\n{ind}\t\tMeshMaterialList {{\n{ind}\t\t\t{len(mats)};\n{ind}\t\t\t{n_faces};\n")
             w(",\n".join(f"{ind}\t\t\t{p.material_index}" for p in me_work.polygons) + ";\n")
             for mat in mats:
-
-                w(f"{ind}\t\t\t{{{mat.name}}}\n")
+                if inline_materials:
+                    # Inline blocks inside the list — the style native
+                    # Virtual Sailor generators and kwXport both use, and
+                    # the safest shape for template-driven parsers that
+                    # choke on cross-object references. kwXport keeps the
+                    # material NAMED inline ("Material bottom { ... }"),
+                    # which stays readable and round-trips, so do the same.
+                    _write_material_block(w, mat, f"{ind}\t\t\t",
+                                          names.get(mat.name),
+                                          export_textures, filepath)
+                else:
+                    w(f"{ind}\t\t\t{{{names.get(mat.name)}}}\n")
             w(f"{ind}\t\t}}\n")
 
     # Re-emit the original DeclData block verbatim when this mesh was
@@ -1419,6 +2319,20 @@ def _write_mesh_frame(obj, out, indent,
         _dd = "\n".join(f"{ind}\t\t{ln.lstrip()}" if ln.strip() else ln
                         for ln in _dd.split("\n"))
         w("\n" + _dd + "\n")
+    elif _use_decl_remap:
+        _els, _stride, _dwords = _decl_stash_parsed
+        w(f"\n{ind}\t\tDeclData {{\n{ind}\t\t\t{len(_els)};\n")
+        _el_lines = [f"{ind}\t\t\t{t};{m};{u};{ui};"
+                     for t, m, u, ui in _els]
+        w(",\n".join(_el_lines) + ";\n")
+        w(f"{ind}\t\t\t{n_verts * _stride};\n")
+        _out_dw = []
+        for _ri in _decl_remap_rows:
+            _b = _ri * _stride
+            _out_dw.extend(_dwords[_b:_b + _stride])
+        w(",\n".join(f"{ind}\t\t\t{d & 0xFFFFFFFF}" for d in _out_dw)
+          + ";\n")
+        w(f"{ind}\t\t}}\n")
 
     if export_weights and arm_obj and obj.vertex_groups:
         bone_names = {b.name for b in arm_obj.data.bones}
@@ -1495,7 +2409,14 @@ def _write_mesh_frame(obj, out, indent,
                     bone = arm_obj.data.bones.get(vg.name)
 
                     if bone:
-                        bind_dx = _bl_bone_to_dx_world(bone.matrix_local, bl_to_dx_3, inv_scale)
+                        # Bind world includes the armature object transform
+                        # (when non-identity) — must match the space the
+                        # frame hierarchy and vertices are written in.
+                        _arm_M = _arm_world_or_none(arm_obj)
+                        _bind_rest = (_arm_M @ bone.matrix_local
+                                      if _arm_M is not None
+                                      else bone.matrix_local)
+                        bind_dx = _bl_bone_to_dx_world(_bind_rest, bl_to_dx_3, inv_scale)
                         try:
                             offset = bind_dx.inverted()
                         except ValueError:
@@ -1504,7 +2425,7 @@ def _write_mesh_frame(obj, out, indent,
                         offset = Matrix.Identity(4)
 
                     w(f"\n{ind}\t\tSkinWeights {{\n")
-                    w(f"{ind}\t\t\t\"{vg.name}\";\n")
+                    w(f"{ind}\t\t\t\"{names.get(vg.name)}\";\n")
                     w(f"{ind}\t\t\t{len(influences)};\n")
                     w(",\n".join(f"{ind}\t\t\t{vi}" for vi, _ in influences) + ";\n")
                     w(",\n".join(f"{ind}\t\t\t{wt:.6f}" for _, wt in influences) + ";\n")
@@ -1512,7 +2433,8 @@ def _write_mesh_frame(obj, out, indent,
                     w(f"{ind}\t\t}}\n")
 
     w(f"{ind}\t}}\n")
-    w(f"{ind}}}\n")
+    if not suppress_frame_wrapper:
+        w(f"{ind}}}\n")
 
     bpy.data.meshes.remove(me_work)
     return warnings

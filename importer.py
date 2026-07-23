@@ -26,7 +26,7 @@ import re
 import bpy
 from mathutils import Matrix, Vector, Quaternion
 
-from .parser import parse_x_file
+from .parser import parse_x_file, TOK_NUM
 
 
 _KEY_TYPE_VALUES = {
@@ -46,6 +46,46 @@ _KEY_TYPE_VALUES = {
 }
 
 
+def _parse_vertex_colors(vcol_node):
+    """Parse a MeshVertexColors node into {vertex_index: (r, g, b, a)}.
+    Layout: nVertexColors; then per entry: index; r; g; b; a;;
+    Pure node math, headlessly testable."""
+    nums = vcol_node.nums()
+    if not nums:
+        return {}
+    count = int(nums[0])
+    out = {}
+    i = 1
+    while i + 4 < len(nums) and len(out) < count:
+        idx = int(nums[i])
+        out[idx] = (nums[i + 1], nums[i + 2], nums[i + 3], nums[i + 4])
+        i += 5
+    return out
+
+
+def _material_list_slots(mat_list_node):
+    """Return the MeshMaterialList's material slots as an ordered list of
+    ('inline', material_node) / ('ref', name) descriptors, in CHILD ORDER.
+
+    DirectX face material indices index into the list's declaration order,
+    with inline Material blocks and { Name } references freely interleaved
+    (kwXport and other exporters mix them). The old import collapsed this
+    to inline-only OR ref-only ('inline or ref or all'), dropping whichever
+    style came second, and then name-deduplicated the survivors — both of
+    which shift slot indices so faces pick up the wrong material. Pure
+    node walk, headlessly testable."""
+    slots = []
+    for child in mat_list_node.children:
+        if child.kind == "Material":
+            slots.append(("inline", child))
+        elif child.kind == "REF":
+            ref_name = next((v for t, v in child.values
+                             if t in ("WORD", "STR")), None)
+            if ref_name:
+                slots.append(("ref", ref_name))
+    return slots
+
+
 def _mat4_from_list(vals):
     if len(vals) < 16:
         return Matrix.Identity(4)
@@ -55,6 +95,555 @@ def _mat4_from_list(vals):
         [vals[8],  vals[9],  vals[10], vals[11]],
         [vals[12], vals[13], vals[14], vals[15]],
     ]).transposed()
+
+
+def _mat4_to_list(M):
+    """Inverse of _mat4_from_list — same row-major .x ordering."""
+    T = M.transposed()
+    return [T[r][c] for r in range(4) for c in range(4)]
+
+
+def _det3(M):
+    return (M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+            - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+            + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]))
+
+
+def _set_nums(node, new_vals):
+    """Replace the numeric tokens of a node in order, leaving others."""
+    it = iter(new_vals)
+    out = []
+    for t, v in node.values:
+        out.append((t, next(it)) if t == TOK_NUM else (t, v))
+    node.values = out
+
+
+def flatten_reflection(root):
+    """Normalise the frame hierarchy to unit-scale, right-handed locals.
+
+    Blender bone rests cannot represent scale OR reflection: they are pure
+    rotations (vec_roll_to_mat3). Any frame carrying either therefore makes
+    Rest and Pose disagree somewhere — a mirrored root shreds the skin, and
+    a scaled holder frame inflates its rigid mesh in Rest Position by the
+    reciprocal of its scale (HUD2's Box01/Box05 at 7.17x/35.84x).
+
+    So fold each frame's accumulated similarity D_f = (+-s) * I into the
+    geometry instead. With D_p the parent's accumulated similarity:
+
+        local    L -> D_p @ L @ D_f^-1     (unit scale, det > 0)
+        verts    v -> s_f * v              (signed: reflection negates)
+        offset   O -> D_f @ O
+        rot keys      unchanged            (uniform similarity commutes)
+        scale keys -> / |local scale|      (becomes 1 when constant)
+        pos keys   -> * s_parent           (signed)
+        mat keys   -> D_p @ K @ D_f^-1
+
+    which preserves W(t) @ O @ v exactly while every matrix Blender sees is
+    orthonormal and right-handed. Non-uniform frame scale is left alone
+    (with a warning): it cannot commute with child rotations.
+    """
+    _anim_cache = {}
+    _anim_all = _animated_frame_names(root)
+    # Skin-target bone names: a mirrored frame that is itself a skin bind
+    # target cannot be flattened either — conjugating its offset changes
+    # what poses aimed at it produce (Bugsnax lid/pupil aux joints, which
+    # are static mirrored pose targets). Pure mirrored CONTAINERS with no
+    # skin binding of their own (slender's Root) remain flattenable.
+    _skin_targets = set()
+    def _collect_skin(n):
+        for c in n.children:
+            if c.kind == "SkinWeights":
+                nm = next((v for t, v in c.values
+                           if t in ("STR", "WORD")), None)
+                if nm:
+                    _skin_targets.add(nm)
+            _collect_skin(c)
+    _collect_skin(root)
+    sim = {}          # id(frame) -> signed accumulated uniform scale
+    hits = []
+    conjugated = {}   # frame name -> (s_parent, s_self) for key rewriting
+
+    def uniform_scale(M):
+        import math as _m
+        mags = [_m.sqrt(sum(M[r][c] ** 2 for r in range(3))) for c in range(3)]
+        avg = sum(mags) / 3.0
+        if avg < 1e-12 or max(abs(m - avg) for m in mags) > 1e-3 * max(avg, 1.0):
+            return None
+        # Snap near-unit scale to exactly 1: sub-1e-3 FTM noise (Maya
+        # squash/stretch joints) must not trigger conjugation of frames the
+        # skin-target guard protects — the rewrite threshold (1e-6) and the
+        # guard threshold (1e-3) have to agree on what "unit" means.
+        if abs(avg - 1.0) <= 1e-3:
+            avg = 1.0
+        return -avg if _det3(M) < 0.0 else avg
+
+    def D(s):
+        M = Matrix.Identity(4)
+        for k in range(3):
+            M[k][k] = s
+        return M
+
+    def _absorb_parent_similarity(fn, ftm, L, s_par):
+        """A guard-protected frame keeps its own FTM/offset untouched, but
+        its ANCESTORS may already have had their uniform similarity folded
+        out of the chain (D_p). Leaving the protected local as-authored
+        under a now-unit parent silently changes its world by 1/s_par —
+        the *_L characters' eye bones (9.304x skin targets under the
+        0.107x Head_bone) ballooned 9.3x and drifted off the head exactly
+        this way. Absorb the parent's accumulated similarity into the
+        protected frame's local (L' = D(s_par) @ L) and its animation keys
+        (matrix keys K' = D(s_par) @ K, position keys *= s_par), which
+        restores the original composition for the whole untouched subtree:
+        parent'_world @ L' == parent_world @ L. Offsets, scale keys and
+        rotation keys are unaffected (uniform similarity commutes). When
+        s_par == 1 (every Bugsnax aux/candle case) this is a strict no-op.
+        """
+        if abs(s_par - 1.0) <= 1e-9:
+            return
+        if ftm is not None:
+            _set_nums(ftm, _mat4_to_list(D(s_par) @ L))
+        if not fn.name:
+            return
+
+        def _walk(n2):
+            if n2.kind == "Animation":
+                r2 = n2.child("REF")
+                b2 = next((v for t, v in r2.values
+                           if t in ("STR", "WORD")),
+                          None) if r2 is not None else None
+                if b2 == fn.name:
+                    for ak in n2.children:
+                        if ak.kind != "AnimationKey":
+                            continue
+                        nums = ak.nums()
+                        if len(nums) < 2:
+                            continue
+                        kt = int(nums[0]); nk = int(nums[1])
+                        if kt not in (2, 3, 4):
+                            continue
+                        out = list(nums); i = 2
+                        for _ in range(nk):
+                            if i + 1 >= len(out):
+                                break
+                            cnt = int(out[i + 1])
+                            if kt == 2 and cnt >= 3:
+                                for k in range(3):
+                                    out[i + 2 + k] *= s_par
+                            elif kt in (3, 4) and cnt >= 16:
+                                K = Matrix(
+                                    [[out[i + 2 + r * 4 + c]
+                                      for c in range(4)]
+                                     for r in range(4)]).transposed()
+                                out[i + 2:i + 18] = _mat4_to_list(
+                                    D(s_par) @ K)
+                            i += 2 + cnt
+                        _set_nums(ak, out)
+            for c2 in n2.children:
+                _walk(c2)
+        _walk(root)
+
+    _kdet_cache = {}
+
+    def _matrix_key_det_sign(name):
+        """Sign of the determinant of the frame's first matrix animation
+        key (type 3/4), or None if it has no matrix keys. Distinguishes
+        a mirrored frame whose KEYS mirror along with it (Colonel-X_L's
+        L_brow bones: FTM det -1 AND every key det -1 — foldable, the
+        rewrite makes FTM+keys+offset all proper simultaneously) from a
+        mirrored frame with UN-mirrored keys (Bugsnax lid/pupil aux
+        joints: keys replace the FTM at playback, so folding the FTM
+        desyncs them — must stay protected)."""
+        if name in _kdet_cache:
+            return _kdet_cache[name]
+        sign = None
+
+        def _scan(n2):
+            nonlocal sign
+            if sign is not None:
+                return
+            if n2.kind == "Animation":
+                r2 = n2.child("REF")
+                b2 = next((v for t, v in r2.values
+                           if t in ("STR", "WORD")),
+                          None) if r2 is not None else None
+                if b2 == name:
+                    for ak in n2.children:
+                        if ak.kind != "AnimationKey":
+                            continue
+                        nums = ak.nums()
+                        if len(nums) < 20 or int(nums[0]) not in (3, 4):
+                            continue
+                        # Sample the first, middle and last keys rather
+                        # than the first alone: the fold rewrites every
+                        # key with one sign, so a (pathological) channel
+                        # whose keys flip sign mid-stream must NOT fold
+                        # — disagreement reports 0, which no caller
+                        # treats as mirrored, so the frame keeps its
+                        # guard protection (the safe default).
+                        nk = int(nums[1])
+                        signs = set()
+                        i = 2
+                        want = {0, nk // 2, nk - 1}
+                        for kidx in range(nk):
+                            if i + 1 >= len(nums):
+                                break
+                            cnt = int(nums[i + 1])
+                            if kidx in want and cnt >= 16:
+                                K = _mat4_from_list(
+                                    [float(x) for x in
+                                     nums[i + 2:i + 18]])
+                                signs.add(-1 if K.determinant() < 0
+                                          else 1)
+                            i += 2 + cnt
+                        if signs:
+                            sign = signs.pop() if len(signs) == 1 else 0
+                            return
+            for c2 in n2.children:
+                _scan(c2)
+        _scan(root)
+        _kdet_cache[name] = sign
+        return sign
+
+    def rewrite(fn, s_par):
+        ftm = fn.child("FrameTransformMatrix")
+        L = _mat4_from_list(ftm.nums()) if ftm is not None else Matrix.Identity(4)
+        u = uniform_scale(L)
+        if _guard_protected(fn, u):
+            # A frame that is ITSELF a skin bind target must keep its own
+            # scale/mirror: conjugating its offset changes what poses and
+            # weights aimed at it produce (Bugsnax scaled aux joints).
+            # Containers above skinned bones (slender's Root/Armature) and
+            # rigid holders (HUD2) remain flattenable. Same for animated
+            # mirrored basis, so flattening would rewrite the FTM while
+            # the keys stay un-mirrored (Bugsnax lid/pupil/leg aux
+            # joints). Leave the entire subtree untouched — after first
+            # absorbing any similarity the fold already removed from the
+            # parent chain, so the subtree's world stays exactly as
+            # authored.
+            _absorb_parent_similarity(fn, ftm, L, s_par)
+            return
+        if u is None and fn.name and fn.name in _skin_targets:
+            # A non-uniform frame that is animated or a skin target must
+            # keep its squash/stretch rest intact (Bugsnax spine/candle/
+            # ButtScale joints): baking would strip the FTM and divide the
+            # live scale keys. Leave the subtree untouched.
+            _absorb_parent_similarity(fn, ftm, L, s_par)
+            return
+        if u is None:
+            # Non-uniform scale cannot commute through a CHAIN, but on a
+            # LEAF holder frame (no child frames, rigid mesh only) nothing
+            # composes below it, so the scale can be folded straight into
+            # the mesh vertices: v -> S_local @ v, FTM stripped to R|T.
+            # (HUD2's 'trigger' (1,1,3.55) and 'pull' (1,1,0.65).)
+            # Bakeable if the whole subtree below is unanimated and
+            # unskinned: strip S from this FTM and bake S @ (path locals)
+            # into each descendant mesh's verts, zeroing the path FTMs.
+            _anim_names = _anim_cache.setdefault(
+                id(root), _animated_frame_names(root))
+            _has_mesh = [False]
+            def _subtree_ok(f2):
+                for c2 in f2.children:
+                    if c2.kind == "Mesh":
+                        _has_mesh[0] = True
+                return _subtree_ok_inner(f2)
+            def _subtree_ok_inner(f2):
+                if f2.name and f2.name in _anim_names and f2 is not fn:
+                    return False
+                for c2 in f2.children:
+                    if c2.kind == "Mesh" and any(
+                            cc.kind == "SkinWeights" for cc in c2.children):
+                        return False
+                    if c2.kind == "Frame" and not _subtree_ok(c2):
+                        return False
+                return True
+            # The bake exists solely to fold non-uniform scale into MESH
+            # vertices; an empty helper subtree (Grumpus cloth-fold joints:
+            # leaf, unskinned, meshless) has nothing to bake and must be
+            # left untouched — stripping its FTM and dividing its scale
+            # keys changes an animated bone for no benefit.
+            if ftm is not None and _subtree_ok(fn) and _has_mesh[0]:
+                import math as _m
+                _mags = [_m.sqrt(sum(L[r][c] ** 2 for r in range(3)))
+                         for c in range(3)]
+                _Ls = L.copy()
+                for _c in range(3):
+                    if _mags[_c] > 1e-12:
+                        for _r in range(3):
+                            _Ls[_r][_c] = L[_r][_c] / _mags[_c]
+                _set_nums(ftm, _mat4_to_list(D(s_par) @ _Ls @ D(1.0 / s_par)))
+                _S = Matrix.Identity(4)
+                for _c in range(3):
+                    _S[_c][_c] = _mags[_c]
+                def _bake(f2, M):
+                    for c2 in f2.children:
+                        if c2.kind == "Mesh":
+                            vals = c2.nums()
+                            if not vals:
+                                continue
+                            nv = int(vals[0]); out = list(vals)
+                            for i in range(nv):
+                                v = M @ Vector((out[1 + 3 * i],
+                                                out[2 + 3 * i],
+                                                out[3 + 3 * i]))
+                                out[1 + 3 * i], out[2 + 3 * i], \
+                                    out[3 + 3 * i] = v[0], v[1], v[2]
+                            _set_nums(c2, out)
+                        elif c2.kind == "Frame":
+                            f2f = c2.child("FrameTransformMatrix")
+                            L2 = (_mat4_from_list(f2f.nums())
+                                  if f2f is not None else Matrix.Identity(4))
+                            if f2f is not None:
+                                _set_nums(f2f,
+                                          _mat4_to_list(Matrix.Identity(4)))
+                            _bake(c2, M @ L2)
+                _bake(fn, _S)
+                # The baked frame may be ANIMATED: its keys REPLACE the FTM
+                # at playback, so scale keys still carrying the baked
+                # magnitudes would apply them a second time on top of the
+                # verts (right at rest, oversized in animation). Divide
+                # scale keys componentwise by the baked mags; matrix keys
+                # get D(1/mags) on the right (into the vert space that now
+                # carries S). Rotation/translation keys are unaffected.
+                if fn.name:
+                    def _fixk(n2):
+                        if n2.kind == "Animation":
+                            r2 = n2.child("REF")
+                            b2 = next((v for t, v in r2.values
+                                       if t in ("STR", "WORD")),
+                                      None) if r2 is not None else None
+                            if b2 == fn.name:
+                                for ak in n2.children:
+                                    if ak.kind != "AnimationKey":
+                                        continue
+                                    nums = ak.nums()
+                                    if len(nums) < 2:
+                                        continue
+                                    kt = int(nums[0]); nk = int(nums[1])
+                                    if kt not in (1, 3, 4):
+                                        continue
+                                    out = list(nums); i = 2
+                                    for _ in range(nk):
+                                        if i + 1 >= len(out):
+                                            break
+                                        cnt = int(out[i + 1])
+                                        if kt == 1 and cnt >= 3:
+                                            for k in range(3):
+                                                if _mags[k] > 1e-12:
+                                                    out[i + 2 + k] /= _mags[k]
+                                        elif kt in (3, 4) and cnt >= 16:
+                                            K = Matrix(
+                                                [[out[i + 2 + r * 4 + c]
+                                                  for c in range(4)]
+                                                 for r in range(4)]
+                                            ).transposed()
+                                            Di = Matrix.Identity(4)
+                                            for k in range(3):
+                                                if _mags[k] > 1e-12:
+                                                    Di[k][k] = 1.0 / _mags[k]
+                                            out[i + 2:i + 18] = \
+                                                _mat4_to_list(K @ Di)
+                                        i += 2 + cnt
+                                    _set_nums(ak, out)
+                        for c2 in n2.children:
+                            _fixk(c2)
+                    _fixk(root)
+                hits.append(fn.name or "<unnamed>")
+                s_self = s_par
+                if fn.name:
+                    conjugated[fn.name] = (s_par, s_self)
+                return
+            s_self = s_par
+        else:
+            s_self = s_par * u
+        if ftm is not None and (abs(s_self - 1.0) > 1e-6 or
+                                abs(s_par - 1.0) > 1e-6):
+            _set_nums(ftm, _mat4_to_list(D(s_par) @ L @ D(1.0 / s_self)))
+            if abs(u or 1.0) != 1.0 or (u or 1.0) < 0:
+                hits.append(fn.name or "<unnamed>")
+        for ch in fn.children:
+            if ch.kind == "Mesh":
+                rewrite_mesh(ch, s_self)
+            elif ch.kind == "Frame":
+                rewrite(ch, s_self)
+
+    def rewrite_mesh(mn, s):
+        # The SkinWeights rewrite must run even when the mesh's own holder
+        # frame is unit (s == 1): what it corrects is the BONES' similarity
+        # (O' = D(s_bone) @ O @ D(1/s)), and scaled bones routinely skin a
+        # mesh whose holder is unscaled (Colonel-X_L's facial rig: unit
+        # holders, 9.3x facial bones). The vert/winding/normal rewrite, by
+        # contrast, only applies when the holder itself is scaled/mirrored.
+        if abs(s - 1.0) > 1e-9:
+            vals = mn.nums()
+            if not vals:
+                return
+            nv = int(vals[0])
+            out = list(vals)
+            for i in range(nv):
+                for k in range(3):
+                    out[1 + 3 * i + k] *= s
+            if s < 0:
+                p = 1 + 3 * nv
+                if p < len(out):
+                    nfaces = int(out[p]); q = p + 1
+                    for _ in range(nfaces):
+                        if q >= len(out):
+                            break
+                        cnt = int(out[q])
+                        out[q + 1:q + 1 + cnt] = list(
+                            reversed(out[q + 1:q + 1 + cnt]))
+                        q += 1 + cnt
+            _set_nums(mn, out)
+        for ch in mn.children:
+            if ch.kind == "MeshNormals" and s < 0:
+                nvals = ch.nums()
+                if nvals:
+                    nn = int(nvals[0]); nout = list(nvals)
+                    for i in range(nn):
+                        for k in range(3):
+                            nout[1 + 3 * i + k] = -nout[1 + 3 * i + k]
+                    _set_nums(ch, nout)
+            elif ch.kind == "SkinWeights":
+                sv = ch.nums()
+                if len(sv) >= 17:
+                    O = Matrix([[sv[-16 + r * 4 + c] for c in range(4)]
+                                for r in range(4)]).transposed()
+                    bname = next((v for t, v in ch.values
+                                  if t in ("STR", "WORD")), None)
+                    sb = conjugated.get(bname, (1.0, 1.0))[1]
+                    sv[-16:] = _mat4_to_list(D(sb) @ O @ D(1.0 / s))
+                    _set_nums(ch, sv)
+
+    def rewrite_keys():
+        def walk(n):
+            if n.kind == "Animation":
+                r = n.child("REF")
+                bn = next((v for t, v in r.values if t in ("STR", "WORD")),
+                          None) if r is not None else None
+                pair = conjugated.get(bn)
+                if pair is not None and (abs(pair[0] - 1.0) > 1e-6 or
+                                         abs(pair[1] - 1.0) > 1e-6):
+                    s_par, s_self = pair
+                    ratio = abs(s_self / s_par)
+                    for ak in n.children:
+                        if ak.kind != "AnimationKey":
+                            continue
+                        nums = ak.nums()
+                        if len(nums) < 2:
+                            continue
+                        ktype = int(nums[0]); nkeys = int(nums[1])
+                        if ktype == 0:
+                            continue
+                        out = list(nums); i = 2
+                        for _ in range(nkeys):
+                            if i + 1 >= len(out):
+                                break
+                            cnt = int(out[i + 1])
+                            if ktype == 1 and cnt >= 3:
+                                for k in range(3):
+                                    out[i + 2 + k] /= ratio
+                            elif ktype == 2 and cnt >= 3:
+                                for k in range(3):
+                                    out[i + 2 + k] *= s_par
+                            elif ktype in (3, 4) and cnt >= 16:
+                                K = Matrix([[out[i + 2 + r * 4 + c]
+                                             for c in range(4)]
+                                            for r in range(4)]).transposed()
+                                out[i + 2:i + 18] = _mat4_to_list(
+                                    D(s_par) @ K @ D(1.0 / s_self))
+                            i += 2 + cnt
+                        _set_nums(ak, out)
+            for c in n.children:
+                walk(c)
+        walk(root)
+
+    # PHASE 1: collect every frame's accumulated similarity FIRST, so that
+    # skin-offset rewriting can look up bones that appear later in the
+    # traversal than the mesh that references them (Colonel-X_L's facial
+    # bones sit deeper in the tree than the skinned mesh).
+    conflict = []
+
+    def _guard_protected(fn, u):
+        """True when this frame must be left un-folded (guard cases).
+        Shared by collect() and rewrite() so the conjugated map always
+        agrees with what the fold actually did to the tree."""
+        if u is None or not fn.name:
+            return False
+        if (u < 0
+                and (fn.name in _anim_all or fn.name in _skin_targets)
+                and abs(abs(u) - 1.0) <= 1e-3
+                and _matrix_key_det_sign(fn.name) == -1):
+            # Mirrored frame whose matrix keys mirror IN LOCKSTEP with
+            # its FTM (Colonel-X_L's L-side facial bones): foldable —
+            # the rewrite makes FTM, keys and skin offset all proper
+            # simultaneously, so the bone imports exactly like its
+            # unmirrored R-side twin.
+            return False
+        return ((u < 0 and fn.name in _anim_all)
+                or (abs(abs(u) - 1.0) > 1e-3 and fn.name in _skin_targets)
+                or (u < 0 and fn.name in _skin_targets))
+
+    def collect(fn, s_par):
+        ftm = fn.child("FrameTransformMatrix")
+        L = _mat4_from_list(ftm.nums()) if ftm is not None else Matrix.Identity(4)
+        u = uniform_scale(L)
+        if _guard_protected(fn, u):
+            return          # animated mirror / scaled skin target: skip
+        s_self = s_par if u is None else s_par * u
+        if fn.name:
+            prev = conjugated.get(fn.name)
+            if prev is not None and (abs(prev[0] - s_par) > 1e-6 or
+                                     abs(prev[1] - s_self) > 1e-6):
+                conflict.append(fn.name)
+            conjugated[fn.name] = (s_par, s_self)
+        for ch in fn.children:
+            if ch.kind == "Frame":
+                collect(ch, s_self)
+
+    for c in root.children:
+        if c.kind == "Frame":
+            collect(c, 1.0)
+        else:
+            for cc in c.children:
+                if cc.kind == "Frame":
+                    collect(cc, 1.0)
+    if conflict:
+        # Duplicate frame names with DIFFERENT accumulated similarities
+        # (the fragMOTION '_L' rigs). A name-keyed rewrite of offsets and
+        # animation keys would apply one duplicate's factor to the other,
+        # so leave these files untouched — they keep the scaled-subtree
+        # machinery, which already handles them.
+        return []
+    # PHASE 2: rewrite
+    for c in root.children:
+        if c.kind == "Frame":
+            rewrite(c, 1.0)
+        else:
+            for cc in c.children:
+                if cc.kind == "Frame":
+                    rewrite(cc, 1.0)
+    if hits:
+        rewrite_keys()
+    return hits
+
+def _animated_frame_names(root):
+    out = set()
+
+    def walk(n):
+        if n.kind == "Animation":
+            r = n.child("REF")
+            if r is not None:
+                for t, v in r.values:
+                    if t in ("STR", "WORD"):
+                        out.add(v)
+        for c in n.children:
+            walk(c)
+    walk(root)
+    return out
+
+
+
+
 
 
 def _is_near_identity(M, tol=1e-4):
@@ -546,6 +1135,8 @@ def import_x(context, filepath,
              lock_root_translation=False,
              lock_leaf_translation=False,
              smooth_shade_from_faces=False,
+             rest_from_frame1=False,
+             flatten_reflections=True,
              weld_duplicate_verts=True,
              import_type="standard",
              use_diffuse_alpha=True,
@@ -563,6 +1154,34 @@ def import_x(context, filepath,
     root = parse_x_file(filepath,
                         split_submeshes=split_submeshes,
                         triangulate_quads=triangulate_quads)
+
+    # Blender rebuilds every bone rest as a pure ROTATION:
+
+    # vec_roll_to_mat3 (armature.cc:2698) documents itself as
+
+    # producing 'the rotation matrix M from the Y axis', so
+
+    # det is +1 by construction. A reflected input therefore
+
+    # always comes back with an axis flipped relative to the
+
+    # composed pose. No rest- or pose-side correction can
+
+    # reconcile that, so the mirror is removed from the
+
+    # matrices before Blender ever sees one.
+
+    if flatten_reflections:
+
+        try:
+
+            flatten_reflection(root)
+
+        except Exception as _e:
+
+            pass
+
+
 
     # Import path is chosen explicitly by the user (import_type), not guessed.
     #   standard : general .x (various exporters and game tools, etc.)
@@ -595,16 +1214,27 @@ def import_x(context, filepath,
 
             def _extract_braced_block(text, start_idx):
                 # Given index pointing at a `{`, walk the matching brace.
+                # Jump between braces with str.find (C speed) instead of
+                # visiting every character — these blocks span megabytes
+                # in big files and the per-char walk (with a len() call
+                # per character) dominated text-file import time.
                 depth = 0
                 j = start_idx
-                while j < len(text):
-                    if text[j] == '{':
+                n = len(text)
+                find = text.find
+                while j < n:
+                    c = find('}', j)
+                    if c == -1:
+                        return n
+                    o = find('{', j)
+                    if o != -1 and o < c:
                         depth += 1
-                    elif text[j] == '}':
+                        j = o + 1
+                    else:
                         depth -= 1
                         if depth == 0:
-                            return j + 1
-                    j += 1
+                            return c + 1
+                        j = c + 1
                 return j
 
             # All `template Foo { ... }` declarations
@@ -731,16 +1361,62 @@ def import_x(context, filepath,
             state.tick_scale = float(target_fps) / float(file_ticks_per_second)
         state.ticks_per_second = target_fps
     elif file_ticks_per_second is not None and file_ticks_per_second > 240:
-        # High-precision tick rate (e.g. some games uses 4800) —
-        # Blender's scene FPS field is integer with effective max around
-        # 240 in normal use, and using 4800 as the frame-number unit makes
-        # the timeline confusing (animations that are <1 second land at
-        # frames 0..3200 instead of 0..20).
-        # Normalize to 30 fps: scale tick values down so animation length
-        # in frames matches duration-in-seconds × 30.
-        target_fps = 30.0
-        state.tick_scale = target_fps / float(file_ticks_per_second)
-        state.ticks_per_second = target_fps
+        # High-precision tick rate declared (e.g. 4800). Two very
+        # different files land here, and treating them alike destroys
+        # one of them:
+        #
+        #  (a) key times genuinely ARE 1/4800-second ticks — scaling to
+        #      30 fps is right, otherwise a 2-second clip lands at frame
+        #      9600 and the timeline is unusable;
+        #  (b) key times are FRAME NUMBERS and the 4800 is a stale 3ds
+        #      Max tick-rate constant the exporter wrote without
+        #      converting the keys. Scaling then crushes the whole
+        #      animation into a handful of frames.
+        #
+        # DirectX itself is no help (AnimTicksPerSecond is advisory), so
+        # the deciding evidence is what the consuming engine does:
+        # FPS Creator / Dark Basic never read AnimTicksPerSecond at all
+        # (it appears nowhere in ConvX.cpp or DBOFormat) and compare key
+        # dwTime DIRECTLY against the playback frame counter — i.e. for
+        # these files, ticks ARE frames.
+        #
+        # Discriminate on key DENSITY, which is decisive and needs no
+        # per-file table: under reading (a) a mislabelled file implies a
+        # physically impossible authoring rate. HUD.X declares 4800 with
+        # 521 distinct key times over 679 ticks — 0.14 s of animation at
+        # 3683 keys/second. Nobody keys above a few hundred per second,
+        # so anything past IMPLIED_RATE_MAX is reading (b).
+        IMPLIED_RATE_MAX = 240.0
+        _ticks = set()
+        def _collect_ticks(node):
+            if node.kind == "AnimationKey":
+                _kn = node.nums()
+                if _kn and len(_kn) > 1:
+                    _nk = int(_kn[1])
+                    _i, _c = 2, 0
+                    while _i + 1 < len(_kn) and _c < _nk:
+                        _ticks.add(_kn[_i]); _i += 1
+                        _i += 1 + int(_kn[_i]); _c += 1
+            for _ch in node.children:
+                _collect_ticks(_ch)
+        try:
+            _collect_ticks(root)
+        except Exception:
+            _ticks = set()
+        _implied_rate = 0.0
+        if _ticks:
+            _dur = max(_ticks) / float(file_ticks_per_second)
+            _implied_rate = (len(_ticks) / _dur) if _dur > 0 else float("inf")
+        if _implied_rate > IMPLIED_RATE_MAX:
+            # Reading (b): key times are frame numbers. Take them 1:1,
+            # exactly as Dark Basic does.
+            state.tick_scale = 1.0
+            state.ticks_per_second = 30.0
+        else:
+            # Reading (a): genuine high-resolution ticks.
+            target_fps = 30.0
+            state.tick_scale = target_fps / float(file_ticks_per_second)
+            state.ticks_per_second = target_fps
 
     mat_nodes = [n for n in root.children if n.kind == "Material"]
     for node in mat_nodes:
@@ -769,17 +1445,125 @@ def import_x(context, filepath,
             ftm_globals.update(_collect_ftm_globals(fn))
             _collect_ftm_globals_by_node(fn, out=ftm_by_node)
             _collect_ftm_globals_multi(fn, out=ftm_globals_multi)
-        # Keep the per-name candidate list so the bake can disambiguate a skin
-        # bone whose name collides with an unrelated frame (last-writer in the
-        # plain name map can be the wrong frame — see HUD__1_'s two 'Body's).
+
+        # Uniform whole-rig scale (slender.x-class files: one non-animated,
+        # non-skinned container carrying e.g. 12.32x above an otherwise
+        # unit-scale skeleton). Blender's edit bones can't store rest scale,
+        # and routing a WHOLE rig through the scaled-subtree repair (built
+        # for fragMOTION facial boundaries) is exactly the fragility that
+        # kept re-breaking these imports. Instead, re-express the file in
+        # unit-rig space: left-divide the factor out of every frame world
+        # and bind matrix — parent-relative locals then match the file's
+        # own local transforms EXACTLY, so TRS/matrix animation keys apply
+        # verbatim on the plain path — and re-apply the factor once as the
+        # armature OBJECT scale (mirroring how the DX runtime composes the
+        # container). The skinned-mesh bake reads these same normalized
+        # maps, so binding stays consistent by construction. The detector
+        # is deliberately conservative: fragMOTION facial rigs, Bugsnax
+        # micro-joints, HUD weapons and old-3ds scenes all disqualify and
+        # keep today's machinery untouched.
+        # NOTE: the uniform-rig normalisation that used to live here has
+        # been removed. It divided every frame world by a detected uniform
+        # factor and re-applied it as the armature OBJECT scale — a second,
+        # independent way of getting a scaled frame hierarchy into Blender.
+        # Blender's own source settles which mechanism is correct:
+        #
+        #   armature.cc:3258  deform = pose_mat @ arm_mat^-1
+        #   armature.cc:2664  pose_mat(b) = pose_mat(b-1) * offs_bone
+        #                                   * chan_mat(b)
+        #   BKE_bone_offset_matrix_get builds offs_bone from a 3x3 bone_mat
+        #   (mat3_to_vec_roll), the head, and the parent's length
+        #
+        # arm_mat is orthonormal by construction, so scale can only ride in
+        # the POSE — which is what the unanimated-frame basis does. Keeping
+        # both meant the factor was applied twice whenever the detector
+        # fired, and the two corrections fought.
+
+        # Which frames does the unanimated-frame pose basis own? A frame
+        # with local scale and no animation track. Those bones must NOT
+        # also be taken by the scaled-subtree/micro machinery, which
+        # deliberately makes pose_bone.matrix stop describing the frame's
+        # true world transform — the opposite of what the pose basis needs.
+        # Colonel-X_L and the other fragMOTION facial rigs have no such
+        # frames (every scaled frame there IS animated), so they keep the
+        # subtree machinery exactly as before; slender.x has precisely one,
+        # its 12.32x 'Armature' container.
+        _static_scaled = set()
+        try:
+            _anim_named = set()
+            def _mk(_n):
+                if _n.kind == "Animation":
+                    _r = _n.child("REF")
+                    if _r is not None:
+                        for _t, _v in _r.values:
+                            if _t in ("WORD", "STR"):
+                                _anim_named.add(_v)
+                for _c in _n.children:
+                    _mk(_c)
+            _mk(root)
+            def _scan(_n):
+                if _n.kind == "Frame" and _n.name and _n.name not in _anim_named:
+                    _f = _n.child("FrameTransformMatrix")
+                    if _f is not None:
+                        _sc = _mat4_from_list(_f.nums()).to_scale()
+                        if any(abs(c - 1.0) > 1e-3 for c in _sc):
+                            _static_scaled.add(_n.name)
+                for _c in _n.children:
+                    _scan(_c)
+            _scan(root)
+        except Exception:
+            _static_scaled = set()
+        state._static_scaled_frames = _static_scaled
+        state._rest_from_frame1 = bool(rest_from_frame1)
+
         state._ftm_globals_multi = ftm_globals_multi
 
         # SkinWeights matrixOffset is the inverse bind pose (the mesh was
-        # authored against it); FTM is the bone position at the first keyframe.
-        # When they disagree, matrixOffset is ground truth for binding and FTM
-        # drives rest orientation. Bones with no SkinWeights fall back to FTM.
+        # authored against it); FTM is the bone position at the first
+        # keyframe. When they disagree, matrixOffset is ground truth for
+        # binding and FTM drives rest orientation. Bones with no
+        # SkinWeights fall back to FTM.
         state.build_armature(frame_nodes, context, bind_poses, ftm_globals,
                              conv_mat, ftm_by_node=ftm_by_node)
+
+        # First-occurrence LOCAL FTM per frame name. Used by the
+        # object-chain animation pass to synthesize a missing TRS track
+        # (a frame animated with rotation+position but no scale keys
+        # holds its REST value on the missing channel — DX runtime
+        # semantics; requiring all three tracks silently dropped the
+        # whole animation for such frames).
+        _ftm_local_by_name = {}
+        def _collect_ftm_locals(fn):
+            if fn.name and fn.name not in _ftm_local_by_name:
+                _ftm = fn.child("FrameTransformMatrix")
+                _ftm_local_by_name[fn.name] = (
+                    _mat4_from_list(_ftm.nums()) if _ftm
+                    else Matrix.Identity(4))
+            for _c in fn.children:
+                if _c.kind == "Frame":
+                    _collect_ftm_locals(_c)
+        for fn in frame_nodes:
+            _collect_ftm_locals(fn)
+        state._ftm_local_by_name = _ftm_local_by_name
+
+        # Parent frame world scale per frame name, for the
+        # type-2 key path (Blender rests are scale-free).
+        _anim_parent_scale = {}
+        def _collect_parent_scale(fn, parent_world):
+            _ftm = fn.child("FrameTransformMatrix")
+            _lm = _mat4_from_list(_ftm.nums()) if _ftm else Matrix.Identity(4)
+            if fn.name and fn.name not in _anim_parent_scale:
+                try:
+                    _anim_parent_scale[fn.name] = tuple(parent_world.to_scale())
+                except Exception:
+                    _anim_parent_scale[fn.name] = (1.0, 1.0, 1.0)
+            _world = parent_world @ _lm
+            for _c in fn.children:
+                if _c.kind == "Frame":
+                    _collect_parent_scale(_c, _world)
+        for fn in frame_nodes:
+            _collect_parent_scale(fn, Matrix.Identity(4))
+        state._anim_parent_scale = _anim_parent_scale
 
 
         # Stash passthrough text on the armature so the exporter can
@@ -869,6 +1653,91 @@ def import_x(context, filepath,
             except Exception:
                 pass
 
+    # Dark Basic composes every frame as
+    #     matCombined = matTransformed * parentMatrix
+    # where an ANIMATED frame has matTransformed replaced by its keys, and an
+    # unanimated one keeps `matUserMatrix * matOriginal` — its own
+    # FrameTransformMatrix, scale included. Blender instead evaluates
+    #     pose = parent_pose @ rel @ basis,    rel = parent_rest^-1 @ rest
+    # with scale-free rests, so an unanimated frame gets basis = identity and
+    # contributes `rel` rather than its true local. Wherever those differ, the
+    # whole subtree below inherits the wrong transform: slender.x's 'Armature'
+    # container carries 12.32x with no animation track, so its scale vanished
+    # from every bone under it.
+    #
+    # Restoring it is exact rather than heuristic — the basis that reproduces
+    # the engine's composition is simply
+    #     basis = rel^-1 @ L
+    # with L the frame's own local matrix. Pose basis can hold scale even
+    # though bone rests cannot, and with no F-curves on these channels the
+    # value just holds.
+    if not import_animation or state.armature_obj is None:
+        pass
+    if import_animation and state.armature_obj is not None:
+        try:
+            _animated = set()
+            def _mark(_n):
+                if _n.kind == "Animation":
+                    _r = _n.child("REF")
+                    if _r is not None:
+                        for _t, _v in _r.values:
+                            if _t in ("WORD", "STR"):
+                                _animated.add(_v)
+                for _c in _n.children:
+                    _mark(_c)
+            _mark(root)
+            _conv = state._conv_mat
+            _applied = []
+            for _bname, _L in (getattr(state, "_ftm_local_by_name", {}) or {}).items():
+                if _bname in _animated:
+                    continue
+                _pb = state.armature_obj.pose.bones.get(_bname)
+                if _pb is None:
+                    continue
+                try:
+                    if _pb.parent is not None:
+                        _rel = (_pb.parent.bone.matrix_local.inverted()
+                                @ _pb.bone.matrix_local)
+                        _Lb = _L
+                    else:
+                        _rel = _pb.bone.matrix_local
+                        _Lb = _conv @ _L
+                    _basis = _rel.inverted() @ _Lb
+                    # A reflecting frame (det < 0) must NOT come through
+                    # here. Blender builds rests with mat3_to_vec_roll,
+                    # which yields a strictly right-handed basis and cannot
+                    # represent a reflection, while strip() in the skin bake
+                    # divides by a to_scale() of (-1,-1,-1) and so KEEPS
+                    # det = -1. Rest and bake therefore already disagree by
+                    # a reflection; injecting a third copy into the pose
+                    # mirrors the whole subtree. slender.x's top-level
+                    # 'Root' is exactly this — a pure handedness flip
+                    # sitting above the entire rig — and mirroring there
+                    # shredded the mesh. Handedness is the conversion
+                    # matrix's job, not the pose's.
+                    _d3 = _basis.to_3x3()
+                    _det = (_d3[0][0] * (_d3[1][1] * _d3[2][2] - _d3[1][2] * _d3[2][1])
+                            - _d3[0][1] * (_d3[1][0] * _d3[2][2] - _d3[1][2] * _d3[2][0])
+                            + _d3[0][2] * (_d3[1][0] * _d3[2][1] - _d3[1][1] * _d3[2][0]))
+                    if _det < 0.0:
+                        continue
+                    if any(abs(_basis[_r][_c] - (1.0 if _r == _c else 0.0)) > 1e-5
+                           for _r in range(4) for _c in range(4)):
+                        _pb.matrix_basis = _basis
+                        _applied.append(_bname)
+                        _got = tuple(round(c, 4)
+                                     for c in _pb.matrix_basis.to_scale())
+                        _want = tuple(round(c, 4) for c in _basis.to_scale())
+                except (ValueError, ZeroDivisionError) as _e:
+                    pass
+            if _applied:
+                pass
+            else:
+                pass
+        except Exception as _e:
+            import traceback
+            traceback.print_exc()
+
     if import_animation and set_frame_range:
         frame_range = _compute_animation_frame_range(root)
         if frame_range:
@@ -893,6 +1762,33 @@ def import_x(context, filepath,
             context.scene.frame_set(fstart)
 
     return {"FINISHED"}
+
+def _write_keyframes(fc, pts):
+    """Append pts [(frame, value), ...] to an fcurve as LINEAR keys.
+
+    When the fcurve is empty (the overwhelmingly common case — one
+    fcurve per bone channel, written once), use foreach_set to push all
+    coordinates and interpolation modes in two batched RNA calls instead
+    of two property assignments per key: dense rigs write millions of
+    keyframe properties otherwise. If the fcurve already has points
+    (shared channel appended across sets), fall back to the exact
+    per-point tail write used before."""
+    n = len(pts)
+    existing = len(fc.keyframe_points)
+    fc.keyframe_points.add(n)
+    if existing == 0:
+        flat = [0.0] * (2 * n)
+        flat[0::2] = [p[0] for p in pts]
+        flat[1::2] = [p[1] for p in pts]
+        fc.keyframe_points.foreach_set("co", flat)
+        # 'LINEAR' interpolation enum value is 1 in every Blender 2.8+.
+        fc.keyframe_points.foreach_set("interpolation", [1] * n)
+    else:
+        for kp, (fr, v) in zip(fc.keyframe_points[-n:], pts):
+            kp.co = (fr, v)
+            kp.interpolation = "LINEAR"
+    fc.update()
+
 
 def _get_or_create_fcurve(action, anim_data, data_path, index, group_name):
     if hasattr(action, "fcurves"):
@@ -976,17 +1872,18 @@ def _decode_decl_data(decl_node, expected_vert_count):
         type_floats = {1: 2, 2: 3, 3: 4}
         stride = 0
         norm_off = None
-        uv_off   = None
-        for t, _m, u, _ui in elements:
+        uv_offs  = []   # [(usage_index, float_offset), ...]
+        for t, _m, u, ui in elements:
             n_f = type_floats.get(t)
             if n_f is None:
                 # Unknown / unsupported type — bail
                 return None
             if u == 3 and norm_off is None and n_f == 3:
                 norm_off = (stride, 3)
-            elif u == 5 and uv_off is None and n_f >= 2:
-                uv_off = (stride, 2)
+            elif u == 5 and n_f >= 2:
+                uv_offs.append((int(ui), stride))
             stride += n_f
+        uv_offs.sort()
         if stride == 0:
             return None
         if n_dwords % stride != 0:
@@ -1004,14 +1901,14 @@ def _decode_decl_data(decl_node, expected_vert_count):
             for v in range(n_verts):
                 base = v * stride + off
                 per_vert_normals.append((floats[base], floats[base + 1], floats[base + 2]))
-        per_vert_uvs = None
-        if uv_off is not None:
-            off, _ = uv_off
-            per_vert_uvs = []
+        per_vert_uv_sets = []
+        for _ui, off in uv_offs:
+            uv_set = []
             for v in range(n_verts):
                 base = v * stride + off
-                per_vert_uvs.append((floats[base], floats[base + 1]))
-        return (per_vert_normals, per_vert_uvs)
+                uv_set.append((floats[base], floats[base + 1]))
+            per_vert_uv_sets.append(uv_set)
+        return (per_vert_normals, per_vert_uv_sets or None)
     except Exception:
         return None
 
@@ -1208,18 +2105,20 @@ class _ImportState:
         self._import_collection = None
 
     def parse_material(self, node, base_dir):
+        # A named material may be referenced by {REF} elsewhere and must
+        # resolve to the SAME Blender material, so it's cached by name.
+        # An UNNAMED material is a distinct inline definition — several
+        # can appear in one MeshMaterialList (Virtual Sailor skybox-cube
+        # boats give each of the six faces its own textured but nameless
+        # Material). Caching those under a shared placeholder name made
+        # the first one win for all six, so every face showed the same
+        # texture. Only the named case consults/populates the cache.
+        _has_name = bool(node.name)
         name = node.name or "Material"
-        # Per-import cache: if THIS import session already created a
-        # material with this name (e.g. via a REF resolution earlier
-        # in the same file), reuse it. We deliberately DON'T check
-        # bpy.data.materials.get(name) here — that would reuse a
-        # material from a PREVIOUS bulk-import iteration. Many .x files
-        # name their materials generically ("blinn1", "lambert1"), so
-        # cross-file name collisions are the norm; reusing them would
-        # mean every file after the first inherits the first's textures.
-        existing = self.materials.get(name)
-        if existing:
-            return existing
+        if _has_name:
+            existing = self.materials.get(name)
+            if existing:
+                return existing
         # If a material with this name exists globally (e.g. from a
         # previous import in the same Blender session), let Blender
         # auto-suffix the new one to "blinn1.001". The shader graph
@@ -1276,9 +2175,32 @@ class _ImportState:
             mat["_x_emissive"] = (nums[8], nums[9], nums[10])
 
         # Stash the texture filename on the material *unconditionally*
-        tex_node = node.child("TextureFileName") or node.child("TextureFilename")
+        # A Material may carry SEVERAL TextureFilename blocks, one per
+        # texture slot, distinguished only by the object's NAME —
+        # kwXport writes "Diffuse", "Specular" and "Bump" this way. Taking
+        # the first child blindly can therefore load a bump or specular
+        # map as the diffuse texture. Prefer an explicitly diffuse-named
+        # slot, then any unnamed block, and only then fall back to the
+        # first one present.
+        _tex_nodes = [c for c in node.children
+                      if c.kind in ("TextureFilename", "TextureFileName")]
+        tex_node = None
+        if _tex_nodes:
+            tex_node = next(
+                (c for c in _tex_nodes
+                 if (c.name or "").strip().lower() in ("diffuse", "map_kd")),
+                None)
+            if tex_node is None:
+                tex_node = next((c for c in _tex_nodes if not c.name), None)
+            if tex_node is None:
+                tex_node = _tex_nodes[0]
         original_tex_name = None
         if tex_node:
+            # Remember the source file's spelling ('TextureFileName' is a
+            # Bugsnax/Horsepower authoring quirk; the spec and most engines
+            # use 'TextureFilename'). The exporter re-emits the stashed
+            # spelling on round-trip and stays spec-standard otherwise.
+            mat["_x_texfn_case"] = tex_node.kind
             strs = tex_node.strings()
             if strs:
                 original_tex_name = strs[0].replace('\\\\', '\\')
@@ -1446,7 +2368,8 @@ class _ImportState:
                     except Exception:
                         pass
 
-        self.materials[name] = mat
+        if _has_name:
+            self.materials[name] = mat
         return mat
 
     def build_armature(self, frame_nodes, context, bind_poses, ftm_globals,
@@ -1464,6 +2387,25 @@ class _ImportState:
         # or the mesh part silently fails to follow its bone.
         self._bone_name_for_node = {}     # id(frame_node) -> real bone name
         self._real_bone_for_skinname = {} # SkinWeights name -> real bone name
+        # Ordered creation record: requested frame name -> [real Blender
+        # bone names]. DirectX .x permits several frames to share a name
+        # (HUD1.X carries TWO animated 'GUN' frames); Blender uniquifies
+        # the second to 'GUN.001', but every Animation REF still says
+        # 'GUN', so both key sets used to land on ONE bone (mixing
+        # channels) while the other never animated. Recording creation
+        # order lets import_animation_set pair the k-th REF occurrence of
+        # a duplicated name with the k-th same-named frame — matching how
+        # the D3DX runtime resolves references positionally.
+        self._bones_for_frame_name = {}
+        # Frame names that at least one SkinWeights block binds to. The
+        # scaled-subtree/micro pose-rebasing correction is a SKINNING
+        # repair and is gated on this: an unskinned animated frame must
+        # keep pose_bone.matrix equal to the frame's true world, because
+        # that is what rigidly bone-parented meshes ride.
+        try:
+            self._skinned_bone_names = set(bind_poses.keys())
+        except Exception:
+            self._skinned_bone_names = set()
 
         # Rest pose is always the FrameTransformMatrix hierarchy. The mesh is
         # rebound from its authored bind pose into that rest; the per-mesh bake
@@ -1603,8 +2545,27 @@ class _ImportState:
             # inherited scale is reintroduced per-frame by the scaled-subtree
             # target-pose path in import_animation_set. Fall back to the
             # inverse-bind only for a skinned bone with no FTM of its own.
-            if ftm_glob_node is not None:
-                rest_mat = conv_mat @ ftm_glob_node
+            # FTM hierarchy = first animation frame in most .x files; the
+            # authored rest is inv(matrixOffset). Default: bind pose.
+            # Safe only because _bake_ref_rest uses the same per-bone
+            # source (the rest cancels from pose @ rest^-1 @ rest @ O @ v).
+            _use_bind = (not getattr(self, "_rest_from_frame1", False)
+                         and name in bind_poses)
+            if _use_bind or ftm_glob_node is not None:
+                rest_mat = (conv_mat @ bind_poses[name] if _use_bind
+                            else conv_mat @ ftm_glob_node)
+                # eb.matrix requires an orthonormal 3x3 (armature_utils.cc:236
+                # asserts, release builds don't); normalise by column
+                # magnitude like Blender's own FBX importer.
+                _t = rest_mat.translation.copy()
+                _m3 = rest_mat.to_3x3()
+                for _c in range(3):
+                    _l = math.sqrt(sum(_m3[_r][_c] ** 2 for _r in range(3)))
+                    if _l > 1e-12:
+                        for _r in range(3):
+                            _m3[_r][_c] = _m3[_r][_c] / _l
+                rest_mat = _m3.to_4x4()
+                rest_mat.translation = _t
             elif name in bind_poses:
                 rest_mat = conv_mat @ bind_poses[name]
             else:
@@ -1628,12 +2589,42 @@ class _ImportState:
             # exclude unnamed frames entirely and only let scale propagate
             # through genuinely-named deform bones.
             _named = bool(name) and name.strip() != ""
+            # Uniform whole-rig scale mode: the file was re-expressed in
+            # unit-rig space at import_x (every working bone's rest is
+            # unit by construction; frames outside the rig subtree carry
+            # a deliberate 1/s shrink that the armature object scale
+            # undoes). The detector already proved no OTHER scale pattern
+            # exists on the rig, so the scaled-subtree/micro machinery
+            # has nothing legitimate to do here — suppress registration
+            # entirely so the residual shrink can't re-trigger it.
+            # Was: uniform-rig mode. Now keyed on whether the pose-basis
+            # correction owns a frame on this rig (see _static_scaled_frames).
+            _uniform_mode = bool(getattr(self, "_static_scaled_frames", None))
+            # The scaled-subtree/micro machinery re-bases POSES so that
+            # pose @ rest^-1 reproduces the file's skin deformation on a
+            # scale-discontinuous chain (fragMOTION facial rigs). That
+            # trade is only correct for vertices moved by linear blend
+            # skinning: it deliberately makes pose_bone.matrix stop
+            # describing the frame's true world transform, which is
+            # exactly what a rigidly bone-parented mesh needs. So a bone
+            # that nothing is skinned to must never enter it. Weapon rigs
+            # are entirely this shape — HUD1's SLIDE/EMPTY/LIVEROUND and
+            # every scaled frame in HUD2 are animated, carry rigid gun
+            # parts, and have zero SkinWeights — and flagging them was
+            # what pushed their meshes off bone-parenting and into the
+            # object-chain fallback that misplaced them.
+            _has_skin = bool(name) and (
+                name in getattr(self, "_skinned_bone_names", ())
+                or name in getattr(self, "_real_bone_for_skinname", {}))
             try:
                 _wscale = rest_mat.to_scale()
-                _is_micro = _named and any(c < MICRO_SCALE_THRESH
-                                           for c in _wscale)
-                _is_scaled = (_named and not _is_micro
-                              and any(abs(c - 1.0) > 1e-3 for c in _wscale))
+                _is_micro = (_named and _has_skin and not _uniform_mode
+                             and any(abs(c) < MICRO_SCALE_THRESH
+                                     for c in _wscale))
+                _is_scaled = (_named and _has_skin and not _is_micro
+                              and not _uniform_mode
+                              and any(abs(abs(c) - 1.0) > 1e-3
+                                      for c in _wscale))
             except Exception:
                 _is_micro = False
                 _is_scaled = False
@@ -1710,6 +2701,9 @@ class _ImportState:
             # vertex groups bind to a bone that actually exists.
             real_name = eb.name
             self._bone_name_for_node[id(frame_node)] = real_name
+            if name:
+                self._bones_for_frame_name.setdefault(name, []).append(
+                    real_name)
             if name not in self._real_bone_for_skinname:
                 self._real_bone_for_skinname[name] = real_name
             if self.global_scale != 1.0:
@@ -1847,6 +2841,12 @@ class _ImportState:
             if not bn:
                 continue
             W_dx = ftm_globals.get(bn)
+            if (not getattr(self, "_rest_from_frame1", False)
+                    and bn in getattr(self, "_bind_poses", {})):
+                # Same source as the rest above: bind world = inv(offset),
+                # so net = W @ O collapses toward identity and the mesh
+                # keeps its authored shape at rest.
+                W_dx = self._bind_poses[bn]
             if W_dx is None:
                 continue
             # Use THIS mesh's OWN matrixOffset (the trailing 16 floats of its
@@ -1910,6 +2910,35 @@ class _ImportState:
             Ob = to_blender(O_dx)
             if Wb is None or Ob is None:
                 continue
+            # deform = pose @ rest^-1, and `rest` is scale-free, so the bake
+            # must target that same scale-free world or the frame's scale is
+            # left multiplying every vertex. Valid because the pose now
+            # carries the full scaled world (see the unanimated-frame basis).
+            # Normalise by column MAGNITUDE, never by to_scale().
+            #
+            # to_scale() returns NEGATIVE components whenever the matrix has
+            # a negative determinant, so on a reflected chain dividing by it
+            # inverts all three axes. Blender's rest does no such thing:
+            # mat3_to_vec_roll (armature.cc:2672) keeps only `mat[1]` — the
+            # bone's Y column — and rebuilds X/Z from it, discarding the
+            # reflection but PRESERVING the Y direction. Blender's own FBX
+            # importer normalises the same way, via Matrix.normalized()
+            # (import_fbx.py:2691).
+            #
+            # Dividing by to_scale() therefore left the bake mirrored
+            # relative to the rest on every bone under slender.x's
+            # reflecting 'Root', which is what collapsed the mesh onto the
+            # bone axes. Magnitudes are always positive, so this matches the
+            # rest on reflected and ordinary rigs alike.
+            _mag = [math.sqrt(sum(Wb[_r][_c] ** 2 for _r in range(3)))
+                    for _c in range(3)]
+            if any(abs(c - 1.0) > 1e-6 for c in _mag):
+                _sw = Wb.copy()
+                for _c in range(3):
+                    _d = _mag[_c] if abs(_mag[_c]) > 1e-12 else 1.0
+                    for _r in range(3):
+                        _sw[_r][_c] = Wb[_r][_c] / _d
+                Wb = _sw
             net[bn] = Wb @ Ob
 
         if not net:
@@ -2098,12 +3127,15 @@ class _ImportState:
             xs_text = self._passthrough_xskinheader.get(_src_mesh_name)
             if xs_text:
                 obj["_x_xskinheader"] = xs_text
-            # Record the original file's vertex count too: if the user
-            # later edits the mesh and the count changes, the exporter
-            # will know the stashed DeclData no longer applies.
-            obj["_x_orig_vert_count"] = vcount
-            # Stash the original mesh name so the exporter can look it up.
-            obj["_x_mesh_name"] = _src_mesh_name
+        # Record the original file's vertex count too: if the user
+        # later edits the mesh and the count changes, the exporter
+        # will know the stashed DeclData no longer applies.
+        obj["_x_orig_vert_count"] = vcount
+        # Stash the original mesh name UNCONDITIONALLY — an empty
+        # string records "the source Mesh was unnamed", which the
+        # exporter must reproduce (HUD.X's unnamed meshes were gaining
+        # a 'Geo' suffix on every round trip).
+        obj["_x_mesh_name"] = _src_mesh_name
         # Stash the wrapping Frame's name too. In .x text format the
         # common tools export convention is to nest the Mesh inside a Frame
         # where the Frame is named e.g. "WatermelonGeo3" and the
@@ -2116,6 +3148,23 @@ class _ImportState:
         # the original "WatermelonGeo3".
         if frame_name and frame_name != _src_mesh_name:
             obj["_x_frame_name"] = frame_name
+
+        # Stash the wrapping Frame's FTM (post-flatten, i.e. exactly what
+        # this import consumed) so a round-trip export re-emits it
+        # verbatim. Recomputing the FTM from the Blender object is
+        # ambiguous — the world-authored vs frame-local placement
+        # heuristic can then decide DIFFERENTLY on re-import than it did
+        # here (sb.X's x3ds pieces sat 131 units off when it flipped).
+        # With the byte-identical FTM the re-import sees the same data
+        # and makes the same decision.
+        if parent_frame is not None:
+            _pf_ftm = parent_frame.child("FrameTransformMatrix")
+            if _pf_ftm is not None:
+                try:
+                    obj["_x_frame_ftm"] = [
+                        float(v) for v in _pf_ftm.nums()[:16]]
+                except Exception:
+                    pass
 
         # If this mesh came from a multi-material .x split (parser-level
         # _split_x_mesh_by_material post-process), stash the split-group
@@ -2156,6 +3205,25 @@ class _ImportState:
             except Exception:
                 # On failure, fall back to authored verts (rebind path applies).
                 self._refbake_done = False
+
+        # DirectX stores faces in left-handed winding. The addon's axis
+        # conversion is a proper rotation (det +1), so it preserves that
+        # winding into Blender's right-handed space — which is correct
+        # WHEN the file supplies explicit MeshNormals/DeclData, because
+        # those normals define facing and are applied verbatim below.
+        # But a mesh with NO normal data at all falls back to winding for
+        # facing, and left-handed winding read into a right-handed mesh
+        # is reversed — the surface imports inside-out. conv3ds
+        # regenerates normals from smoothing groups here; Panda reverses
+        # the winding at build. We do the latter, but ONLY for the
+        # normal-less case, so every file that ships normals (all real
+        # corpus assets) is byte-for-byte untouched. No corpus file needs
+        # this; it makes hand-authored / normal-stripped meshes import
+        # right-side-out instead of inverted.
+        _has_normal_src = (mesh_node.child("MeshNormals") is not None
+                           or mesh_node.child("DeclData") is not None)
+        if not _has_normal_src:
+            faces = [tuple(reversed(f)) for f in faces]
 
         me.from_pydata(verts, [], faces)
         me.update()
@@ -2291,7 +3359,7 @@ class _ImportState:
         ):
             decoded = _decode_decl_data(decl_node, vcount)
             if decoded is not None:
-                per_vert_normals, per_vert_uvs = decoded
+                per_vert_normals, per_vert_uv_sets = decoded
                 if (per_vert_normals is not None
                         and self.import_normals
                         and _pending_loop_normals is None):
@@ -2309,29 +3377,45 @@ class _ImportState:
                             else:
                                 loop_normals.append((0.0, 0.0, 1.0))
                     _pending_loop_normals = loop_normals
-                if (per_vert_uvs is not None
+                if (per_vert_uv_sets
                         and self.import_uvs
                         and not me.uv_layers):
-                    uv_layer = me.uv_layers.new(name="UVMap")
-                    for poly in me.polygons:
-                        for loop_idx in poly.loop_indices:
-                            vi = me.loops[loop_idx].vertex_index
-                            if vi < len(per_vert_uvs):
-                                u, v = per_vert_uvs[vi]
-                                uv_layer.data[loop_idx].uv = (u, 1.0 - v)
+                    # One Blender UV layer per DeclData TEXCOORD set,
+                    # in usage-index order (3 PZ 'Kate' bodies carry a
+                    # second set that previously only survived via the
+                    # verbatim DeclData stash and never reached Blender).
+                    for set_i, per_vert_uvs in enumerate(per_vert_uv_sets):
+                        uv_layer = me.uv_layers.new(
+                            name="UVMap" if set_i == 0
+                            else f"UVMap.{set_i:03d}")
+                        for poly in me.polygons:
+                            for loop_idx in poly.loop_indices:
+                                vi = me.loops[loop_idx].vertex_index
+                                if vi < len(per_vert_uvs):
+                                    u, v = per_vert_uvs[vi]
+                                    uv_layer.data[loop_idx].uv = (u, 1.0 - v)
 
         mat_list_node = mesh_node.child("MeshMaterialList")
         if self.import_materials and mat_list_node:
             mat_nums = mat_list_node.nums()
             if mat_nums:
                 face_mat_count   = int(mat_nums[1]) if len(mat_nums) > 1 else 0
-                # Per Microsoft Learn MeshMaterialList spec, nFaceIndexes
-                # MUST equal the parent mesh's nFaces. Log a warning if
-                # they disagree, then clamp to avoid mis-assigning
-                # materials to non-existent faces.
+                # Per the MeshMaterialList spec, nFaceIndexes may be
+                # SHORTER than the mesh's nFaces — most commonly it is 1,
+                # meaning "every face uses the single listed material".
+                # The rule (matching Microsoft's loader and Panda3D's
+                # reader) is: faces beyond the list inherit the LAST
+                # listed index, not 0. Defaulting the tail to 0 would put
+                # all-material-2 meshes (nFaceIndexes=1, index=[2]) onto
+                # material 0 for every face but the first. Read the
+                # explicit indices, then extend with the last one.
                 face_mat_indices = [int(mat_nums[2 + i])
                                     for i in range(min(face_mat_count, fcount))
                                     if 2 + i < len(mat_nums)]
+                if face_mat_indices and len(face_mat_indices) < fcount:
+                    _last_idx = face_mat_indices[-1]
+                    face_mat_indices.extend(
+                        [_last_idx] * (fcount - len(face_mat_indices)))
 
                 # If degenerate faces were filtered before from_pydata,
                 # the surviving mesh polygons no longer match the
@@ -2344,29 +3428,63 @@ class _ImportState:
                         for fsi in _kept_face_src_idx
                     ]
 
-                inline_mats = []
-                for child in mat_list_node.children:
-                    if child.kind == "Material":
-                        inline_mats.append(self.parse_material(child, self.base_dir))
+                # Build the slot list in DECLARATION ORDER, inline and
+                # referenced materials interleaved, one Blender slot per
+                # .x list entry and NO deduplication — the face indices
+                # index this exact order, and Blender happily allows the
+                # same material in several slots, so this is the only
+                # arrangement that keeps every face on the material the
+                # file assigned it.
+                slot_mats = []
+                for _skind, _payload in _material_list_slots(mat_list_node):
+                    if _skind == "inline":
+                        slot_mats.append(
+                            self.parse_material(_payload, self.base_dir))
+                    else:
+                        _m = self.materials.get(_payload)
+                        if _m is None:
+                            # Unresolved reference: keep the slot occupied
+                            # with a placeholder of the referenced name so
+                            # every later index still lands on the right
+                            # slot. (Reuses an existing same-named Blender
+                            # material if one exists.)
+                            _m = (bpy.data.materials.get(_payload)
+                                  or bpy.data.materials.new(_payload))
+                        slot_mats.append(_m)
+                if not slot_mats:
+                    slot_mats = list(self.materials.values())
 
-                ref_mats = []
-                for child in mat_list_node.children:
-                    if child.kind == "REF":
-                        ref_name = next((v for t, v in child.values if t == "WORD"), None)
-                        if ref_name and ref_name in self.materials:
-                            ref_mats.append(self.materials[ref_name])
-
-                source = inline_mats or ref_mats or list(self.materials.values())
-                seen, used_mats = set(), []
-                for m in source:
-                    if m.name not in seen:
-                        seen.add(m.name); used_mats.append(m)
-
-                for m in used_mats:
+                for m in slot_mats:
                     me.materials.append(m)
                 for i, poly in enumerate(me.polygons):
                     if i < len(face_mat_indices):
                         poly.material_index = face_mat_indices[i]
+
+        # Per-vertex colors (kwXport cubes, FPSC segment meshes carrying
+        # baked lighting). Applied before the weld pass so the attribute
+        # rides through bmesh with the vertices; indices refer to the .x
+        # source vertex order, which is 1:1 with the mesh at this point
+        # (degenerate-face filtering drops faces, never vertices).
+        vcol_node = mesh_node.child("MeshVertexColors")
+        if vcol_node is not None:
+            try:
+                _vcols = _parse_vertex_colors(vcol_node)
+            except Exception:
+                _vcols = {}
+            if _vcols:
+                try:
+                    _attr = me.color_attributes.new(
+                        name=(vcol_node.name or "Col"),
+                        type='FLOAT_COLOR', domain='POINT')
+                    for _vi, _col in _vcols.items():
+                        if 0 <= _vi < len(me.vertices):
+                            _attr.data[_vi].color = _col
+                    # Stash the source node name so a round-trip export
+                    # can reproduce 'MeshVertexColors col0 { ... }'.
+                    if vcol_node.name:
+                        me["_x_vcolors_name"] = vcol_node.name
+                except Exception:
+                    pass
 
         # Only take the skinned path when the mesh actually carries
         # SkinWeights. A mesh with none must fall to the rigid-placement
@@ -2700,10 +3818,19 @@ class _ImportState:
                         frame_world = frame_world.copy()
                         frame_world.translation *= self.global_scale
                     bone_t = frame_world.translation
-                    n_v    = len(obj.data.vertices)
+                    # Centroid over UNIQUE positions: the raw mean is
+                    # duplication-weighted, so a re-import of an
+                    # unwelded export (one vert per corner) computes a
+                    # different centroid than the first import did and
+                    # can flip this decision for borderline meshes
+                    # (sb.X pieces flipped by ~1%). Deduplicating makes
+                    # the decision a function of the geometry alone.
+                    _uniq = {(round(v.co[0], 5), round(v.co[1], 5),
+                              round(v.co[2], 5)) for v in obj.data.vertices}
+                    n_v = len(_uniq)
                     c = Vector((0.0, 0.0, 0.0))
-                    for v in obj.data.vertices:
-                        c += v.co
+                    for _p in _uniq:
+                        c += Vector(_p)
                     c /= n_v
                     c_applied = frame_world @ c
                     d_identity = (c - bone_t).length
@@ -2743,24 +3870,26 @@ class _ImportState:
                 # any mesh on a scale-carrying chain to exact object-level
                 # chain F-curves instead (import_animation_set); chains
                 # with unit rest scale keep bone-parenting unchanged.
+                # Bail out ONLY when the pose-rebasing correction is
+                # actually active somewhere up this chain. Testing raw
+                # rest scale instead (the previous behaviour) rejected
+                # every legitimately scaled rigid chain — HUD1's 0.869x
+                # SLIDE, HUD2's 0.028x Box02 — even though nothing had
+                # re-based those poses, so pose_bone.matrix described the
+                # frame exactly and bone-parenting would have been
+                # correct. With the correction now restricted to skinned
+                # bones (see add_bone), an unskinned scaled chain leaves
+                # this false and keeps its mesh on the bone.
                 _chain_scaled = False
-                _g = self._ftm_by_node.get(id(parent_frame))
-                if _g is not None:
-                    try:
-                        _chain_scaled = any(abs(c - 1.0) > 1e-3
-                                            for c in _g.to_scale())
-                    except Exception:
-                        _chain_scaled = False
-                if not _chain_scaled:
-                    _pm = getattr(self, "_frame_parent_node", {})
-                    _n = parent_frame
-                    _hops = 0
-                    while _n is not None and _hops < 200:
-                        if _n.name and _n.name in self._scaled_subtree_info:
-                            _chain_scaled = True
-                            break
-                        _n = _pm.get(id(_n))
-                        _hops += 1
+                _pm = getattr(self, "_frame_parent_node", {})
+                _n = parent_frame
+                _hops = 0
+                while _n is not None and _hops < 200:
+                    if _n.name and _n.name in self._scaled_subtree_info:
+                        _chain_scaled = True
+                        break
+                    _n = _pm.get(id(_n))
+                    _hops += 1
 
                 if rigid_bone is None or _chain_scaled:
                     self._pending_rigid_object_anim.append(
@@ -2773,17 +3902,73 @@ class _ImportState:
                     obj.parent = self.armature_obj
                     obj.parent_type = "BONE"
                     obj.parent_bone = rigid_bone
+                    # rigid_bone came from THIS mesh's own container frame
+                    # (bone_name_for_node[parent_frame]), so mark the pair.
+                    # The exporter uses this to write the Mesh directly
+                    # inside that bone's Frame — reproducing the source
+                    # layout 'Frame X { FTM  Mesh X {...} }' instead of
+                    # nesting a duplicate-named holder frame, which
+                    # perturbed re-import placement (PZ props/items).
+                    obj["_x_container_bone"] = rigid_bone
 
-                    # Pin the object at its resting world position so
-                    # bone-parenting doesn't shift it at rest; the bone
-                    # then drives it during animation.
+                    # Blender bone rests cannot hold scale, so a bone
+                    # driven by a scaled frame is scale-free at rest and
+                    # scaled during playback. Pinning against either one
+                    # alone is wrong in the other state — pinning at the
+                    # rest left HUD().X's parts sunk and HUD2's collapsed
+                    # during animation, and pinning at the animated world
+                    # inflated Mesh.004 to 7.17x and Mesh.005 to 35.84x at
+                    # rest. There is no pin that satisfies both.
+                    #
+                    # So remove the disagreement instead: fold the frame's
+                    # scale into the MESH VERTICES and place the object with
+                    # the scale-free world. The bone chain is then scale-free
+                    # end to end (matching the scale-free rests the animation
+                    # keys are now corrected into), and the object is correct
+                    # at rest and under animation alike.
+                    # The pose now reproduces the frame's scaled world, so
+                    # pin against that rather than the scale-free rest.
+                    _pin = None
+                    _pin_src = "frame-world"
                     try:
+                        _fw = self._ftm_by_node.get(id(parent_frame))
+                        if _fw is not None:
+                            _pin = self._conv_mat @ _fw
+                    except Exception:
+                        _pin = None
+                    if _pin is None:
+                        _pin = bone.matrix
+                        _pin_src = "bone.matrix FALLBACK"
+                    try:
+                        # Blender bone-parenting attaches at the bone TAIL
+                        # (BKE_object ob_parbone): include bone.length
+                        # along Y or objects land one bone-length off.
+                        _blen = getattr(getattr(bone, "bone", bone),
+                                        "length", 0.0) or 0.0
+                        _pin_tail = _pin @ Matrix.Translation(
+                            (0.0, _blen, 0.0))
                         obj.matrix_parent_inverse = (
-                            self.armature_obj.matrix_world @ bone.matrix
-                        ).inverted()
-                    except ValueError:
-                        pass
-                    obj.matrix_world = placed_world
+                            self.armature_obj.matrix_world
+                            @ _pin_tail).inverted()
+                        # If the holder's FTM chain was zeroed by the
+                        # non-uniform subtree bake, placed_world degenerates
+                        # to identity while the pin still holds the true
+                        # frame world (HUD2's Mesh.004/.006 under
+                        # Group01/Group02). The object then belongs AT the
+                        # bone frame: basis = identity places it exactly at
+                        # pinT, which equals the expected holder world.
+                        if (_is_near_identity(placed_world)
+                                and not _is_near_identity(_pin)):
+                            # World convention: object worlds are the
+                            # CONJUGATED form conv @ W @ conv^-1; the pin is
+                            # the plain conv @ W. Replaying ob_parbone shows
+                            # basis = pin alone lands rotated 90deg.
+                            obj.matrix_basis = (
+                                _pin @ self._conv_mat.inverted())
+                        else:
+                            obj.matrix_basis = placed_world.copy()
+                    except (ValueError, AttributeError) as _e:
+                        obj.matrix_world = placed_world
 
             for poly in obj.data.polygons:
                 poly.use_smooth = True
@@ -3128,6 +4313,37 @@ class _ImportState:
                         refined[base_key + (ci,)] = cl[1]
             key_to_vis = refined
 
+        # Faces must survive the weld: bmesh.ops.weld_verts DELETES any
+        # face left with fewer than 3 unique verts, so a merge that
+        # fuses two corners of a zero-area helper triangle (PZ prop
+        # files author these) silently drops the face. Veto such merges
+        # by splitting the offending face's corners back out into
+        # singleton groups; a vert made a singleton can only increase
+        # every face's uniqueness, so a bounded re-check converges.
+        _face_corner_vis = [list(p.vertices) for p in me.polygons]
+        for _pass in range(4):
+            _pre_to_keep_chk = {}
+            for _vs in key_to_vis.values():
+                _keep = min(_vs)
+                for _vi in _vs:
+                    _pre_to_keep_chk[_vi] = _keep
+            _split_out = set()
+            for _corners in _face_corner_vis:
+                _mapped = {_pre_to_keep_chk.get(_vi, _vi) for _vi in _corners}
+                if len(_mapped) < 3 and len(set(_corners)) >= 3:
+                    _split_out.update(_corners)
+            if not _split_out:
+                break
+            _new_ktv = {}
+            for _key, _vs in key_to_vis.items():
+                _stay = [_vi for _vi in _vs if _vi not in _split_out]
+                if _stay:
+                    _new_ktv[_key] = _stay
+                for _vi in _vs:
+                    if _vi in _split_out:
+                        _new_ktv[("_solo", _vi)] = [_vi]
+            key_to_vis = _new_ktv
+
         # Build pre_to_post mapping
         keeper_pre_vis = sorted(min(vs) for vs in key_to_vis.values())
         keep_to_post = {keep: i for i, keep in enumerate(keeper_pre_vis)}
@@ -3137,6 +4353,19 @@ class _ImportState:
             for vi in vs:
                 pre_to_keep[vi] = keep
         pre_to_post = {vi: keep_to_post[pre_to_keep[vi]] for vi in range(_pre_count)}
+
+        # DeclData meshes: record which post-weld vert each original
+        # file row collapsed into. The exporter uses this to re-emit the
+        # stashed DeclData with rows remapped to the output vertex
+        # order (bit-exact normals/tangents/extra UV sets), which is
+        # otherwise impossible once welding changes the vertex count.
+        if (obj.get("_x_decldata")
+                and not obj.get("_x_split_source_mesh")):
+            try:
+                obj["_x_declmap"] = [int(pre_to_post[vi])
+                                     for vi in range(_pre_count)]
+            except Exception:
+                pass
 
         # Apply weld via bmesh
         _bm = _bmesh.new()
@@ -3719,6 +4948,10 @@ class _ImportState:
             # returns None and the standard path runs (no worse than before).
             self._scaled_dx_by_frame = {}
 
+        # Per-set counter of how many times each duplicated REF name has
+        # been seen, for positional pairing with same-named frames.
+        _ref_occurrence = {}
+
         for _anim_idx, anim_node in enumerate(anim_nodes):
             ref = anim_node.child("REF")
             if not ref:
@@ -3726,6 +4959,26 @@ class _ImportState:
             bone_name = next((v for t, v in ref.values if t == "WORD"), None)
             if not bone_name:
                 continue
+            # Resolve the REF through the creation-order registry. For a
+            # unique name this maps requested -> real (identical unless a
+            # collision forced Blender to rename); for a DUPLICATED name
+            # (HUD1.X's two 'GUN' frames) the k-th REF occurrence pairs
+            # with the k-th same-named frame, so each Animation drives its
+            # own bone instead of both stacking on the first.
+            # Keep the file's own frame name: the rename below maps to the
+            # (possibly uniquified) Blender bone, but file-keyed lookups —
+            # e.g. the rest local FTM used to relativise type-1 scale keys —
+            # must still use the original.
+            _ref_frame_name = bone_name
+            _cands = getattr(self, "_bones_for_frame_name", {}).get(
+                bone_name)
+            if _cands:
+                if len(_cands) > 1:
+                    _k = _ref_occurrence.get(bone_name, 0)
+                    _ref_occurrence[bone_name] = _k + 1
+                    bone_name = _cands[min(_k, len(_cands) - 1)]
+                else:
+                    bone_name = _cands[0]
             if bone_name not in arm_obj.pose.bones:
                 continue
 
@@ -3842,13 +5095,56 @@ class _ImportState:
 
                 prev_pose_q = None
 
+                # Hoist per-CHANNEL constants out of the per-key loop: the
+                # basis pre-matrix (an inversion + a mult that were being
+                # recomputed for every one of potentially thousands of
+                # keys), the scaled-subtree membership test, tick scale,
+                # and bound append methods for the channel lists (replacing
+                # ten setdefault dict lookups per key). Dense rigs carry
+                # 100+ channels x 2500 keys, so the per-key constant work
+                # dominated import time.
+                _ts = self.tick_scale
+                _gs = self.global_scale
+                if key_type in (3, 4):
+                    _in_scaled = (self._has_scaled_subtree
+                                  and bone_name in self._scaled_subtree_info)
+                    _mb_pre = None
+                    try:
+                        if pose_bone.parent:
+                            _mb_pre = (pose_bone.bone.matrix_local.inverted()
+                                       @ pose_bone.parent.bone.matrix_local)
+                        else:
+                            _mb_pre = (pose_bone.bone.matrix_local.inverted()
+                                       @ self._conv_mat)
+                    except (ValueError, ZeroDivisionError):
+                        _mb_pre = None
+                    _a10 = chan_data.setdefault(10, []).append
+                    _a11 = chan_data.setdefault(11, []).append
+                    _a12 = chan_data.setdefault(12, []).append
+                    _a20 = chan_data.setdefault(20, []).append
+                    _a21 = chan_data.setdefault(21, []).append
+                    _a22 = chan_data.setdefault(22, []).append
+                    _a23 = chan_data.setdefault(23, []).append
+                    _a30 = chan_data.setdefault(30, []).append
+                    _a31 = chan_data.setdefault(31, []).append
+                    _a32 = chan_data.setdefault(32, []).append
+                elif key_type == 0:
+                    _a0 = chan_data.setdefault(0, []).append
+                    _a1 = chan_data.setdefault(1, []).append
+                    _a2 = chan_data.setdefault(2, []).append
+                    _a3 = chan_data.setdefault(3, []).append
+                elif key_type in (1, 2):
+                    _a0 = chan_data.setdefault(0, []).append
+                    _a1 = chan_data.setdefault(1, []).append
+                    _a2 = chan_data.setdefault(2, []).append
+
                 for frame_tick, vals in all_key_vals:
                     # Scale file ticks to Blender frame numbers. tick_scale
                     # is normally 1.0; for files with very high tick rates
                     # (e.g. high-precision's 4800/sec) it normalizes the timeline to a
                     # sane FPS so the animation isn't spread across
                     # thousands of frames.
-                    frame = float(frame_tick) * self.tick_scale
+                    frame = float(frame_tick) * _ts
                     try:
                         if key_type == 0:
                             abs_q  = Quaternion((vals[0], -vals[1], -vals[2], -vals[3]))
@@ -3857,14 +5153,37 @@ class _ImportState:
                                 pose_q.make_compatible(prev_pose_q)
                             prev_pose_q = Quaternion(pose_q)
 
-                            for ci, v in enumerate(pose_q):
-                                chan_data.setdefault(ci, []).append((frame, v))
+                            _a0((frame, pose_q[0]))
+                            _a1((frame, pose_q[1]))
+                            _a2((frame, pose_q[2]))
+                            _a3((frame, pose_q[3]))
 
                         elif key_type == 1:
-                            for ci, v in enumerate(vals[:3]):
-                                chan_data.setdefault(ci, []).append((frame, v))
+                            # Type-1 keys carry the frame's ABSOLUTE local
+                            # scale, and that is exactly what the pose needs.
+                            # Blender composes
+                            #   pose_world = parent_pose @ rel @ basis
+                            # where `rel` is built from scale-FREE bone rests
+                            # (eb.matrix keeps only orientation and length),
+                            # so the basis has to supply the whole scale for
+                            # the chain to reproduce the DirectX world. A
+                            # headless replay of this composition against the
+                            # file's own frame worlds confirms it: passing the
+                            # raw key through reproduces DirectX to 0.0000 on
+                            # every animated bone of HUD1/HUD2/slender, while
+                            # dividing by the rest scale corrupts 7 of HUD2's
+                            # 11 bones. Do not "relativise" this value.
+                            _a0((frame, vals[0]))
+                            _a1((frame, vals[1]))
+                            _a2((frame, vals[2]))
 
                         elif key_type == 2:
+                            # basis = rel^-1 @ L (the engine's own
+                            # composition), whose translation is exactly
+                            # rel_rot^-1 @ (t_L - t_rel). No rescaling of
+                            # the key is needed: the scale reaches the pose
+                            # through the basis of whichever frame carries
+                            # it, animated or not.
                             if _t2_lock:
                                 loc = Vector((0.0, 0.0, 0.0))
                             elif pose_bone.parent:
@@ -3876,8 +5195,9 @@ class _ImportState:
                                     Vector((vals[0], vals[1], vals[2])) * self.global_scale)
                                 loc = _t2_rest_rot_inv @ (anim_t - _t2_rest_head)
 
-                            for ci, v in enumerate(loc):
-                                chan_data.setdefault(ci, []).append((frame, v))
+                            _a0((frame, loc[0]))
+                            _a1((frame, loc[1]))
+                            _a2((frame, loc[2]))
 
                         elif key_type in (3, 4):
                             # Matrix key per spec (3) or engine
@@ -3887,16 +5207,9 @@ class _ImportState:
                             # Matrix key per spec (3) or engine extension (4):
                             # a flat 16-float 4x4 local transform.
                             dx_local = _mat4_from_list(vals)
-                            # The rest bones (and mesh) may have been scaled by
-                            # global_scale. The animation key's translation is
-                            # in the file's native (unscaled) units, so scale it
-                            # to match — otherwise the animated bone spacing is
-                            # 1/scale of the rest skeleton and the armature
-                            # collapses small during playback while the rest
-                            # pose looks right.
-                            if self.global_scale != 1.0:
+                            if _gs != 1.0:
                                 dx_local = dx_local.copy()
-                                _t = dx_local.translation * self.global_scale
+                                _t = dx_local.translation * _gs
                                 dx_local.translation = _t
                             # Scaled subtree (e.g. the face under Head_bone's
                             # 0.107 scale): the rest bone is scale-free at its
@@ -3907,20 +5220,15 @@ class _ImportState:
                             # spike) across frames 1-15. Unscaled bones take the
                             # standard basis below unchanged.
                             _corr = None
-                            if (self._has_scaled_subtree
-                                    and bone_name in self._scaled_subtree_info):
+                            if _in_scaled:
                                 _corr = self._scaled_subtree_basis(
                                     bone_name, dx_local, frame_tick)
                             if _corr is not None:
                                 matrix_basis = _corr
-                            elif pose_bone.parent:
-                                matrix_basis = (pose_bone.bone.matrix_local.inverted()
-                                                @ pose_bone.parent.bone.matrix_local
-                                                @ dx_local)
+                            elif _mb_pre is not None:
+                                matrix_basis = _mb_pre @ dx_local
                             else:
-                                matrix_basis = (pose_bone.bone.matrix_local.inverted()
-                                                @ self._conv_mat
-                                                @ dx_local)
+                                raise ValueError("bone rest not invertible")
                             mb_loc = matrix_basis.to_translation()
                             mb_rot = matrix_basis.to_quaternion()
                             mb_sca = matrix_basis.to_scale()
@@ -3928,12 +5236,16 @@ class _ImportState:
                                 mb_rot.make_compatible(prev_pose_q)
                             prev_pose_q = Quaternion(mb_rot)
 
-                            for ci, v in enumerate(mb_loc):
-                                chan_data.setdefault(10 + ci, []).append((frame, v))
-                            for ci, v in enumerate(mb_rot):
-                                chan_data.setdefault(20 + ci, []).append((frame, v))
-                            for ci, v in enumerate(mb_sca):
-                                chan_data.setdefault(30 + ci, []).append((frame, v))
+                            _a10((frame, mb_loc[0]))
+                            _a11((frame, mb_loc[1]))
+                            _a12((frame, mb_loc[2]))
+                            _a20((frame, mb_rot[0]))
+                            _a21((frame, mb_rot[1]))
+                            _a22((frame, mb_rot[2]))
+                            _a23((frame, mb_rot[3]))
+                            _a30((frame, mb_sca[0]))
+                            _a31((frame, mb_sca[1]))
+                            _a32((frame, mb_sca[2]))
 
                     except Exception:
                         keyframe_errors += 1
@@ -3955,11 +5267,7 @@ class _ImportState:
                         if not pts:
                             continue
                         fc = _get_or_create_fcurve(action, anim_data, path, ci, bone_name)
-                        fc.keyframe_points.add(len(pts))
-                        for kp, (fr, v) in zip(fc.keyframe_points[-len(pts):], pts):
-                            kp.co = (fr, v)
-                            kp.interpolation = "LINEAR"
-                        fc.update()
+                        _write_keyframes(fc, pts)
                 elif key_type in (3, 4):
                     pose_bone.rotation_mode = "QUATERNION"
                     for offset, path_tmpl, indices in [
@@ -3973,11 +5281,7 @@ class _ImportState:
                             if not pts:
                                 continue
                             fc = _get_or_create_fcurve(action, anim_data, path, ci, bone_name)
-                            fc.keyframe_points.add(len(pts))
-                            for kp, (fr, v) in zip(fc.keyframe_points[-len(pts):], pts):
-                                kp.co = (fr, v)
-                                kp.interpolation = "LINEAR"
-                            fc.update()
+                            _write_keyframes(fc, pts)
 
         # Exact object-level animation for unskinned meshes whose container
         # frame never became a bone (see _apply_object_chain_anim).
@@ -4081,6 +5385,42 @@ class _ImportState:
                     knums = k.nums()
                     if knums:
                         by_type.setdefault(int(knums[0]), k)
+                present = [t for t in (0, 1, 2) if t in by_type]
+                if present and len(present) < 3:
+                    # Partial TRS (e.g. a HUD part keyed with rotation +
+                    # position but no scale track). DX runtime semantics:
+                    # a channel with no keys holds the frame's REST value.
+                    # Requiring all three tracks used to silently drop the
+                    # whole animation for such frames, so synthesize the
+                    # missing track(s) as a single constant rest key; the
+                    # resampled composer nearest-samples the constant
+                    # across the union of ticks.
+                    rest_L = getattr(self, "_ftm_local_by_name",
+                                     {}).get(bn)
+                    if rest_L is not None:
+                        _any = by_type[present[0]].nums()
+                        _t0 = float(_any[2]) if len(_any) > 2 else 0.0
+                        if 0 not in by_type:
+                            # File-form quaternion: the composer's
+                            # row-major matrix is transposed on read, so
+                            # the file stores the CONJUGATE of the
+                            # mathutils-space rotation (w, -x, -y, -z) —
+                            # the same convention the importer uses when
+                            # reading real type-0 keys.
+                            _q = rest_L.to_quaternion()
+                            by_type[0] = _SyntheticKeyNode(
+                                [0.0, 1.0, _t0, 4.0,
+                                 _q.w, -_q.x, -_q.y, -_q.z])
+                        if 1 not in by_type:
+                            _sv = rest_L.to_scale()
+                            by_type[1] = _SyntheticKeyNode(
+                                [1.0, 1.0, _t0, 3.0,
+                                 _sv[0], _sv[1], _sv[2]])
+                        if 2 not in by_type:
+                            _tv = rest_L.to_translation()
+                            by_type[2] = _SyntheticKeyNode(
+                                [2.0, 1.0, _t0, 3.0,
+                                 _tv[0], _tv[1], _tv[2]])
                 if all(t in by_type for t in (0, 1, 2)):
                     mat_node = _compose_type4_from_trs(
                         by_type[0], by_type[1], by_type[2])

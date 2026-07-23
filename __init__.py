@@ -9,8 +9,8 @@ Supports: geometry, normals, UVs, materials, textures,
 bl_info = {
     "name": "DirectX X Format (.x)",
     "author": "",
-    "version": (1, 3, 1),
-    "blender": (3, 0, 0),
+    "version": (1, 4, 0),
+    "blender": (4, 2, 0),
     "location": "File > Import-Export",
     "description": "Import/Export DirectX .x files — full armature, skin, animation, material and texture support",
     "category": "Import-Export",
@@ -94,6 +94,28 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         ),
         default=True,
     )
+    rest_from_frame1: BoolProperty(
+        name="Rest Pose from First Frame",
+        description=("Use the FrameTransformMatrix hierarchy (which in most "
+                     ".x files is the first animation frame) as the rest "
+                     "pose, matching the old behaviour. Off (default): use "
+                     "the model's own bind pose from the SkinWeights "
+                     "matrixOffset, so the rest pose is the authored rig"),
+        default=False,
+    )
+
+    flatten_reflections: BoolProperty(
+        name="Flatten Mirrored Frames",
+        description=("Fold a mirrored (negative-determinant) frame into the "
+                     "mesh geometry instead of leaving it in the matrices. "
+                     "Blender rebuilds bone rests as pure rotations, so a "
+                     "reflected frame always ends up with an axis flipped "
+                     "between Rest and Pose. Turn off to restore the old "
+                     "behaviour"),
+        default=True,
+    )
+
+
     smooth_shade_from_faces: BoolProperty(
         name="Smooth Shade from Faces",
         description=(
@@ -120,7 +142,11 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
             "OFF: all materials are kept in one Blender object with "
             "per-face material assignments and merged skin weights. "
             "Single-material .x files are never split regardless of "
-            "this setting"
+            "this setting.\n\n"
+            "Tip: multi-part characters (FPSC '_L' models, HUD weapons) "
+            "legitimately contain many meshes; with this ON each also "
+            "splits per material, so a busy Outliner after import is "
+            "expected, not a fault. Turn OFF for fewer, merged objects"
         ),
         default=True,
     )
@@ -142,22 +168,16 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
-    import_type: EnumProperty(
-        name="Import Type",
+    ms_dx8: BoolProperty(
+        name="DirectX 8.0 (rigid skin)",
         description=(
-            "Which exporter produced this .x file. Each is a separate, "
-            "self-contained import path — picking the right one avoids the "
-            "guesswork of auto-detection and keeps the conversions independent"
+            "Use the dedicated import path for DirectX 8.0-style files: "
+            "a single skinned mesh with SkinWeights / matrixOffset bind "
+            "matrices and rigid (one-bone-per-vertex) binding. Leave off "
+            "for general .x files from common exporters (the original, "
+            "well-tested path)"
         ),
-        items=[
-            ("standard", "Standard .x",
-             "General DirectX .x files from common exporters. This is the "
-             "original, well-tested path"),
-            ("ms_dx8", "DirectX 8.0 (rigid skin)",
-             "A single skinned mesh with SkinWeights / matrixOffset bind "
-             "matrices and rigid (one-bone-per-vertex) binding"),
-        ],
-        default="standard",
+        default=False,
     )
 
     import_armature:  BoolProperty(name="Import Armature",  default=True)
@@ -223,15 +243,23 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         layout.use_property_split = True
 
         box = layout.box()
-        box.label(text="Import Type", icon="FILE_3D")
-        box.prop(self, "import_type")
-
-        box = layout.box()
         box.label(text="Transform", icon="ORIENTATION_GLOBAL")
         box.prop(self, "global_scale")
         box.prop(self, "axis_forward")
         box.prop(self, "axis_up")
         box.prop(self, "use_apply_transform")
+
+        box = layout.box()
+        box.label(text="DirectX Format", icon="FILE_BLANK")
+        box.prop(self, "ms_dx8")
+        box.prop(self, "rest_from_frame1")
+        box.prop(self, "flatten_reflections")
+        # The weld toggle is always available. It has no effect on the
+        # DirectX 8.0 rigid-skin path (welding is suppressed there), but
+        # stays visible so its meaning is discoverable.
+        box.prop(self, "weld_duplicate_verts")
+        box.prop(self, "split_submeshes")
+        box.prop(self, "triangulate_quads")
 
         box = layout.box()
         box.label(text="Data", icon="MESH_DATA")
@@ -241,17 +269,11 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
         box.prop(self, "import_materials")
         box.prop(self, "import_textures")
         box.prop(self, "use_diffuse_alpha")
-        box.prop(self, "split_submeshes")
-        box.prop(self, "triangulate_quads")
 
         box = layout.box()
         box.label(text="Armature & Animation", icon="ARMATURE_DATA")
         box.prop(self, "import_armature")
         box.prop(self, "import_weights")
-        # The weld toggle is always available. It has no effect on the
-        # DirectX 8.0 rigid-skin path (welding is suppressed there), but
-        # stays visible so its meaning is discoverable.
-        box.prop(self, "weld_duplicate_verts")
         box.prop(self, "import_animation")
         box.prop(self, "anim_fps")
         box.prop(self, "set_frame_range")
@@ -284,6 +306,11 @@ class ImportDirectX(bpy.types.Operator, ImportHelper):
                 unique_paths.append(p)
 
         keywords = self.as_keywords(ignore=("filter_glob", "files", "directory"))
+        # The UI exposes the DirectX 8.0 rigid-skin path as a tickbox;
+        # the importer API keeps the explicit import_type string so
+        # scripts and tests calling import_x directly are unaffected.
+        keywords["import_type"] = ("ms_dx8" if keywords.pop("ms_dx8", False)
+                                   else "standard")
         last_result = {"FINISHED"}
         errors = []
         for fp in unique_paths:
@@ -414,6 +441,48 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         default="TEXT_X",
     )
 
+
+
+    inline_materials: BoolProperty(
+        name="Inline Materials in Mesh",
+        description=(
+            "Write Material blocks anonymously inside each mesh's "
+            "MeshMaterialList instead of declaring them once at the root "
+            "and referencing them by name. Native Virtual Sailor files "
+            "use the inline style, and some strict template-driven "
+            "parsers resolve it more reliably than cross-object "
+            "references"
+        ),
+        default=False,
+    )
+
+    fill_missing_uvs: BoolProperty(
+        name="Write Zero UVs When Missing",
+        description=(
+            "For meshes without a UV map, write a MeshTextureCoords "
+            "block of zeroed coordinates instead of omitting it. Some "
+            "strict consumers (Virtual Sailor-style) treat the missing "
+            "block as malformed"
+        ),
+        default=False,
+    )
+
+    write_templates: BoolProperty(
+        name="Write Template Declarations",
+        description=(
+            "Declare the standard DirectX templates at the top of the "
+            "file. Strict template-driven loaders (FPS Creator / Dark "
+            "Basic's converter, ModelConverterX, Virtual Sailor NG) "
+            "reject files whose data objects use undeclared templates, "
+            "so this should stay enabled unless the target engine is "
+            "known to pre-register everything itself. When the model "
+            "was imported from a .x file, that file's own template "
+            "block is re-used and topped up with any missing standard "
+            "templates"
+        ),
+        default=True,
+    )
+
     pz_compat: BoolProperty(
         name="High-precision animation ticks",
         description=(
@@ -468,6 +537,15 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
         box.prop(self, "axis_up")
 
         box = layout.box()
+        box.label(text="DirectX Format", icon="FILE_BLANK")
+        box.prop(self, "export_format")
+        box.prop(self, "write_templates")
+        box.prop(self, "anim_key_format")
+        box.prop(self, "pz_compat")
+        box.prop(self, "inline_materials")
+        box.prop(self, "fill_missing_uvs")
+
+        box = layout.box()
         box.label(text="Data", icon="MESH_DATA")
         box.prop(self, "export_normals")
         box.prop(self, "export_uvs")
@@ -498,16 +576,10 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
                     row.prop(mat, '["_x_texture_filename"]', text="")
 
         box = layout.box()
-        box.label(text="Format", icon="FILE_BLANK")
-        box.prop(self, "export_format")
-
-        box = layout.box()
         box.label(text="Armature & Animation", icon="ARMATURE_DATA")
         box.prop(self, "export_armature")
         box.prop(self, "export_weights")
         box.prop(self, "export_animation")
-        box.prop(self, "anim_key_format")
-        box.prop(self, "pz_compat")
         row = box.row()
         row.prop(self, "anim_fps")
         row = box.row()
@@ -546,7 +618,6 @@ class ExportDirectX(bpy.types.Operator, ExportHelper):
 
     def execute(self, context):
         keywords = self.as_keywords(ignore=("filter_glob", "check_existing"))
-
         # Pull format off keywords; default routes to text .x
         fmt = keywords.pop("export_format", "TEXT_X")
 

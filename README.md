@@ -48,15 +48,19 @@ The addon then appears at:
 
 ## Import Options
 
-### Import Type
+### DirectX Format
 
-A dropdown selects the import path so the right conversion is used rather than
-guessed:
+The switches that control how the `.x` file's own conventions are interpreted,
+grouped in one box:
 
-| Type | Description |
-|---|---|
-| **Standard .x** | General DirectX `.x` files from common exporters. The original, well-tested path. |
-| **DirectX 8.0 (rigid skin)** | A single skinned mesh with `SkinWeights` / `matrixOffset` bind matrices and rigid (one-bone-per-vertex) binding. |
+| Option | Default | Description |
+|---|---|---|
+| **DirectX 8.0 (rigid skin)** | off | Dedicated import path for DirectX 8.0-style files: a single skinned mesh with `SkinWeights` / `matrixOffset` bind matrices and rigid (one-bone-per-vertex) binding. Leave off for general `.x` files. |
+| **Rest Pose from First Frame** | off | Use the first animation frame as the rest pose instead of the bind pose. |
+| **Flatten Mirrored Frames** | on | Fold mirrored / scaled frame hierarchies into geometry so Blender bones (which cannot store scale or reflection at rest) reproduce the file's worlds. |
+| **Weld Duplicate Vertices** | on | Collapse the format's split vertices back into shared verts for smooth shading (inert on the DirectX 8.0 path, where welding is suppressed). |
+| **Split Sub-Meshes** | on | Split multi-material meshes into one Blender object per material. |
+| **Triangulate Quads** | on | Triangulate quad faces at parse time. |
 
 ### Transform
 
@@ -148,7 +152,15 @@ A panel in the export dialog lists every material that has a stored texture
 path and lets you edit those paths before export without opening the material
 editor.
 
-### Format
+### DirectX Format
+
+All DirectX-specific output settings live in one box: the file format below,
+plus **Write Template Declarations** (on by default — strict loaders such as
+FPS Creator / Dark Basic and Virtual Sailor NG reject files whose objects use
+undeclared templates), **Animation Keys** (quaternion TRS vs 4x4 matrix),
+**High-precision animation ticks** (the 4800-ticks-per-second biped
+convention), **Inline Materials in Mesh** and **Write Zero UVs When Missing**
+(both matching native Virtual Sailor output).
 
 | Format | Extension | Description |
 |---|---|---|
@@ -248,3 +260,26 @@ io_directx_x/
 
 `parser.parse_x_file(path)` is the single entry point — it auto-detects the
 `.x` sub-format (text / binary / compressed) by magic bytes.
+
+
+## Known limitations
+
+- **HUD.X-style baked-Group constructs** re-export with a ~0.9-unit residual
+  (the import itself is exact); the construct is pathological and no other
+  corpus file uses it.
+- **Blender's "Rest Position" toggle** can show a small seam offset on a few
+  neck vertices of characters whose meshes bind the same bones with different
+  per-mesh offsets. The animated result — what the engine shows — is exact;
+  one shared armature cannot make both displays exact when the offsets
+  disagree.
+- **Unnamed source meshes split by material don't re-merge on export**
+  (nothing exists to key the merge); geometry and materials are still correct,
+  simply as separate objects.
+- The brace scanner used for round-trip passthrough does not skip braces
+  inside quoted strings; a `{` or `}` inside a texture filename would miscount.
+  No known file does this.
+
+## Version
+
+Current release: **1.3.18**. Development history lives in the repository's
+commit log rather than this file.

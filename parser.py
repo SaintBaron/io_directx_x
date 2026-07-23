@@ -7,12 +7,11 @@ related binary cache formats (handled by a separate addon).
 """
 
 import math
-import os
 import re
 import struct
 import warnings
 import zlib
-from typing import List, Optional
+from typing import Optional
 
 TOK_WORD   = "WORD"
 TOK_STR    = "STR"
@@ -45,19 +44,23 @@ _RE_TOKEN = re.compile(
 
 def _tokenize(text):
     tokens = []
+    append = tokens.append
     for m in _RE_TOKEN.finditer(text):
         s, comment, punc, num, word = m.groups()
-        if comment:
-            continue
-        if s is not None:
-            tokens.append((TOK_STR, s))
+        # Branch order matters: mesh/animation data makes numbers and
+        # punctuation the overwhelmingly common tokens (millions per
+        # file), while strings and comments are rare.
+        if num is not None:
+            append((TOK_NUM, num))
         elif punc:
-            tokens.append((punc, punc))
-        elif num is not None:
-            tokens.append((TOK_NUM, num))
+            append((punc, punc))
         elif word is not None:
-            tokens.append((TOK_WORD, word))
-    tokens.append((TOK_EOF, None))
+            append((TOK_WORD, word))
+        elif comment:
+            continue
+        elif s is not None:
+            append((TOK_STR, s))
+    append((TOK_EOF, None))
     return tokens
 
 class XNode:
@@ -152,28 +155,42 @@ class _TextParser:
         return None
 
     def _fill_block(self, node):
+        # Hot loop: consumes every token in the file. Access the token
+        # list directly (peek()/consume() method calls per token cost
+        # seconds on multi-million-token files) and test the frequent
+        # kinds first — mesh/animation payloads make numbers and
+        # separators the overwhelming majority. self._pos is kept
+        # synced so the recursive _parse_block calls stay correct.
+        tok = self._tok
+        n = len(tok)
+        vals_append = node.values.append
+        ch_append = node.children.append
         while True:
-            t = self.peek()
-            if t[0] in (TOK_RBRACE, TOK_EOF):
+            pos = self._pos
+            t = tok[pos]
+            k = t[0]
+            if k == TOK_NUM or k == TOK_SEMI or k == TOK_COMMA or k == TOK_STR:
+                vals_append(t)
+                self._pos = pos + 1
+                continue
+            if k == TOK_RBRACE or k == TOK_EOF:
                 return
-            if t[0] == TOK_WORD:
-                p1 = self._tok[self._pos + 1][0] if self._pos + 1 < len(self._tok) else TOK_EOF
+            if k == TOK_WORD:
+                p1 = tok[pos + 1][0] if pos + 1 < n else TOK_EOF
                 if p1 == TOK_LBRACE or p1 == TOK_WORD:
                     child = self._parse_block()
                     if child:
-                        node.children.append(child)
+                        ch_append(child)
                     continue
-                node.values.append(self.consume())
+                vals_append(t)
+                self._pos = pos + 1
                 continue
-            if t[0] == TOK_LBRACE:
+            if k == TOK_LBRACE:
                 child = self._parse_block()
                 if child:
-                    node.children.append(child)
+                    ch_append(child)
                 continue
-            if t[0] in (TOK_NUM, TOK_STR, TOK_SEMI, TOK_COMMA):
-                node.values.append(self.consume())
-                continue
-            self.consume()
+            self._pos = pos + 1
 
 _BIN_TOK_NAME      = 0x01
 _BIN_TOK_STRING    = 0x02
@@ -201,22 +218,25 @@ class _BinaryParser:
         self._buf         = buf
         self._p           = 0
         self._end         = len(buf)
+        # Explicit little-endian ('<'): the DirectX binary format is LE
+        # by spec; native formats would silently misread on big-endian
+        # hosts and carried struct alignment semantics we never wanted.
         self._float_fmt   = 'f' if float_size == 32 else 'd'
         self._float_bytes = float_size // 8
         self._num_count   = 0
         self._peeked      = None
 
     def _u16(self):
-        v, = struct.unpack_from('H', self._buf, self._p); self._p += 2; return v
+        v, = struct.unpack_from('<H', self._buf, self._p); self._p += 2; return v
 
     def _u32(self):
-        v, = struct.unpack_from('I', self._buf, self._p); self._p += 4; return v
+        v, = struct.unpack_from('<I', self._buf, self._p); self._p += 4; return v
 
     def _raw_int(self):
         return self._u32()
 
     def _raw_float(self):
-        v, = struct.unpack_from(self._float_fmt, self._buf, self._p)
+        v, = struct.unpack_from('<' + self._float_fmt, self._buf, self._p)
         self._p += self._float_bytes
         return v
 
@@ -297,6 +317,34 @@ class _BinaryParser:
                 continue
             self._p = p0; break
         return 0.0
+
+    def read_floats(self, n):
+        """Bulk-read n floats. When the cursor is at (or inside) a
+        FLOAT_LIST with at least n values pending, unpack them in one
+        struct call — animation keys read 16 floats per key and dense
+        files carry millions, so per-float dispatch dominates the parse
+        otherwise. Falls back to the scalar reader at list boundaries /
+        mixed separators, preserving exact desync-avoidance semantics."""
+        if self._num_count == 0:
+            # Consume separators and, if the next token is a FLOAT_LIST,
+            # its header — exactly what the first scalar read_float would
+            # do, but leaving the whole list pending for the bulk path.
+            while self._p + 2 <= self._end:
+                p0 = self._p; tok = self._u16()
+                if tok == _BIN_TOK_FLT_LIST:
+                    self._num_count = self._u32()
+                    break
+                if tok in (_BIN_TOK_SEMICOLON, _BIN_TOK_COMMA):
+                    continue
+                self._p = p0
+                break
+        if self._num_count >= n and self._p + n * self._float_bytes <= self._end:
+            self._num_count -= n
+            vals = struct.unpack_from(
+                "<%d%s" % (n, self._float_fmt), self._buf, self._p)
+            self._p += n * self._float_bytes
+            return vals
+        return [self.read_float() for _ in range(n)]
 
     def read_string(self) -> str:
         tok, val = self._get()
@@ -429,11 +477,11 @@ class _BinaryParser:
                     break
             elif tok == _BIN_TOK_FLT_LIST:
                 for _ in range(val):
-                    node.values.append((TOK_NUM, repr(self._raw_float())))
+                    node.values.append((TOK_NUM, self._raw_float()))
                     self._num_count -= 1
             elif tok == _BIN_TOK_INT_LIST:
                 for _ in range(val):
-                    node.values.append((TOK_NUM, repr(self._raw_int())))
+                    node.values.append((TOK_NUM, self._raw_int()))
                     self._num_count -= 1
             elif tok == _BIN_TOK_STRING:
                 node.values.append((TOK_STR, val))
@@ -444,7 +492,7 @@ class _BinaryParser:
     def _p_anim_ticks(self) -> XNode:
         node = XNode("AnimTicksPerSecond", "")
         self.read_name_and_brace()
-        node.values.append((TOK_NUM, str(self.read_int())))
+        node.values.append((TOK_NUM, self.read_int()))
         self.skip_sep()
         self._get()
         return node
@@ -467,12 +515,12 @@ class _BinaryParser:
         mat_name = self.read_name_and_brace()
         node = XNode("Material", mat_name)
         for _ in range(4):
-            node.values.append((TOK_NUM, repr(self.read_float())))
-        node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.append((TOK_NUM, self.read_float()))
+        node.values.append((TOK_NUM, self.read_float()))
         for _ in range(3):
-            node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.append((TOK_NUM, self.read_float()))
         for _ in range(3):
-            node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.append((TOK_NUM, self.read_float()))
         self.skip_sep()
         while self._p < self._end:
             tok, val = self._peek()
@@ -483,14 +531,21 @@ class _BinaryParser:
             if tok == _BIN_TOK_NAME:
                 self._eat_peeked()
                 lv = (val or "").lower()
-                child = self._p_tex_filename() if lv == "texturefilename" else self._p_generic(val or "Unknown")
+                child = (self._p_tex_filename(val)
+                         if lv == "texturefilename"
+                         else self._p_generic(val or "Unknown"))
                 node.children.append(child)
             else:
                 self._eat_peeked()
         return node
 
-    def _p_tex_filename(self) -> XNode:
-        node = XNode("TextureFileName", self.read_name_and_brace())
+    def _p_tex_filename(self, kind: str = "TextureFilename") -> XNode:
+        # `kind` carries the source file's spelling ('TextureFilename' is
+        # standard; Bugsnax/Horsepower author 'TextureFileName'). Keeping
+        # it verbatim lets the importer stash the casing for round-trip
+        # export instead of silently normalizing every binary file to the
+        # Bugsnax spelling.
+        node = XNode(kind, self.read_name_and_brace())
         node.values.append((TOK_STR, self.read_string()))
         self.skip_sep()
         self._get()
@@ -524,7 +579,7 @@ class _BinaryParser:
         self.read_name_and_brace()
         node = XNode("FrameTransformMatrix", "")
         for _ in range(16):
-            node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.append((TOK_NUM, self.read_float()))
         self.skip_sep()
         self._get()
         return node
@@ -534,19 +589,19 @@ class _BinaryParser:
         node = XNode("Mesh", mesh_name)
 
         n_verts = self.read_int()
-        node.values.append((TOK_NUM, str(n_verts)))
+        node.values.append((TOK_NUM, n_verts))
         for _ in range(n_verts):
             for _ in range(3):
-                node.values.append((TOK_NUM, repr(self.read_float())))
+                node.values.append((TOK_NUM, self.read_float()))
             self.skip_sep()
 
         n_faces = self.read_int()
-        node.values.append((TOK_NUM, str(n_faces)))
+        node.values.append((TOK_NUM, n_faces))
         for _ in range(n_faces):
             cc = self.read_int()
-            node.values.append((TOK_NUM, str(cc)))
+            node.values.append((TOK_NUM, cc))
             for _ in range(cc):
-                node.values.append((TOK_NUM, str(self.read_int())))
+                node.values.append((TOK_NUM, self.read_int()))
             self.skip_sep()
 
         while self._p < self._end:
@@ -578,10 +633,10 @@ class _BinaryParser:
         self.read_name_and_brace()
         node = XNode("MeshNormals", "")
         n = self.read_int()
-        node.values.append((TOK_NUM, str(n)))
+        node.values.append((TOK_NUM, n))
         for _ in range(n):
             for _ in range(3):
-                node.values.append((TOK_NUM, repr(self.read_float())))
+                node.values.append((TOK_NUM, self.read_float()))
             self.skip_sep()
         # MeshNormals carries its OWN nFaceNormals count, which is a
         # separate DWORD in the stream — it is NOT guaranteed to equal
@@ -592,12 +647,12 @@ class _BinaryParser:
         # leading count was then misread as the first face's vertex
         # count). Read it from the stream like _p_mesh does for faces.
         n_face_normals = self.read_int()
-        node.values.append((TOK_NUM, str(n_face_normals)))
+        node.values.append((TOK_NUM, n_face_normals))
         for _ in range(n_face_normals):
             cc = self.read_int()
-            node.values.append((TOK_NUM, str(cc)))
+            node.values.append((TOK_NUM, cc))
             for _ in range(cc):
-                node.values.append((TOK_NUM, str(self.read_int())))
+                node.values.append((TOK_NUM, self.read_int()))
             self.skip_sep()
         self._get()
         return node
@@ -606,10 +661,10 @@ class _BinaryParser:
         self.read_name_and_brace()
         node = XNode("MeshTextureCoords", "")
         n = self.read_int()
-        node.values.append((TOK_NUM, str(n)))
+        node.values.append((TOK_NUM, n))
         for _ in range(n):
-            node.values.append((TOK_NUM, repr(self.read_float())))
-            node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.append((TOK_NUM, self.read_float()))
+            node.values.append((TOK_NUM, self.read_float()))
             self.skip_sep()
         self._get()
         return node
@@ -619,10 +674,10 @@ class _BinaryParser:
         node = XNode("MeshMaterialList", "")
         n_mats = self.read_int()
         n_idx  = self.read_int()
-        node.values.append((TOK_NUM, str(n_mats)))
-        node.values.append((TOK_NUM, str(n_idx)))
+        node.values.append((TOK_NUM, n_mats))
+        node.values.append((TOK_NUM, n_idx))
         for _ in range(n_idx):
-            node.values.append((TOK_NUM, str(self.read_int())))
+            node.values.append((TOK_NUM, self.read_int()))
         self.skip_sep()
         while self._p < self._end:
             tok, val = self._peek()
@@ -649,7 +704,7 @@ class _BinaryParser:
         self.read_name_and_brace()
         node = XNode("XSkinMeshHeader", "")
         for _ in range(3):
-            node.values.append((TOK_NUM, str(self.read_int())))
+            node.values.append((TOK_NUM, self.read_int()))
         self.skip_sep()
         self._get()
         return node
@@ -659,13 +714,13 @@ class _BinaryParser:
         node = XNode("SkinWeights", "")
         node.values.append((TOK_STR, self.read_string()))
         n = self.read_int()
-        node.values.append((TOK_NUM, str(n)))
+        node.values.append((TOK_NUM, n))
         for _ in range(n):
-            node.values.append((TOK_NUM, str(self.read_int())))
+            node.values.append((TOK_NUM, self.read_int()))
         for _ in range(n):
-            node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.append((TOK_NUM, self.read_float()))
         for _ in range(16):
-            node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.append((TOK_NUM, self.read_float()))
         self.skip_sep()
         self._get()
         return node
@@ -732,8 +787,8 @@ class _BinaryParser:
         node = XNode("AnimationKey", "")
         key_type  = self.read_int()
         key_count = self.read_int()
-        node.values.append((TOK_NUM, str(key_type)))
-        node.values.append((TOK_NUM, str(key_count)))
+        node.values.append((TOK_NUM, key_type))
+        node.values.append((TOK_NUM, key_count))
 
         # Per spec, each TimedFloatKeys carries `tick`, then `nValues`,
         # then nValues floats. Trust the stream's nValues over the
@@ -745,13 +800,13 @@ class _BinaryParser:
         for _ in range(key_count):
             tick = self.read_int()
             nv   = self.read_int()
-            node.values.append((TOK_NUM, str(tick)))
-            node.values.append((TOK_NUM, str(nv)))
+            node.values.append((TOK_NUM, tick))
+            node.values.append((TOK_NUM, nv))
             # Use stream's nv when sane, fall back to lookup when nv
             # is out of plausible range (corrupt stream).
             n_to_read = nv if 1 <= nv <= 64 else default_n
-            for _ in range(n_to_read):
-                node.values.append((TOK_NUM, repr(self.read_float())))
+            node.values.extend(
+                (TOK_NUM, f) for f in self.read_floats(n_to_read))
             self.skip_sep()
 
         self.skip_sep()
@@ -1163,7 +1218,7 @@ def _sanitize_anim_keys(root) -> int:
                                 f = float("nan")
                             if not math.isfinite(f) or abs(f) > 1.0e6:
                                 f = prev[j] if prev is not None else ident[j]
-                                vals[fstart + j] = (TOK_NUM, repr(f))
+                                vals[fstart + j] = (TOK_NUM, f)
                                 fixed += 1
                             cur[j] = f
                         prev = cur
@@ -1179,15 +1234,13 @@ def _sanitize_anim_keys(root) -> int:
 
 # Shared XNode value-builder helpers (used by .x mesh splitting too).
 def _num(v) -> tuple:
-    return (TOK_NUM, repr(float(v)))
+    return (TOK_NUM, float(v))
 
 
 def _str(s: str) -> tuple:
     return (TOK_STR, s)
 
 
-def _word(w: str) -> tuple:
-    return (TOK_WORD, w)
 
 
 
@@ -1249,6 +1302,22 @@ def _split_one_mesh(mesh: 'XNode') -> 'Optional[list]':
     if n_mats < 2 or n_face_mats < 1:
         return None
     face_mat_idx = [int(x) for x in ml_nums[2:2 + n_face_mats]]
+    # Spec shorthand: nFaceIndexes may be shorter than nFaces, tail
+    # inheriting the last listed index (see importer MeshMaterialList
+    # note). Expand here too so the distinct-material test and the
+    # face-count gate below see one index per face.
+    _ml_nfaces = None
+    _mesh_nums_probe = mesh.nums()
+    if _mesh_nums_probe:
+        _nv_probe = int(_mesh_nums_probe[0])
+        _pos_probe = 1 + 3 * _nv_probe
+        if _pos_probe < len(_mesh_nums_probe):
+            _ml_nfaces = int(_mesh_nums_probe[_pos_probe])
+    if (_ml_nfaces is not None and face_mat_idx
+            and len(face_mat_idx) < _ml_nfaces):
+        face_mat_idx.extend(
+            [face_mat_idx[-1]] * (_ml_nfaces - len(face_mat_idx)))
+        n_face_mats = len(face_mat_idx)
     distinct_mats = sorted(set(face_mat_idx))
     if len(distinct_mats) < 2:
         # Only 1 material actually used (per requested behavior — even if
@@ -1458,6 +1527,39 @@ def _split_one_mesh(mesh: 'XNode') -> 'Optional[list]':
             if child.kind in ('MeshNormals', 'MeshTextureCoords',
                               'MeshMaterialList'):
                 continue   # already replaced above
+            if child.kind == 'MeshVertexColors':
+                # Vertex colours are indexed by ORIGINAL vertex index;
+                # copying the block as-is puts colours on the wrong
+                # verts of the reindexed piece (kwXport cube corners
+                # took a neighbour's colour). Filter to this piece's
+                # verts and remap through old_to_new.
+                vc_nums = child.nums()
+                if not vc_nums:
+                    sub_mesh.children.append(child)
+                    continue
+                n_vc = int(vc_nums[0])
+                if 1 + 5 * n_vc > len(vc_nums):
+                    sub_mesh.children.append(child)
+                    continue
+                kept_vc = []
+                for i in range(n_vc):
+                    o = 1 + 5 * i
+                    old_vi = int(vc_nums[o])
+                    if old_vi in old_to_new:
+                        kept_vc.append((old_to_new[old_vi],
+                                        vc_nums[o + 1], vc_nums[o + 2],
+                                        vc_nums[o + 3], vc_nums[o + 4]))
+                kept_vc.sort(key=lambda e: e[0])
+                new_vc = XNode("MeshVertexColors", child.name)
+                new_vc.values.append(_num(len(kept_vc)))
+                for nv, r, g, b, a in kept_vc:
+                    new_vc.values.append(_num(nv))
+                    new_vc.values.append(_num(r))
+                    new_vc.values.append(_num(g))
+                    new_vc.values.append(_num(b))
+                    new_vc.values.append(_num(a))
+                sub_mesh.children.append(new_vc)
+                continue
             if child.kind == 'SkinWeights':
                 sw_nums = child.nums()
                 sw_strs = child.strings()
@@ -1755,7 +1857,10 @@ def parse_x_file(filepath: str, split_submeshes: bool = False,
                         f"{len(lenient)} damaged block(s) {lenient} that were "
                         "recovered via a tolerant decoder; "
                         f"{recovered}/{info['total_blocks']} blocks decoded. "
-                        "Animation in the damaged region may be slightly "
+                        "The damage is in the source file itself (it ships "
+                        "this way and even strict zlib rejects the block) — "
+                        "recovery is as complete as the data allows; at most, "
+                        "animation inside the damaged region may be slightly "
                         "imperfect.",
                         stacklevel=2,
                     )
@@ -1789,8 +1894,20 @@ def parse_x_file(filepath: str, split_submeshes: bool = False,
                 pass
     else:
         text = payload.decode("utf-8", errors="replace")
-        nl   = text.find("\n")
-        body = text[nl + 1:] if nl >= 0 else text
+        if is_compressed:
+            # A decompressed payload contains NO file header — it begins
+            # at the first real token. Stripping a leading line here (as
+            # the uncompressed path must, to drop the remainder of the
+            # 16-byte header's line) would silently discard the first
+            # top-level item: a template declaration at best, a Frame or
+            # Mesh at worst. Compressed-TEXT (.x "tzip") files are rare
+            # in the wild, which is why this went unnoticed — every
+            # compressed file in the test corpora is binary ("bzip"),
+            # which takes the binary branch above.
+            body = text
+        else:
+            nl   = text.find("\n")
+            body = text[nl + 1:] if nl >= 0 else text
         tokens = _tokenize(body)
         try:
             root = _TextParser(tokens).parse_file()
